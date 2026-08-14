@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.grokaagent/
+.groka/
+.env
+.env.*
+!.env.example
+*.pem
+xai-auth.json
+groka-events.jsonl

@@ -1,0 +1,608 @@
+//! Named background processes the model can start, inspect, and kill.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::oneshot;
+
+use crate::error::{Error, Result};
+use crate::events::{AgentEvent, EventMeta, EventSink};
+use crate::procgroup::ProcessGuard;
+use crate::shellguard::{self, CommandReviewer};
+use crate::tools::{hide_window, resolve_in_workspace, shell_command, ClientTool, ToolCallFut, ToolSpec};
+
+pub const MAX_BACKGROUNDS: usize = 4;
+const LOG_CAP: usize = 200;
+
+struct Slot {
+    command: String,
+    pid: u32,
+    log: VecDeque<String>,
+    kill_tx: Option<oneshot::Sender<()>>,
+    alive: bool,
+    detail: String,
+}
+
+struct Inner {
+    slots: HashMap<String, Slot>,
+    next_id: u32,
+}
+
+pub struct BackgroundHub {
+    workspace: std::path::PathBuf,
+    agent_name: String,
+    run_id: String,
+    parent_run_id: Option<String>,
+    inner: Mutex<Inner>,
+}
+
+impl BackgroundHub {
+    pub fn new(
+        workspace: std::path::PathBuf,
+        agent_name: String,
+        run_id: String,
+        parent_run_id: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            workspace,
+            agent_name,
+            run_id,
+            parent_run_id,
+            inner: Mutex::new(Inner {
+                slots: HashMap::new(),
+                next_id: 1,
+            }),
+        })
+    }
+
+    fn meta(&self) -> EventMeta {
+        EventMeta {
+            ts: chrono::Utc::now(),
+            agent_name: self.agent_name.clone(),
+            run_id: self.run_id.clone(),
+            parent_run_id: self.parent_run_id.clone(),
+        }
+    }
+
+    pub fn start(
+        self: &Arc<Self>,
+        command: &str,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<String> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(Error::Tool("command is required".into()));
+        }
+        let cwd = match cwd.map(str::trim).filter(|s| !s.is_empty() && *s != ".") {
+            Some(p) => resolve_in_workspace(&self.workspace, p)?,
+            None => self
+                .workspace
+                .canonicalize()
+                .map_err(|e| Error::Tool(format!("workspace not found: {e}")))?,
+        };
+        if !cwd.is_dir() {
+            return Err(Error::Tool("cwd is not a directory".into()));
+        }
+        let name = self.take_name(name)?;
+
+        let mut cmd = shell_command(command);
+        cmd.current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        hide_window(&mut cmd);
+
+        let mut guard = ProcessGuard::spawn(cmd)
+            .map_err(|e| Error::Tool(format!("run_background spawn failed: {e}")))?;
+        let pid = guard.child_mut().id().unwrap_or(0);
+        let stdout = guard.child_mut().stdout.take();
+        let stderr = guard.child_mut().stderr.take();
+        let (kill_tx, kill_rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.slots.insert(
+                name.clone(),
+                Slot {
+                    command: command.to_string(),
+                    pid,
+                    log: VecDeque::new(),
+                    kill_tx: Some(kill_tx),
+                    alive: true,
+                    detail: String::new(),
+                },
+            );
+        }
+
+        let hub = Arc::clone(self);
+        let wait_name = name.clone();
+        let wait_sink = sink.clone();
+        tokio::spawn(async move {
+            let out = pump_lines(stdout, "out", wait_name.clone(), hub.clone(), wait_sink.clone());
+            let err = pump_lines(stderr, "err", wait_name.clone(), hub.clone(), wait_sink.clone());
+            let wait = wait_or_kill(guard, kill_rx);
+            let (detail, _, _) = tokio::join!(wait, out, err);
+            hub.mark_dead(&wait_name, &detail);
+            wait_sink.emit(&AgentEvent::BackgroundExited {
+                meta: hub.meta(),
+                name: wait_name,
+                detail,
+            });
+        });
+
+        sink.emit(&AgentEvent::BackgroundStarted {
+            meta: self.meta(),
+            name: name.clone(),
+            command: command.to_string(),
+            pid,
+        });
+
+        Ok(json!({
+            "name": name,
+            "pid": pid,
+            "command": command,
+            "alive": true
+        })
+        .to_string())
+    }
+
+    pub fn snapshot(&self, name: &str) -> Result<String> {
+        let inner = self.inner.lock().unwrap();
+        let slot = inner
+            .slots
+            .get(name)
+            .ok_or_else(|| Error::Tool(format!("no background named {name}")))?;
+        Ok(json!({
+            "name": name,
+            "pid": slot.pid,
+            "command": slot.command,
+            "alive": slot.alive,
+            "detail": slot.detail,
+            "log": slot.log.iter().cloned().collect::<Vec<_>>(),
+        })
+        .to_string())
+    }
+
+    pub fn alive_pids(&self) -> Vec<u32> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .slots
+            .values()
+            .filter(|s| s.alive && s.pid > 0)
+            .map(|s| s.pid)
+            .collect()
+    }
+
+    pub fn kill(&self, name: &str) -> Result<String> {
+        let tx = {
+            let mut inner = self.inner.lock().unwrap();
+            let slot = inner
+                .slots
+                .get_mut(name)
+                .ok_or_else(|| Error::Tool(format!("no background named {name}")))?;
+            if !slot.alive {
+                return Ok(json!({"name": name, "killed": false, "detail": slot.detail}).to_string());
+            }
+            slot.kill_tx.take()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+        Ok(json!({"name": name, "killed": true}).to_string())
+    }
+
+    fn push_line(&self, name: &str, line: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(slot) = inner.slots.get_mut(name) {
+                if slot.log.len() >= LOG_CAP {
+                    slot.log.pop_front();
+                }
+                slot.log.push_back(line);
+            }
+        }
+    }
+
+    fn mark_dead(&self, name: &str, detail: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(slot) = inner.slots.get_mut(name) {
+                slot.alive = false;
+                slot.detail = detail.to_string();
+                slot.kill_tx = None;
+            }
+        }
+    }
+
+    fn take_name(&self, requested: Option<&str>) -> Result<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let name = match requested.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let name = sanitize_name(raw)?;
+                if inner.slots.get(&name).is_some_and(|s| s.alive) {
+                    return Err(Error::Tool(format!("background {name} already running")));
+                }
+                name
+            }
+            None => loop {
+                let n = format!("bg-{}", inner.next_id);
+                inner.next_id += 1;
+                if !inner.slots.contains_key(&n) {
+                    break n;
+                }
+            },
+        };
+        let replacing_dead = inner.slots.get(&name).is_some_and(|s| !s.alive);
+        let alive = inner.slots.values().filter(|s| s.alive).count();
+        if alive >= MAX_BACKGROUNDS && !replacing_dead {
+            return Err(Error::Tool(format!(
+                "run_background blocked: max {MAX_BACKGROUNDS} processes"
+            )));
+        }
+        Ok(name)
+    }
+
+    pub async fn shutdown(&self) {
+        let mut kills = Vec::new();
+        if let Ok(mut inner) = self.inner.lock() {
+            for (_, slot) in inner.slots.iter_mut() {
+                if let Some(tx) = slot.kill_tx.take() {
+                    kills.push(tx);
+                }
+            }
+        }
+        for tx in kills {
+            let _ = tx.send(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn sanitize_name(raw: &str) -> Result<String> {
+    if raw.len() > 40 {
+        return Err(Error::Tool("background name too long".into()));
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Tool(
+            "background name must be ascii alphanumeric, dash, or underscore".into(),
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+async fn pump_lines<R: tokio::io::AsyncRead + Unpin + Send>(
+    pipe: Option<R>,
+    stream: &'static str,
+    name: String,
+    hub: Arc<BackgroundHub>,
+    sink: Arc<dyn EventSink>,
+) {
+    let Some(pipe) = pipe else {
+        return;
+    };
+    let mut lines = BufReader::new(pipe).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        hub.push_line(&name, format!("{stream} {line}"));
+        sink.emit(&AgentEvent::BackgroundOutput {
+            meta: hub.meta(),
+            name: name.clone(),
+            stream: stream.to_string(),
+            text: line,
+        });
+    }
+}
+
+async fn wait_or_kill(mut guard: ProcessGuard, kill_rx: oneshot::Receiver<()>) -> String {
+    tokio::select! {
+        status = guard.child_mut().wait() => match status {
+            Ok(s) => format!("exit {}", s.code().unwrap_or(-1)),
+            Err(e) => format!("wait: {e}"),
+        },
+        _ = kill_rx => {
+            let _ = guard.kill().await;
+            "killed".into()
+        }
+    }
+}
+
+pub struct RunBackgroundTool {
+    hub: Arc<BackgroundHub>,
+    sink: Arc<dyn EventSink>,
+    guard: Option<Arc<dyn CommandReviewer>>,
+}
+
+impl RunBackgroundTool {
+    pub fn new(
+        hub: Arc<BackgroundHub>,
+        sink: Arc<dyn EventSink>,
+        guard: Option<Arc<dyn CommandReviewer>>,
+    ) -> Self {
+        Self { hub, sink, guard }
+    }
+}
+
+impl ClientTool for RunBackgroundTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "run_background".into(),
+            description: "Start a workspace shell command in the background and return immediately. Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. Do not use this for short commands — use run_command.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command (cwd = workspace unless cwd is set)"},
+                    "name": {"type": "string", "description": "Optional process name (ascii, dash, underscore)"},
+                    "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: &Value) -> ToolCallFut<'_> {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+        let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let hub = self.hub.clone();
+        let sink = self.sink.clone();
+        let guard = self.guard.clone();
+        Box::pin(async move {
+            shellguard::enforce(guard.as_ref(), &command, cwd.as_deref().unwrap_or(".")).await?;
+            hub.start(&command, name.as_deref(), cwd.as_deref(), sink)
+        })
+    }
+}
+
+pub struct ReadBackgroundTool {
+    hub: Arc<BackgroundHub>,
+}
+
+impl ReadBackgroundTool {
+    pub fn new(hub: Arc<BackgroundHub>) -> Self {
+        Self { hub }
+    }
+}
+
+impl ClientTool for ReadBackgroundTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_background".into(),
+            description: "Read status and recent stdout/stderr of a background process started with run_background.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Process name returned by run_background"}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: &Value) -> ToolCallFut<'_> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let hub = self.hub.clone();
+        Box::pin(async move { hub.snapshot(&name) })
+    }
+}
+
+pub struct KillBackgroundTool {
+    hub: Arc<BackgroundHub>,
+}
+
+impl KillBackgroundTool {
+    pub fn new(hub: Arc<BackgroundHub>) -> Self {
+        Self { hub }
+    }
+}
+
+impl ClientTool for KillBackgroundTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "kill_background".into(),
+            description: "Stop a background process started with run_background.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: &Value) -> ToolCallFut<'_> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let hub = self.hub.clone();
+        Box::pin(async move { hub.kill(&name) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Rec(Mutex<Vec<AgentEvent>>);
+    impl EventSink for Rec {
+        fn emit(&self, event: &AgentEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    fn hang_cmd() -> &'static str {
+        #[cfg(windows)]
+        {
+            "ping -n 60 127.0.0.1 >nul"
+        }
+        #[cfg(not(windows))]
+        {
+            "sleep 60"
+        }
+    }
+
+    fn echo_cmd() -> &'static str {
+        #[cfg(windows)]
+        {
+            "echo hello-bg"
+        }
+        #[cfg(not(windows))]
+        {
+            "printf 'hello-bg\\n'"
+        }
+    }
+
+    fn hub(dir: &std::path::Path) -> Arc<BackgroundHub> {
+        BackgroundHub::new(dir.to_path_buf(), "root".into(), "r".into(), None)
+    }
+
+    #[test]
+    fn alive_pids_empty_until_a_process_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = hub(dir.path());
+        assert!(h.alive_pids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_captures_output_then_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let sink: Arc<dyn EventSink> = rec.clone();
+        let out = hub.start(echo_cmd(), Some("echo"), None, sink).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "echo");
+        assert_eq!(v["alive"], true);
+
+        let mut got_out = false;
+        let mut exited = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let evs = rec.0.lock().unwrap().clone();
+            got_out = evs.iter().any(|e| {
+                matches!(e, AgentEvent::BackgroundOutput { text, .. } if text.contains("hello-bg"))
+            });
+            exited = evs
+                .iter()
+                .any(|e| matches!(e, AgentEvent::BackgroundExited { name, .. } if name == "echo"));
+            if got_out && exited {
+                break;
+            }
+        }
+        assert!(got_out, "stdout never arrived: {:?}", rec.0.lock().unwrap());
+        assert!(exited, "BackgroundExited never arrived: {:?}", rec.0.lock().unwrap());
+        let snap: Value = serde_json::from_str(&hub.snapshot("echo").unwrap()).unwrap();
+        assert_eq!(snap["alive"], false);
+        let log = snap["log"].as_array().unwrap();
+        assert!(
+            log.iter().any(|l| l.as_str().unwrap_or("").contains("hello-bg")),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_stops_a_hanging_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let sink: Arc<dyn EventSink> = rec.clone();
+        hub.start(hang_cmd(), Some("hang"), None, sink).unwrap();
+        let pids = hub.alive_pids();
+        assert_eq!(pids.len(), 1, "{pids:?}");
+        assert!(pids[0] > 0);
+        let killed: Value = serde_json::from_str(&hub.kill("hang").unwrap()).unwrap();
+        assert_eq!(killed["killed"], true);
+        let mut exited = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if rec.0.lock().unwrap().iter().any(|e| {
+                matches!(e, AgentEvent::BackgroundExited { name, detail, .. } if name == "hang" && detail.contains("killed"))
+            }) {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "kill never produced BackgroundExited");
+        let snap: Value = serde_json::from_str(&hub.snapshot("hang").unwrap()).unwrap();
+        assert_eq!(snap["alive"], false);
+        assert!(hub.alive_pids().is_empty(), "{:?}", hub.alive_pids());
+    }
+
+    #[tokio::test]
+    async fn empty_command_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        let err = hub.start("  ", None, None, rec).unwrap_err();
+        assert!(err.to_string().contains("command is required"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fifth_alive_blocked_until_one_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        for i in 1..=4 {
+            hub.start(hang_cmd(), Some(&format!("hang{i}")), None, rec.clone())
+                .unwrap();
+        }
+        let err = hub
+            .start(hang_cmd(), Some("hang5"), None, rec.clone())
+            .unwrap_err();
+        assert!(err.to_string().contains("max"), "{err}");
+        hub.kill("hang1").unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let snap: Value = serde_json::from_str(&hub.snapshot("hang1").unwrap()).unwrap();
+            if snap["alive"] == false {
+                break;
+            }
+        }
+        let out = hub
+            .start(hang_cmd(), Some("hang5"), None, rec.clone())
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "hang5");
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dead_name_can_be_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        hub.start(echo_cmd(), Some("echo"), None, rec.clone()).unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let snap: Value = serde_json::from_str(&hub.snapshot("echo").unwrap()).unwrap();
+            if snap["alive"] == false {
+                break;
+            }
+        }
+        let out = hub.start(echo_cmd(), Some("echo"), None, rec).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "echo");
+        assert_eq!(v["alive"], true);
+        hub.shutdown().await;
+    }
+}
