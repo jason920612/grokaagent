@@ -333,6 +333,60 @@ fn emit_file_changes(
     }
 }
 
+/// The working model writes long-term memory because it lived the turns.
+/// Not streamed to the TUI and not kept as a chat turn. `store: false` so
+/// this does not extend the Responses chain.
+async fn ask_lived_memory<P: Provider>(
+    provider: &P,
+    instructions: &str,
+    goal: &str,
+    model: &str,
+    effort: ReasoningEffort,
+    send_reasoning: bool,
+    head: &[Value],
+    previous_response_id: Option<&str>,
+    use_response_chain: bool,
+) -> Option<String> {
+    if head.is_empty() {
+        return None;
+    }
+    let ask = json!({
+        "role": "user",
+        "content": compact::memory_ask(goal)
+    });
+    let chained = use_response_chain && previous_response_id.is_some();
+    let input = if chained {
+        vec![ask]
+    } else {
+        let mut input = head.to_vec();
+        input.push(ask);
+        input
+    };
+    let req = CompleteRequest {
+        instructions: instructions.to_string(),
+        input,
+        client_tools: vec![],
+        server_tools: vec![],
+        cache_key: prompt_cache_key(model, &[], &[]),
+        previous_response_id: if chained {
+            previous_response_id.map(str::to_string)
+        } else {
+            None
+        },
+        store: false,
+        reasoning_effort: effort,
+        send_reasoning,
+        model: model.to_string(),
+        tool_choice: Some("none".into()),
+    };
+    match provider.complete(req).await {
+        Ok(r) if r.function_calls.is_empty() && compact::lived_brief_usable(&r.text) => {
+            Some(r.text)
+        }
+        _ => None,
+    }
+}
+
 pub async fn run<P: Provider>(
     provider: &P,
     tools: &ToolRegistry,
@@ -467,9 +521,20 @@ pub async fn run<P: Provider>(
             .input_tokens
             .max(compact::estimate_tokens(&cfg.instructions, &history));
         if compact::should_compact(used, window, history.len(), keep_recent) {
-            match compact::compact_history(provider, &cache_key, &cfg.prompt, &history, keep_recent)
-                .await
-            {
+            let (head, _) = compact::split_head_tail(&history, keep_recent);
+            let lived = ask_lived_memory(
+                provider,
+                &cfg.instructions,
+                &cfg.prompt,
+                &model,
+                effort,
+                send_reasoning,
+                head,
+                previous_response_id.as_deref(),
+                use_response_chain,
+            )
+            .await;
+            match compact::compact_history(&cfg.prompt, &history, keep_recent, lived.as_deref()) {
                 Ok(c) => {
                     compacted += 1;
                     sink.emit(&AgentEvent::ContextCompacted {
@@ -784,7 +849,7 @@ pub async fn run<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::COMPACT_MARK;
+    use crate::compact::{COMPACT_MARK, MEMORY_FOLD_MARK};
     use crate::events::AgentEvent;
     use crate::memory::ProjectMemoryTool;
     use crate::provider::{CacheUsage, CompactRequest, CompactResponse, CompleteResponse, FunctionCall};
@@ -1519,6 +1584,10 @@ mod tests {
             replies: Mutex::new(pop_front(vec![
                 first,
                 CompleteResponse {
+                    text: "## Original request\nship the kernel\n## Direction changes\nnone\n## Load-bearing facts\nkeep the ABI stable\n## Where you were\nporting the scheduler\n".into(),
+                    ..CompleteResponse::new("mem")
+                },
+                CompleteResponse {
                     text: "done".into(),
                     usage: CacheUsage {
                         input_tokens: 20,
@@ -1543,14 +1612,21 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::ContextCompacted { method, kept_items, .. }
-                if method == "xai" && *kept_items == 2
+                if method == "lived" && *kept_items >= 2
         )));
 
         let calls = provider.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].previous_response_id, None);
-        assert_eq!(calls[1].input[0]["type"], "compaction");
-        let contents: Vec<String> = calls[1]
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].client_tools.is_empty());
+        assert_eq!(calls[1].tool_choice.as_deref(), Some("none"));
+        assert!(!calls[1].store);
+        assert_eq!(calls[1].previous_response_id.as_deref(), Some("1"));
+        let mem_ask = calls[1].input.last().unwrap()["content"].as_str().unwrap();
+        assert!(mem_ask.contains(MEMORY_FOLD_MARK), "{mem_ask}");
+        assert!(mem_ask.contains("not a new user task"), "{mem_ask}");
+        assert_eq!(calls[2].previous_response_id, None);
+        assert_ne!(calls[2].input[0].get("type").and_then(Value::as_str), Some("compaction"));
+        let contents: Vec<String> = calls[2]
             .input
             .iter()
             .filter_map(|i| i.get("content").and_then(Value::as_str).map(str::to_string))
@@ -1559,8 +1635,16 @@ mod tests {
             contents.iter().any(|c| c.contains("ship the kernel") && c.contains(COMPACT_MARK)),
             "{contents:?}"
         );
-        assert_eq!(calls[1].input.last().unwrap()["type"], "function_call_output");
-        assert!(provider.compact_calls.lock().unwrap().len() == 1);
+        assert!(
+            contents.iter().any(|c| c.contains("porting the scheduler")),
+            "{contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains("not a new user request")),
+            "{contents:?}"
+        );
+        assert_eq!(calls[2].input.last().unwrap()["type"], "function_call_output");
+        assert!(provider.compact_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

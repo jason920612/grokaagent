@@ -650,7 +650,11 @@ fn complete_payload(model: &str, req: &CompleteRequest) -> Value {
         payload["previous_response_id"] = json!(prev);
     }
     if let Some(name) = &req.tool_choice {
-        payload["tool_choice"] = json!({"type": "function", "name": name});
+        if name == "none" {
+            payload["tool_choice"] = json!("none");
+        } else {
+            payload["tool_choice"] = json!({"type": "function", "name": name});
+        }
     }
     payload
 }
@@ -1175,6 +1179,18 @@ mod tests {
         assert_eq!(forced["tool_choice"]["name"], "shell_verdict");
         assert_eq!(forced["store"], false);
         assert_eq!(forced["prompt_cache_key"], "grokaagent:shellguard:v1:cmd");
+        let none = complete_payload(
+            "grok-4.6",
+            &CompleteRequest {
+                tool_choice: Some("none".into()),
+                client_tools: vec![],
+                server_tools: vec![],
+                store: false,
+                ..req.clone()
+            },
+        );
+        assert_eq!(none["tool_choice"], "none");
+        assert!(none.get("tools").is_none(), "{none}");
         let omitted = complete_payload(
             "no-think",
             &CompleteRequest {
