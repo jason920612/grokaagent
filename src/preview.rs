@@ -209,16 +209,28 @@ pub fn write_blits<W: Write>(out: &mut W, blits: &[GraphicBlit]) -> io::Result<(
 }
 
 pub fn cell_size_for(picker: &Picker, path: &Path, max_cols: u16, max_rows: u16) -> (u16, u16) {
-    let max_cols = max_cols.min(MAX_COLS).max(1);
-    let max_rows = max_rows.min(MAX_ROWS).max(1);
-    let Ok(img) = image::open(path) else {
+    fit_cells(
+        picker,
+        path,
+        max_cols.min(MAX_COLS).max(1),
+        max_rows.min(MAX_ROWS).max(1),
+    )
+}
+
+/// Fit into `max_cols`×`max_rows` without the in-chat thumbnail cap.
+pub fn cell_size_fit(picker: &Picker, path: &Path, max_cols: u16, max_rows: u16) -> (u16, u16) {
+    fit_cells(picker, path, max_cols.max(1), max_rows.max(1))
+}
+
+fn fit_cells(picker: &Picker, path: &Path, max_cols: u16, max_rows: u16) -> (u16, u16) {
+    let Ok((iw, ih)) = image::image_dimensions(path) else {
         return (max_cols.min(24).max(1), 2);
     };
     let (fw, fh) = picker.font_size();
     let fw = fw.max(1) as f32;
     let fh = fh.max(1) as f32;
-    let need_w = (img.width() as f32 / fw).ceil().max(1.0);
-    let need_h = (img.height() as f32 / fh).ceil().max(1.0);
+    let need_w = (iw.max(1) as f32 / fw).ceil().max(1.0);
+    let need_h = (ih.max(1) as f32 / fh).ceil().max(1.0);
     let scale = (max_cols as f32 / need_w)
         .min(max_rows as f32 / need_h)
         .min(1.0);
@@ -421,6 +433,25 @@ mod tests {
         }
         assert!(!buf[(1, 1)].skip);
         assert_eq!(buf[(1, 1)].symbol(), " ");
+    }
+
+    #[test]
+    fn cell_size_fit_can_exceed_chat_thumbnail_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.png");
+        image::RgbImage::from_pixel(400, 400, image::Rgb([255, 0, 0]))
+            .save(&path)
+            .unwrap();
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let (cw, ch) = cell_size_for(&picker, &path, 80, 40);
+        assert!(ch <= MAX_ROWS, "{ch}");
+        let (vw, vh) = cell_size_fit(&picker, &path, 80, 40);
+        assert!(
+            vh > MAX_ROWS,
+            "viewer height {vh} should exceed chat cap {MAX_ROWS}"
+        );
+        assert!(vw >= cw && vh > ch, "chat {cw}x{ch} viewer {vw}x{vh}");
     }
 
     #[test]

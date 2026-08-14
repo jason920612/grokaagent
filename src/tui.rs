@@ -12,7 +12,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -325,6 +325,10 @@ enum Hit {
     InspectorClose,
     ChatRow(u16),
     ChatImage(u16),
+    JumpBottom,
+    ImageView,
+    ImageViewClose,
+    ImageViewDismiss,
     PasteImage,
     PendingClose(u16),
     AskOption(u16),
@@ -1159,6 +1163,7 @@ struct App {
     area: Rect,
     streaming: bool,
     composer_inner: Rect,
+    chat_inner: Rect,
     composer_vscroll: u16,
     input_dragging: bool,
     catalog: ModelCatalog,
@@ -1190,9 +1195,11 @@ struct App {
     preview: HashMap<(String, u16), Vec<Line<'static>>>,
     picker: Option<Picker>,
     image_proto: HashMap<(String, u16, u16), Protocol>,
+    image_cells: HashMap<(String, u16, u16), (u16, u16)>,
     graphic_blits: Vec<crate::preview::GraphicBlit>,
     last_graphic_blits: Vec<crate::preview::GraphicBlit>,
     image_hits: Vec<String>,
+    image_view: Option<String>,
     children: Vec<SideChild>,
     monitors: Vec<SideMon>,
     backgrounds: Vec<SideBg>,
@@ -1580,6 +1587,19 @@ impl App {
         if self.focus == Focus::Inspector {
             self.focus = Focus::Chat;
         }
+    }
+
+    fn open_image_view(&mut self, rel: String) {
+        self.chat_sel = ChatSel::Image(rel.clone());
+        self.image_view = Some(rel);
+        self.close_inspector();
+        self.open_tool = None;
+        self.focus = Focus::Chat;
+    }
+
+    fn close_image_view(&mut self) {
+        self.image_view = None;
+        self.focus = Focus::Chat;
     }
 
     fn attach_pending(&mut self, rel: String) -> bool {
@@ -2072,6 +2092,7 @@ impl App {
         self.chat_sel = ChatSel::None;
         self.preview.clear();
         self.image_proto.clear();
+        self.image_cells.clear();
         self.graphic_blits.clear();
         self.last_graphic_blits.clear();
         self.children = p.children;
@@ -2080,6 +2101,7 @@ impl App {
         self.inspector = p.inspector;
         self.inspector_scroll = p.inspector_scroll;
         self.composer_vscroll = 0;
+        self.image_view = None;
         self.ask = None;
         if self.focus == Focus::Ask {
             self.focus = Focus::Chat;
@@ -2997,14 +3019,24 @@ fn push_image_block(
         ));
     }
     let max_cols = cols.saturating_sub(crate::preview::INDENT);
-    if let Some(picker) = app.picker.as_ref().filter(|p| crate::preview::uses_graphics(p)) {
-        let abs = app.session.workspace.join(rel);
-        let (w, h) = crate::preview::cell_size_for(
-            picker,
-            &abs,
-            max_cols,
-            crate::preview::MAX_ROWS,
-        );
+    let max_rows = crate::preview::MAX_ROWS;
+    let uses_gfx = app
+        .picker
+        .as_ref()
+        .is_some_and(crate::preview::uses_graphics);
+    if uses_gfx {
+        let key = (rel.to_string(), max_cols, max_rows);
+        let (w, h) = if let Some(&sz) = app.image_cells.get(&key) {
+            sz
+        } else {
+            let abs = app.session.workspace.join(rel);
+            let sz = {
+                let picker = app.picker.as_ref().expect("graphics picker");
+                crate::preview::cell_size_for(picker, &abs, max_cols, max_rows)
+            };
+            app.image_cells.insert(key, sz);
+            sz
+        };
         out.push(chat_graphic(rel.to_string(), w, h, hit));
         return;
     }
@@ -3979,6 +4011,7 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     draw_header(f, app, opts, chunks[0]);
     let tool_hits = draw_chat(f, app, chunks[1]);
     draw_tool_panel(f, app, chunks[1], &tool_hits);
+    draw_jump_bottom(f, app, chunks[1]);
     let composer_caret = draw_composer(f, app, opts, chunks[2]);
     let mut caret = composer_caret;
     if app.focus == Focus::Rename {
@@ -4008,6 +4041,9 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     }
     if app.inspector.is_some() {
         draw_inspector(f, app, f.area());
+    }
+    if app.image_view.is_some() {
+        draw_image_view(f, app, f.area());
     }
     if app.ask.is_some() {
         if let Some(pos) = draw_ask(f, app) {
@@ -4604,6 +4640,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         area.width.saturating_sub(2),
         area.height.saturating_sub(1),
     );
+    app.chat_inner = inner;
     let mut tool_hits = Vec::new();
     if inner.width == 0 || inner.height == 0 {
         return tool_hits;
@@ -4645,10 +4682,11 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
             Paint::Graphic { height, .. } => *height,
         })
         .sum();
+    let max_off = total.saturating_sub(inner.height);
     let scroll = if app.stick_bottom {
-        total.saturating_sub(inner.height)
+        max_off
     } else {
-        app.scroll.min(total.saturating_sub(1))
+        max_off.saturating_sub(app.scroll.min(max_off))
     };
     let vis_end = scroll.saturating_add(inner.height);
     let mut logical = 0u16;
@@ -4702,14 +4740,6 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
                             Rect::new(inner.x, screen_y, inner.width, 1),
                         );
                     }
-                } else {
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "      圖片（捲動以完整顯示）",
-                            Style::default().fg(DIM),
-                        )),
-                        Rect::new(inner.x, screen_y, inner.width, 1),
-                    );
                 }
                 let hit_r = Rect::new(inner.x, screen_y, inner.width, vis_h);
                 if let Some(kind) = hit {
@@ -4756,6 +4786,138 @@ fn flush_image_blits(app: &mut App) -> Result<()> {
     crate::preview::write_blits(&mut io::stdout(), &app.graphic_blits)?;
     app.last_graphic_blits.clone_from(&app.graphic_blits);
     Ok(())
+}
+
+const WHEEL_LINES: u16 = 3;
+
+fn chat_scroll_step(_app: &App) -> u16 {
+    WHEEL_LINES
+}
+
+fn page_scroll_step(app: &App) -> u16 {
+    app.chat_inner.height.saturating_sub(1).max(8)
+}
+
+fn scroll_chat(app: &mut App, delta: i32) {
+    if delta > 0 {
+        app.stick_bottom = false;
+        app.scroll = app.scroll.saturating_add(delta as u16);
+        return;
+    }
+    app.scroll = app.scroll.saturating_sub((-delta) as u16);
+    if app.scroll == 0 {
+        app.stick_bottom = true;
+    }
+}
+
+fn jump_chat_bottom(app: &mut App) {
+    app.stick_bottom = true;
+    app.scroll = 0;
+}
+
+fn draw_jump_bottom(f: &mut Frame, app: &mut App, chat: Rect) {
+    if app.stick_bottom || app.image_view.is_some() {
+        return;
+    }
+    let label = " ▼ ";
+    let w = display_cols(label);
+    if chat.width < w + 2 || chat.height < 2 {
+        return;
+    }
+    let x = chat.x + chat.width.saturating_sub(w) / 2;
+    let y = chat.y + chat.height.saturating_sub(1);
+    let r = Rect::new(x, y, w, 1);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        r,
+    );
+    app.hits.push((r, Hit::JumpBottom));
+}
+
+fn image_view_rect(area: Rect) -> Rect {
+    let max_w = area.width.saturating_sub(2).max(1);
+    let max_h = area.height.saturating_sub(2).max(1);
+    let w = (area.width.saturating_mul(9) / 10).min(max_w).max(24.min(max_w));
+    let h = (area.height.saturating_mul(9) / 10).min(max_h).max(12.min(max_h));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
+fn draw_image_view(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(rel) = app.image_view.clone() else {
+        return;
+    };
+    app.hits.push((area, Hit::ImageViewDismiss));
+    let panel = image_view_rect(area);
+    f.render_widget(Clear, panel);
+    let name = std::path::Path::new(&rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&rel);
+    f.render_widget(
+        Block::default()
+            .title(format!(" 圖片  {name}  · Esc 關閉  · Ctrl+C 複製 "))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL).fg(TEXT)),
+        panel,
+    );
+    let close = Rect::new(
+        panel.x + panel.width.saturating_sub(4),
+        panel.y,
+        3,
+        1,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(" × ", Style::default().fg(WARN))),
+        close,
+    );
+    app.hits.push((panel, Hit::ImageView));
+    app.hits.push((close, Hit::ImageViewClose));
+
+    let inner = Rect::new(
+        panel.x.saturating_add(1),
+        panel.y.saturating_add(1),
+        panel.width.saturating_sub(2),
+        panel.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let abs = app.session.workspace.join(&rel);
+    let picker = app.picker.clone();
+    if let Some(picker) = picker.filter(|p| crate::preview::uses_graphics(p)) {
+        let (w, h) = crate::preview::cell_size_fit(&picker, &abs, inner.width, inner.height);
+        if let Some(proto) = cached_graphic(app, &rel, w, h) {
+            let area = proto.area();
+            let draw = Rect::new(
+                inner.x,
+                inner.y,
+                area.width.min(inner.width),
+                area.height.min(inner.height),
+            );
+            if draw.width > 0 && draw.height > 0 {
+                paint_chat_graphic(f, app, &proto, draw);
+            }
+        } else {
+            f.render_widget(
+                Paragraph::new(Span::styled("[無法預覽]", Style::default().fg(DIM))),
+                inner,
+            );
+        }
+        return;
+    }
+    let lines = crate::preview::from_path(&abs, inner.width, inner.height);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_tool_panel(f: &mut Frame, app: &mut App, chat: Rect, tool_hits: &[(Rect, Hit)]) {
@@ -5046,7 +5208,7 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
         "Enter 完成編輯  ·  Esc 或點取消 還原  ·  工作結束也不會送出，直到編輯完成".to_string()
     } else {
         format!(
-            "Enter 送出  ·  點「貼上圖片」附圖  ·  點訊息後 Ctrl+C 複製  ·  Ctrl+Q 離開  ·  {} · {}",
+            "Enter 送出  ·  點「貼上圖片」附圖  ·  點圖片放大  ·  點訊息後 Ctrl+C 複製  ·  Ctrl+Q 離開  ·  {} · {}",
             opts.model,
             opts.reasoning_effort.label()
         )
@@ -5853,6 +6015,7 @@ async fn tui_loop(
         area: Rect::default(),
         streaming: false,
         composer_inner: Rect::default(),
+        chat_inner: Rect::default(),
         composer_vscroll: 0,
         input_dragging: false,
         catalog: ModelCatalog::default(),
@@ -5882,9 +6045,11 @@ async fn tui_loop(
             preview: HashMap::new(),
             picker: Some(crate::preview::detect_picker()),
             image_proto: HashMap::new(),
+            image_cells: HashMap::new(),
             graphic_blits: Vec::new(),
             last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
+            image_view: None,
             children: Vec::new(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
@@ -5971,34 +6136,26 @@ async fn tui_loop(
         tokio::select! {
             maybe = keys.next() => {
                 match maybe {
-                    Some(Ok(Event::Key(key))) => {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
+                    Some(Ok(ev)) => {
+                        if handle_input(&mut app, &mut opts, ev, &sink, &done_tx) {
+                            break;
                         }
-                        if handle_key(&mut app, &mut opts, key.code, key.modifiers, &sink, &done_tx) {
+                        let mut quit = false;
+                        while let Some(ready) = keys.next().now_or_never() {
+                            match ready {
+                                Some(Ok(ev)) => {
+                                    quit = handle_input(&mut app, &mut opts, ev, &sink, &done_tx);
+                                }
+                                _ => break,
+                            }
+                            if quit {
+                                break;
+                            }
+                        }
+                        if quit {
                             break;
                         }
                     }
-                    Some(Ok(Event::Mouse(m))) => {
-                        handle_mouse(&mut app, &mut opts, m.kind, m.column, m.row, m.modifiers);
-                    }
-                    Some(Ok(Event::Paste(s))) => {
-                        if app.workspace_pick.is_some() {
-                            if let Some(p) = app.workspace_pick.as_mut() {
-                                p.edit.insert_str(&s);
-                            }
-                            app.sync_workspace_pick();
-                        } else if app.ask.as_ref().is_some_and(|a| a.filling) {
-                            if let Some(ask) = app.ask.as_mut() {
-                                let remain = ask::MAX_INPUT.saturating_sub(ask.fill_edit.len());
-                                let clipped: String = s.chars().take(remain).collect();
-                                ask.fill_edit.insert_str(&clipped);
-                            }
-                        } else {
-                            app.paste_from_terminal(&s);
-                        }
-                    }
-                    Some(Ok(Event::Resize(_, _))) => {}
                     _ => continue,
                 }
             }
@@ -6391,7 +6548,9 @@ fn handle_key(
 
     match (code, mods) {
         (KeyCode::Esc, _) => {
-            if app.inspector.is_some() {
+            if app.image_view.is_some() {
+                app.close_image_view();
+            } else if app.inspector.is_some() {
                 app.close_inspector();
             } else if app.queue_edit.is_some() {
                 app.cancel_queue_edit();
@@ -6463,14 +6622,10 @@ fn handle_key(
             }
         }
         (KeyCode::PageUp, _) => {
-            app.stick_bottom = false;
-            app.scroll = app.scroll.saturating_add(5);
+            scroll_chat(app, page_scroll_step(app) as i32);
         }
         (KeyCode::PageDown, _) => {
-            app.scroll = app.scroll.saturating_sub(5);
-            if app.scroll == 0 {
-                app.stick_bottom = true;
-            }
+            scroll_chat(app, -(page_scroll_step(app) as i32));
         }
         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
             if app.queue_edit.is_some() {
@@ -6808,6 +6963,16 @@ fn handle_mouse(
                 }
                 return;
             }
+            if app.image_view.is_some() {
+                match hit {
+                    Some(Hit::ImageViewClose) | Some(Hit::ImageViewDismiss) => {
+                        app.close_image_view();
+                    }
+                    Some(Hit::ImageView) => {}
+                    _ => app.close_image_view(),
+                }
+                return;
+            }
             match hit {
                 Some(Hit::Gear) | Some(Hit::ModelChip) => open_settings(app),
                 Some(Hit::QueueChip) => {
@@ -6875,9 +7040,8 @@ fn handle_mouse(
                     app.commit_rename();
                     app.focus = Focus::Chat;
                     if let Some(path) = app.image_hits.get(i as usize).cloned() {
-                        app.chat_sel = ChatSel::Image(path);
+                        app.open_image_view(path);
                     }
-                    let _ = app.dismiss_tool_ui();
                 }
                 Some(Hit::Composer) => {
                     app.commit_rename();
@@ -6914,6 +7078,10 @@ fn handle_mouse(
                 Some(Hit::ToolPanel) => {}
                 Some(Hit::ToolPanelClose) => {
                     app.open_tool = None;
+                }
+                Some(Hit::JumpBottom) => {
+                    app.focus = Focus::Chat;
+                    jump_chat_bottom(app);
                 }
                 Some(Hit::DismissTool) | Some(Hit::Chat) => {
                     app.commit_rename();
@@ -7025,7 +7193,10 @@ fn handle_mouse(
                 | Some(Hit::WsEntry(_))
                 | Some(Hit::WsConfirm)
                 | Some(Hit::WsCreate)
-                | Some(Hit::WsCancel) => {}
+                | Some(Hit::WsCancel)
+                | Some(Hit::ImageView)
+                | Some(Hit::ImageViewClose)
+                | Some(Hit::ImageViewDismiss) => {}
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -7050,6 +7221,9 @@ fn handle_mouse(
             app.input_dragging = false;
         }
         MouseEventKind::ScrollUp => {
+            if app.image_view.is_some() {
+                return;
+            }
             if app.workspace_pick.is_some() {
                 ws_move_cursor(app, -1);
             } else if app.drop.is_some() && app.focus == Focus::Settings {
@@ -7058,11 +7232,13 @@ fn handle_mouse(
             } else if app.focus == Focus::Inspector {
                 app.inspector_scroll = app.inspector_scroll.saturating_add(1);
             } else {
-                app.stick_bottom = false;
-                app.scroll = app.scroll.saturating_add(1);
+                scroll_chat(app, chat_scroll_step(app) as i32);
             }
         }
         MouseEventKind::ScrollDown => {
+            if app.image_view.is_some() {
+                return;
+            }
             if app.workspace_pick.is_some() {
                 ws_move_cursor(app, 1);
             } else if app.drop.is_some() && app.focus == Focus::Settings {
@@ -7074,13 +7250,50 @@ fn handle_mouse(
             } else if app.focus == Focus::Inspector {
                 app.inspector_scroll = app.inspector_scroll.saturating_sub(1);
             } else {
-                app.scroll = app.scroll.saturating_sub(1);
-                if app.scroll == 0 {
-                    app.stick_bottom = true;
-                }
+                scroll_chat(app, -(chat_scroll_step(app) as i32));
             }
         }
         _ => {}
+    }
+}
+
+fn handle_input(
+    app: &mut App,
+    opts: &mut TuiOptions,
+    ev: Event,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+) -> bool {
+    match ev {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return false;
+            }
+            handle_key(app, opts, key.code, key.modifiers, sink, done_tx)
+        }
+        Event::Mouse(m) => {
+            handle_mouse(app, opts, m.kind, m.column, m.row, m.modifiers);
+            false
+        }
+        Event::Paste(s) => {
+            if app.workspace_pick.is_some() {
+                if let Some(p) = app.workspace_pick.as_mut() {
+                    p.edit.insert_str(&s);
+                }
+                app.sync_workspace_pick();
+            } else if app.ask.as_ref().is_some_and(|a| a.filling) {
+                if let Some(ask) = app.ask.as_mut() {
+                    let remain = ask::MAX_INPUT.saturating_sub(ask.fill_edit.len());
+                    let clipped: String = s.chars().take(remain).collect();
+                    ask.fill_edit.insert_str(&clipped);
+                }
+            } else {
+                app.paste_from_terminal(&s);
+            }
+            false
+        }
+        Event::Resize(_, _) => false,
+        _ => false,
     }
 }
 
@@ -8096,6 +8309,232 @@ mod tests {
     }
 
     #[test]
+    fn wheel_scrolls_three_lines_and_returns_to_bottom() {
+        let mut app = test_app();
+        app.chat_inner = Rect::new(0, 0, 40, 30);
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::ScrollUp,
+            20,
+            10,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(chat_scroll_step(&app), 3);
+        assert_eq!(app.scroll, 3);
+        assert!(!app.stick_bottom);
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::ScrollDown,
+            20,
+            10,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.scroll, 0);
+        assert!(app.stick_bottom);
+    }
+
+    fn buf_hay(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn wheel_up_from_bottom_stays_near_latest() {
+        let mut app = test_app();
+        for i in 0..40 {
+            app.push(Row::User(format!("msg-{i:02}").into()));
+        }
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: PathBuf::from("."),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        let at_bottom = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let hay = buf_hay(at_bottom.buffer);
+        assert!(hay.contains("msg-39"), "{hay}");
+        assert!(
+            !hay.contains("msg-00"),
+            "bottom view must not start at the oldest: {hay}"
+        );
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::ScrollUp,
+            40,
+            10,
+            KeyModifiers::NONE,
+        );
+        let after = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let hay = buf_hay(after.buffer);
+        assert!(
+            !hay.contains("msg-00"),
+            "one wheel tick must not jump to the top: {hay}"
+        );
+        assert!(
+            hay.contains("msg-36") || hay.contains("msg-35") || hay.contains("msg-37"),
+            "should still be near the latest messages: {hay}"
+        );
+    }
+
+    #[test]
+    fn clipped_sixel_keeps_blank_space_not_a_placeholder_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = write_red_png(dir.path(), "red.png");
+        let mut app = test_app();
+        app.session.workspace = dir.path().to_path_buf();
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        app.picker = Some(picker);
+        for i in 0..30 {
+            app.push(Row::User(format!("pad-{i}").into()));
+        }
+        app.push(Row::User(UserMsg {
+            text: "see".into(),
+            images: vec![rel],
+        }));
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: app.session.workspace.clone(),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            !app.graphic_blits.is_empty(),
+            "fully visible sixel at the bottom should blit"
+        );
+        app.stick_bottom = false;
+        app.scroll = 1;
+        let clipped = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let hay = buf_hay(clipped.buffer);
+        assert!(
+            !hay.contains("捲動以完整顯示"),
+            "partial image must keep blank height, not collapse: {hay}"
+        );
+        assert!(
+            app.graphic_blits.is_empty(),
+            "sixel that is not fully on screen must not blit"
+        );
+    }
+
+    #[test]
+    fn jump_bottom_click_sticks_to_latest() {
+        let mut app = test_app();
+        app.stick_bottom = false;
+        app.scroll = 20;
+        app.hits = vec![(Rect::new(20, 18, 3, 1), Hit::JumpBottom)];
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            21,
+            18,
+            KeyModifiers::NONE,
+        );
+        assert!(app.stick_bottom);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn jump_bottom_button_only_when_scrolled_up() {
+        let mut app = test_app();
+        for i in 0..40 {
+            app.push(Row::User(format!("line {i}").into()));
+        }
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: PathBuf::from("."),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            !app.hits.iter().any(|(_, h)| *h == Hit::JumpBottom),
+            "hidden while already at the bottom"
+        );
+        app.stick_bottom = false;
+        app.scroll = 12;
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            app.hits.iter().any(|(_, h)| *h == Hit::JumpBottom),
+            "▼ must appear above the composer after scrolling up"
+        );
+    }
+
+    #[test]
+    fn click_image_opens_viewer_esc_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = write_red_png(dir.path(), "shot.png");
+        let mut app = test_app();
+        app.session.workspace = dir.path().to_path_buf();
+        app.image_hits = vec![rel.clone()];
+        app.hits = vec![(Rect::new(0, 4, 20, 6), Hit::ChatImage(0))];
+        let (mut opts, sink, tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            5,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.image_view.as_deref(), Some(rel.as_str()));
+        assert!(matches!(app.chat_sel, ChatSel::Image(ref p) if p == &rel));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(app.hits.iter().any(|(_, h)| *h == Hit::ImageView));
+        let quit = handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert!(!quit);
+        assert!(app.image_view.is_none());
+    }
+
+    #[test]
     fn tool_started_shows_command_and_path() {
         let cmd = tool_started_line("run_command", &serde_json::json!({"command": "git status"}));
         assert!(cmd.contains("$ git status"), "{cmd}");
@@ -8197,6 +8636,7 @@ mod tests {
             area: Rect::default(),
             streaming: false,
             composer_inner: Rect::default(),
+            chat_inner: Rect::default(),
             composer_vscroll: 0,
             input_dragging: false,
             catalog: ModelCatalog::default(),
@@ -8226,9 +8666,11 @@ mod tests {
             preview: HashMap::new(),
             picker: None,
             image_proto: HashMap::new(),
+            image_cells: HashMap::new(),
             graphic_blits: Vec::new(),
             last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
+            image_view: None,
             children: Vec::new(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
