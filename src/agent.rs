@@ -352,7 +352,7 @@ async fn ask_lived_memory<P: Provider>(
     }
     let ask = json!({
         "role": "user",
-        "content": compact::memory_ask(goal)
+        "content": compact::memory_ask(goal, compact::previous_compact_text(head).as_deref())
     });
     let chained = use_response_chain && previous_response_id.is_some();
     let input = if chained {
@@ -380,8 +380,13 @@ async fn ask_lived_memory<P: Provider>(
         tool_choice: Some("none".into()),
     };
     match provider.complete(req).await {
-        Ok(r) if r.function_calls.is_empty() && compact::lived_brief_usable(&r.text) => {
-            Some(r.text)
+        Ok(r) if r.function_calls.is_empty() => {
+            let text = compact::lived_text_from_complete(&r.text, &r.output_items);
+            if compact::lived_brief_usable(&text) {
+                Some(text)
+            } else {
+                None
+            }
         }
         _ => None,
     }

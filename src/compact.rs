@@ -46,13 +46,12 @@ pub struct CompactOutcome {
     pub method: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Harvest {
     original: String,
-    later: Vec<String>,
+    direction: String,
+    facts: String,
     where_were: String,
-    errors: Vec<String>,
-    paths: Vec<String>,
 }
 
 pub fn context_window(model: &str) -> u32 {
@@ -231,20 +230,61 @@ fn is_assistant(item: &Value) -> bool {
     item.get("role").and_then(Value::as_str) == Some("assistant")
 }
 
-fn push_unique(out: &mut Vec<String>, s: String) {
-    if s.is_empty() {
-        return;
-    }
-    out.retain(|x| x != &s);
-    out.push(s);
-}
-
 fn take_last(items: &[String], n: usize) -> Vec<String> {
     if items.len() <= n {
         items.to_vec()
     } else {
         items[items.len() - n..].to_vec()
     }
+}
+
+fn section_empty(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("n/a")
+}
+
+fn set_if_present(dst: &mut String, body: &str) {
+    if !section_empty(body) {
+        *dst = body.trim().to_string();
+    }
+}
+
+fn append_block(dst: &mut String, add: &str) {
+    let add = add.trim();
+    if section_empty(add) {
+        return;
+    }
+    if dst.is_empty() {
+        *dst = add.to_string();
+        return;
+    }
+    if dst.contains(add) {
+        return;
+    }
+    dst.push('\n');
+    dst.push_str(add);
+}
+
+/// Keep previous key lines the new gist forgot to copy.
+fn retain_unmentioned(prev: &str, new: &str) -> String {
+    if section_empty(new) {
+        return prev.trim().to_string();
+    }
+    if section_empty(prev) {
+        return new.trim().to_string();
+    }
+    let mut out = new.trim().to_string();
+    for chunk in prev.lines() {
+        let chunk = chunk.trim().trim_start_matches("- ").trim();
+        if chunk.is_empty() || section_empty(chunk) {
+            continue;
+        }
+        if !out.contains(chunk) {
+            out.push_str("\n- ");
+            out.push_str(chunk);
+        }
+    }
+    out
 }
 
 fn harvest_brief(text: &str, into: &mut Harvest) {
@@ -255,36 +295,17 @@ fn harvest_brief(text: &str, into: &mut Harvest) {
     let mut body = String::new();
     let flush = |name: &str, body: &str, into: &mut Harvest| {
         let body = body.trim();
-        if name.is_empty() || body.is_empty() {
+        if name.is_empty() || section_empty(body) {
             return;
         }
         match name {
-            "Original request" => into.original = body.to_string(),
-            "Later user direction" => {
-                for line in body.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("- ") {
-                        push_unique(&mut into.later, rest.to_string());
-                    }
-                }
+            "Original request" => set_if_present(&mut into.original, body),
+            "Direction changes" | "Later user direction" => append_block(&mut into.direction, body),
+            "Load-bearing facts" => append_block(&mut into.facts, body),
+            "Where you were" | "Where you were before this fold" => {
+                set_if_present(&mut into.where_were, body)
             }
-            "Where you were before this fold" => into.where_were = body.to_string(),
-            "Errors to remember" => {
-                for line in body.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("- ") {
-                        push_unique(&mut into.errors, rest.to_string());
-                    }
-                }
-            }
-            "Paths" => {
-                for line in body.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("- ") {
-                        push_unique(&mut into.paths, rest.to_string());
-                    }
-                }
-            }
+            "Errors to remember" | "Paths" => append_block(&mut into.facts, body),
             _ => {}
         }
     };
@@ -301,9 +322,104 @@ fn harvest_brief(text: &str, into: &mut Harvest) {
     flush(&name, &body, into);
 }
 
+fn harvest_from_head(head: &[Value]) -> Harvest {
+    let mut harvested = Harvest::default();
+    for item in head {
+        let text = item_text(item);
+        if is_user(item) && text.contains(COMPACT_MARK) {
+            harvest_brief(&text, &mut harvested);
+        }
+    }
+    harvested
+}
+
+fn merge_harvest(goal: &str, prev: &Harvest, new: &Harvest) -> Harvest {
+    let original = if !section_empty(&new.original) {
+        new.original.clone()
+    } else if !section_empty(&prev.original) {
+        prev.original.clone()
+    } else {
+        clip_goal(goal)
+    };
+    Harvest {
+        original,
+        direction: retain_unmentioned(&prev.direction, &new.direction),
+        facts: retain_unmentioned(&prev.facts, &new.facts),
+        where_were: if !section_empty(&new.where_were) {
+            new.where_were.clone()
+        } else {
+            prev.where_were.clone()
+        },
+    }
+}
+
+fn emit_section(title: &str, body: &str) -> String {
+    if section_empty(body) {
+        String::new()
+    } else {
+        format!("\n## {title}\n{}\n", body.trim())
+    }
+}
+
+fn emit_brief(h: &Harvest, lived: bool) -> String {
+    let intro = if lived {
+        "This is sparse long-term memory written by you after living the older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n"
+    } else {
+        "This is sparse long-term memory of older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n"
+    };
+    let footer = "The items after this block are short-term memory. They are complete and authoritative for what you were doing just now. Continue from there.\n";
+    let orig = if section_empty(&h.original) {
+        String::new()
+    } else {
+        h.original.trim().to_string()
+    };
+    let where_were = h.where_were.trim().to_string();
+    let mut direction = h.direction.clone();
+    let mut facts = h.facts.clone();
+    for _ in 0..8 {
+        let out = format!(
+            "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}{}{}\n{footer}",
+            emit_section("Direction changes", &direction),
+            emit_section("Load-bearing facts", &facts),
+            emit_section("Where you were", &where_were),
+        );
+        if out.chars().count() <= RENDER_CHARS {
+            return out;
+        }
+        if facts.chars().count() > 120 {
+            facts = gist(&facts, facts.chars().count().saturating_mul(2) / 3);
+            continue;
+        }
+        if direction.chars().count() > 120 {
+            direction = gist(&direction, direction.chars().count().saturating_mul(2) / 3);
+            continue;
+        }
+        return out;
+    }
+    format!(
+        "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}\n{footer}",
+        emit_section("Where you were", &where_were),
+    )
+}
+
+/// Latest compact block in `items`, if any. Used so a later fold cannot lose it.
+pub fn previous_compact_text(items: &[Value]) -> Option<String> {
+    items.iter().rev().find_map(|item| {
+        if !is_user(item) {
+            return None;
+        }
+        let t = item_text(item);
+        if t.contains(COMPACT_MARK) {
+            Some(t)
+        } else {
+            None
+        }
+    })
+}
+
 /// Local memory fold of `head`. Also reconsolidates any previous fold sitting in `head`.
 pub fn extractive_brief(goal: &str, head: &[Value]) -> String {
-    let mut harvested = Harvest::default();
+    let prev = harvest_from_head(head);
     let mut users = Vec::new();
     let mut assistants = Vec::new();
     let mut errors = Vec::new();
@@ -316,7 +432,6 @@ pub fn extractive_brief(goal: &str, head: &[Value]) -> String {
         }
         let text = item_text(item);
         if is_user(item) && text.contains(COMPACT_MARK) {
-            harvest_brief(&text, &mut harvested);
             continue;
         }
         if is_user(item) && !text.is_empty() && !is_noise_user(&text) {
@@ -347,79 +462,50 @@ pub fn extractive_brief(goal: &str, head: &[Value]) -> String {
         let g = goal.trim();
         if !g.is_empty() && !is_noise_user(g) {
             clip_goal(g)
-        } else if !harvested.original.is_empty() {
-            gist(&harvested.original, GOAL_CHARS)
+        } else if !section_empty(&prev.original) {
+            gist(&prev.original, GOAL_CHARS)
         } else {
             users.first().cloned().unwrap_or_else(|| clip_goal(goal))
         }
     };
 
-    let mut later = harvested.later;
-    for u in &users {
-        if u.as_str() != original.as_str() {
-            push_unique(&mut later, truncate(u, SNIPPET_CHARS));
-        }
+    let later = take_last(
+        &users
+            .iter()
+            .filter(|u| u.as_str() != original.as_str())
+            .cloned()
+            .collect::<Vec<_>>(),
+        MAX_LATER,
+    );
+    let mut direction = String::new();
+    for u in &later {
+        append_block(&mut direction, &format!("- {u}"));
     }
-    let later = take_last(&later, MAX_LATER);
 
     let where_were = assistants
         .last()
         .cloned()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or(harvested.where_were);
-    let where_were = gist(&where_were, ASSISTANT_CHARS);
+        .map(|s| gist(&s, ASSISTANT_CHARS))
+        .unwrap_or_default();
 
-    let mut all_errors = harvested.errors;
-    for e in errors {
-        push_unique(&mut all_errors, truncate(&e, ERROR_CHARS));
+    let recent_errors = take_last(&errors, MAX_ERRORS);
+    let recent_paths = take_last(&paths, MAX_PATHS);
+    let mut facts = String::new();
+    for e in &recent_errors {
+        append_block(&mut facts, &format!("- {e}"));
     }
-    let recent_errors = take_last(&all_errors, MAX_ERRORS);
+    for p in &recent_paths {
+        append_block(&mut facts, &format!("- {p}"));
+    }
 
-    let mut all_paths = harvested.paths;
-    for p in paths {
-        push_unique(&mut all_paths, truncate(&p, PATH_CHARS));
-    }
-    let all_paths = take_last(&all_paths, MAX_PATHS);
-
-    let mut out = String::new();
-    out.push_str(COMPACT_MARK);
-    out.push_str(
-        "\nThis is sparse long-term memory of older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n",
-    );
-    out.push_str(&format!("\n## Original request\n{original}\n"));
-    if !later.is_empty() {
-        out.push_str("\n## Later user direction\n");
-        for u in &later {
-            out.push_str("- ");
-            out.push_str(u);
-            out.push('\n');
-        }
-    }
-    if !where_were.is_empty() {
-        out.push_str("\n## Where you were before this fold\n");
-        out.push_str(&where_were);
-        out.push('\n');
-    }
-    if !recent_errors.is_empty() {
-        out.push_str("\n## Errors to remember\n");
-        for e in &recent_errors {
-            out.push_str("- ");
-            out.push_str(e);
-            out.push('\n');
-        }
-    }
-    if !all_paths.is_empty() {
-        out.push_str("\n## Paths\n");
-        for p in &all_paths {
-            out.push_str("- ");
-            out.push_str(p);
-            out.push('\n');
-        }
-    }
-    out.push_str(
-        "\nThe items after this block are short-term memory. They are complete and authoritative for what you were doing just now. Continue from there.\n",
-    );
-    truncate(&out, RENDER_CHARS)
+    let new = Harvest {
+        original: original.clone(),
+        direction,
+        facts,
+        where_were,
+    };
+    emit_brief(&merge_harvest(&original, &prev, &new), false)
 }
 
 fn collect_paths(s: &str, out: &mut Vec<String>) {
@@ -451,11 +537,19 @@ fn splice_brief(brief: &str, tail: &[Value]) -> Vec<Value> {
 }
 
 /// Ask the working model to write long-term memory. Not a new user task.
-pub fn memory_ask(goal: &str) -> String {
+pub fn memory_ask(goal: &str, previous: Option<&str>) -> String {
     let original = clip_goal(goal);
-    format!(
+    let mut ask = format!(
         "{MEMORY_FOLD_MARK}\nThis is not a new user task. Do not call tools. Do not continue the work in this message.\n\nYou lived the older turns. Write sparse long-term memory for them. The most recent turns will stay verbatim as short-term memory — do not try to replace those.\n\nKeep only what YOU judge is:\n1. The original request (must remain): {original}\n2. Direction-changing or shocking events — a user constraint that rewrote the plan, a surprise, a failure that forced a new approach.\n3. Load-bearing facts that construct or support this task — decisions, invariants, paths, APIs you would need in order to reconstruct the work with reasoning. Not a transcript of every tool call.\n\nOmit routine reads, successful boilerplate, and anything the next you can guess from (1)–(3) plus common sense.\n\nWrite markdown with these headings only:\n## Original request\n## Direction changes\n## Load-bearing facts\n## Where you were\n\nIf a heading has nothing, write \"none\". Hard cap: 80 lines. No tool-call dump.\n"
-    )
+    );
+    if let Some(prev) = previous.map(str::trim).filter(|p| !p.is_empty()) {
+        ask.push_str(
+            "\nPrevious long-term memory — reconsolidate it. Keep every direction change and load-bearing fact that is still true. Do not drop them just to be shorter.\n\n",
+        );
+        ask.push_str(prev);
+        ask.push('\n');
+    }
+    ask
 }
 
 fn strip_fences(s: &str) -> String {
@@ -478,33 +572,61 @@ pub fn lived_brief_usable(text: &str) -> bool {
 }
 
 /// Wrap the working model's own gist so later turns still see orientation rules.
+/// Previous compact sections are merged in so a forgetful rewrite cannot drop them.
 pub fn wrap_lived_brief(goal: &str, model_text: &str) -> String {
+    wrap_lived_brief_with(goal, model_text, &Harvest::default())
+}
+
+fn wrap_lived_brief_with(goal: &str, model_text: &str, prev: &Harvest) -> String {
     let body = strip_fences(model_text);
-    let original = clip_goal(goal);
-    let mut out = String::new();
-    out.push_str(COMPACT_MARK);
-    out.push_str(
-        "\nThis is sparse long-term memory written by you after living the older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n",
-    );
-    let has_original = body.to_ascii_lowercase().contains("original request")
-        || (!original.is_empty() && body.contains(original.trim()));
-    if !has_original {
-        out.push_str(&format!("\n## Original request\n{original}\n"));
-    }
     let body = if let Some(rest) = body.split(COMPACT_MARK).last() {
-        rest.trim()
+        rest.trim().to_string()
     } else {
-        body.trim()
+        body
     };
-    out.push('\n');
-    out.push_str(body);
-    out.push('\n');
-    if !out.contains("short-term memory") {
-        out.push_str(
-            "\nThe items after this block are short-term memory. They are complete and authoritative for what you were doing just now. Continue from there.\n",
-        );
+    let mut incoming = Harvest::default();
+    let wrapped = if body.contains("## ") {
+        format!("{COMPACT_MARK}\n{body}")
+    } else {
+        format!("{COMPACT_MARK}\n## Load-bearing facts\n{body}\n")
+    };
+    harvest_brief(&wrapped, &mut incoming);
+    if section_empty(&incoming.original)
+        && !section_empty(goal)
+        && !body.to_ascii_lowercase().contains("original request")
+    {
+        incoming.original = clip_goal(goal);
     }
-    truncate(&out, RENDER_CHARS)
+    if section_empty(&incoming.where_were) && !body.contains("## ") {
+        incoming.where_were.clear();
+    }
+    emit_brief(&merge_harvest(goal, prev, &incoming), true)
+}
+
+/// Prefer `response.text`; if that is empty, scrape assistant/message output items.
+pub fn lived_text_from_complete(text: &str, output_items: &[Value]) -> String {
+    if lived_brief_usable(text) {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for item in output_items {
+        let typ = item_type(item);
+        if is_assistant(item) || typ == "message" {
+            let t = item_text(item);
+            if t.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&t);
+        }
+    }
+    if lived_brief_usable(&out) {
+        out
+    } else {
+        text.to_string()
+    }
 }
 
 pub fn compact_history(
@@ -517,9 +639,10 @@ pub fn compact_history(
     if head.is_empty() {
         return Err(Error::Provider("nothing to compact".into()));
     }
+    let prev = harvest_from_head(head);
     let (items, method) = match lived {
         Some(text) if lived_brief_usable(text) => (
-            splice_brief(&wrap_lived_brief(goal, text), tail),
+            splice_brief(&wrap_lived_brief_with(goal, text, &prev), tail),
             "lived",
         ),
         _ => (extractive_items(goal, head, tail), "local"),
@@ -735,7 +858,7 @@ mod tests {
 
     #[test]
     fn memory_ask_is_not_a_new_task_and_keeps_original() {
-        let ask = memory_ask("ship the kernel");
+        let ask = memory_ask("ship the kernel", None);
         assert!(ask.contains(MEMORY_FOLD_MARK));
         assert!(ask.contains("not a new user task"), "{ask}");
         assert!(ask.contains("Do not call tools"), "{ask}");
@@ -790,9 +913,78 @@ mod tests {
     #[test]
     fn lived_brief_usable_rejects_echoed_ask() {
         assert!(!lived_brief_usable("ok"));
-        assert!(!lived_brief_usable(&memory_ask("goal")));
+        assert!(!lived_brief_usable(&memory_ask("goal", None)));
         assert!(lived_brief_usable(
             "## Original request\nbuild a cli\n## Where you were\nwriting tests\n"
         ));
+    }
+
+    fn lived_gist() -> String {
+        wrap_lived_brief(
+            "build a cli",
+            "## Original request\nbuild a cli\n## Direction changes\nuse sqlite, not json files\n## Load-bearing facts\nsrc/db.rs is the store\n## Where you were\nwriting sqlite tests\n",
+        )
+    }
+
+    #[test]
+    fn second_fold_keeps_lived_facts_the_new_gist_omitted() {
+        let history = vec![
+            user(&lived_gist()),
+            user("also add tests"),
+            assistant("adding tests now"),
+            user("recent"),
+        ];
+        let forgetful = "## Original request\nbuild a cli\n## Direction changes\nnone\n## Load-bearing facts\nnone\n## Where you were\nadding tests now\n";
+        let out = compact_history("build a cli", &history, 1, Some(forgetful)).unwrap();
+        assert_eq!(out.method, "lived");
+        let brief = out.items[0]["content"].as_str().unwrap();
+        assert!(brief.contains("use sqlite, not json files"), "{brief}");
+        assert!(brief.contains("src/db.rs is the store"), "{brief}");
+        assert!(brief.contains("adding tests now"), "{brief}");
+    }
+
+    #[test]
+    fn extractive_fallback_after_lived_keeps_lived_sections() {
+        let mut history = vec![user(&lived_gist())];
+        for i in 0..6 {
+            history.push(user(&format!("pad-{i}")));
+        }
+        let out = compact_history("build a cli", &history, 2, Some("ok")).unwrap();
+        assert_eq!(out.method, "local");
+        let brief = out.items[0]["content"].as_str().unwrap();
+        assert!(brief.contains("use sqlite, not json files"), "{brief}");
+        assert!(brief.contains("src/db.rs is the store"), "{brief}");
+    }
+
+    #[test]
+    fn memory_ask_pins_previous_compact() {
+        let prev = lived_gist();
+        let ask = memory_ask("build a cli", Some(&prev));
+        assert!(ask.contains("reconsolidate"), "{ask}");
+        assert!(ask.contains("src/db.rs is the store"), "{ask}");
+        assert!(ask.contains(COMPACT_MARK), "{ask}");
+    }
+
+    #[test]
+    fn previous_compact_text_finds_the_block_even_among_later_users() {
+        let items = vec![
+            user(&lived_gist()),
+            user("follow-up"),
+            assistant("ok"),
+        ];
+        let prev = previous_compact_text(&items).expect("compact block");
+        assert!(prev.contains("src/db.rs is the store"), "{prev}");
+    }
+
+    #[test]
+    fn lived_text_from_complete_scrapes_output_items_when_text_empty() {
+        let items = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "## Original request\nbuild a cli\n## Where you were\nwriting tests\n"}]
+        })];
+        let got = lived_text_from_complete("", &items);
+        assert!(lived_brief_usable(&got), "{got}");
+        assert!(got.contains("writing tests"), "{got}");
     }
 }
