@@ -42,9 +42,13 @@ pub struct RunConfig {
     pub knobs: Option<Arc<Mutex<SessionKnobs>>>,
     /// Extra user turns. `None` = one-shot (CLI). `Some` = session: after stop, wait for more.
     pub inbox: Option<mpsc::UnboundedReceiver<UserTurn>>,
+    /// Background-exit notices. Independent of [`Self::inbox`] so a live hub sender cannot pin the session open.
+    pub bg_notify: Option<mpsc::UnboundedReceiver<UserTurn>>,
     pub workspace: PathBuf,
     /// Images attached to the first user message (workspace-relative paths).
     pub images: Vec<PathBuf>,
+    /// Notice from the previous run: backgrounds that were killed because this conversation closed.
+    pub closed_backgrounds: Option<String>,
 }
 
 /// One user message, optionally with workspace images for vision.
@@ -170,20 +174,118 @@ fn drain_inbox(inbox: &mut Option<mpsc::UnboundedReceiver<UserTurn>>) -> Vec<Use
     out
 }
 
-async fn wait_inbox(
-    inbox: &mut Option<mpsc::UnboundedReceiver<UserTurn>>,
-) -> Option<Vec<UserTurn>> {
-    let rx = inbox.as_mut()?;
-    match rx.recv().await {
-        Some(msg) => {
-            let mut out = Vec::new();
-            if !msg.is_empty() {
-                out.push(msg);
-            }
-            out.extend(drain_inbox(inbox));
-            Some(out)
+fn drain_session(cfg: &mut RunConfig) -> Vec<UserTurn> {
+    let mut out = drain_inbox(&mut cfg.inbox);
+    out.extend(drain_inbox(&mut cfg.bg_notify));
+    out
+}
+
+async fn recv_pending(rx: &mut Option<mpsc::UnboundedReceiver<UserTurn>>) -> Option<UserTurn> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wait for the next user turn or background-exit notice. Closing the user inbox ends the session.
+async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
+    if cfg.inbox.is_none() {
+        return None;
+    }
+    loop {
+        let mut msgs = drain_session(cfg);
+        if !msgs.is_empty() {
+            return Some(msgs);
         }
-        None => None,
+        tokio::select! {
+            user = recv_pending(&mut cfg.inbox) => {
+                let Some(msg) = user else {
+                    return None;
+                };
+                if !msg.is_empty() {
+                    msgs.push(msg);
+                }
+                msgs.extend(drain_session(cfg));
+                return Some(msgs);
+            }
+            bg = recv_pending(&mut cfg.bg_notify) => {
+                let Some(msg) = bg else {
+                    cfg.bg_notify = None;
+                    continue;
+                };
+                if !msg.is_empty() {
+                    msgs.push(msg);
+                }
+                msgs.extend(drain_session(cfg));
+                return Some(msgs);
+            }
+        }
+    }
+}
+
+/// Stop retrying the same failing request so we do not hammer the API.
+const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
+
+/// Tell the model why the request failed and keep the loop going.
+/// Do not pause for the user: the model should enlarge/regenerate and continue.
+async fn recover_from_provider_error(
+    cfg: &mut RunConfig,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    previous_response_id: &mut Option<String>,
+    use_response_chain: &mut bool,
+    consecutive: &mut u32,
+    last_text: &str,
+    err: Error,
+) -> Result<()> {
+    *consecutive += 1;
+    *use_response_chain = false;
+    *previous_response_id = None;
+    sink.emit(&AgentEvent::Error {
+        meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+        message: err.to_string(),
+    });
+    crate::vision::strip_attached_images(history);
+    crate::vision::strip_attached_images(pending);
+    let note = format!(
+        "The previous model request failed ({err}). Continue the task yourself. If an image was rejected for being below {} pixels, enlarge or regenerate the file in the workspace then read_image again. Do not wait for the user and do not ask the user to upscale it.",
+        crate::vision::MIN_VISION_PIXELS
+    );
+    append_user(history, pending, &UserTurn::from(note), &cfg.workspace);
+    *pending = history.clone();
+
+    if *consecutive < MAX_CONSECUTIVE_PROVIDER_ERRORS {
+        return Ok(());
+    }
+    if cfg.inbox.is_none() {
+        sink.emit(&AgentEvent::RunFinished {
+            meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+            reason: "error".into(),
+            text: last_text.to_string(),
+        });
+        return Err(err);
+    }
+    *consecutive = 0;
+    sink.emit(&AgentEvent::AwaitingInput {
+        meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+    });
+    match wait_session(cfg).await {
+        Some(msgs) => {
+            for msg in msgs {
+                append_user(history, pending, &msg, &cfg.workspace);
+            }
+            Ok(())
+        }
+        None => {
+            sink.emit(&AgentEvent::RunFinished {
+                meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+                reason: "error".into(),
+                text: last_text.to_string(),
+            });
+            Err(err)
+        }
     }
 }
 
@@ -259,11 +361,28 @@ pub async fn run<P: Provider>(
         cfg.compact_keep_recent
     };
 
-    let mut history = vec![crate::vision::user_message(
+    let mut history = Vec::new();
+    if let Some(closed) = cfg.closed_backgrounds.take() {
+        if !closed.trim().is_empty() {
+            notice(
+                sink,
+                &cfg.agent_name,
+                &run_id,
+                cfg.parent_run_id.as_deref(),
+                closed.clone(),
+            );
+            history.push(crate::vision::user_message(
+                &closed,
+                &[],
+                &cfg.workspace,
+            ));
+        }
+    }
+    history.push(crate::vision::user_message(
         &cfg.prompt,
         &cfg.images,
         &cfg.workspace,
-    )];
+    ));
     let mut previous_response_id: Option<String> = None;
     let mut pending: Vec<Value> = history.clone();
     let mut last_text = String::new();
@@ -278,10 +397,11 @@ pub async fn run<P: Provider>(
     let mut total_turns: u32 = 0;
     let mut seen_model = false;
     let mut use_response_chain = true;
+    let mut consecutive_provider_errors: u32 = 0;
 
     loop {
         if seen_model {
-            for msg in drain_inbox(&mut cfg.inbox) {
+            for msg in drain_session(&mut cfg) {
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
                 turn = 0;
             }
@@ -300,7 +420,7 @@ pub async fn run<P: Provider>(
                 sink.emit(&AgentEvent::AwaitingInput {
                     meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
                 });
-                match wait_inbox(&mut cfg.inbox).await {
+                match wait_session(&mut cfg).await {
                     Some(msgs) if !msgs.is_empty() => {
                         for msg in msgs {
                             append_user(&mut history, &mut pending, &msg, &cfg.workspace);
@@ -448,22 +568,41 @@ pub async fn run<P: Provider>(
                 match provider.complete_stream(req, &on_text, &on_server, &on_reasoning).await {
                     Ok(r) => r,
                     Err(e2) => {
-                        sink.emit(&AgentEvent::Error {
-                            meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                            message: e2.to_string(),
-                        });
-                        return Err(e2);
+                        recover_from_provider_error(
+                            &mut cfg,
+                            sink,
+                            &run_id,
+                            &mut history,
+                            &mut pending,
+                            &mut previous_response_id,
+                            &mut use_response_chain,
+                            &mut consecutive_provider_errors,
+                            &last_text,
+                            e2,
+                        )
+                        .await?;
+                        continue;
                     }
                 }
             }
             Err(e) => {
-                sink.emit(&AgentEvent::Error {
-                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                    message: e.to_string(),
-                });
-                return Err(e);
+                recover_from_provider_error(
+                    &mut cfg,
+                    sink,
+                    &run_id,
+                    &mut history,
+                    &mut pending,
+                    &mut previous_response_id,
+                    &mut use_response_chain,
+                    &mut consecutive_provider_errors,
+                    &last_text,
+                    e,
+                )
+                .await?;
+                continue;
             }
         };
+        consecutive_provider_errors = 0;
 
         last_usage = response.usage.clone();
         cache_turns.push(last_usage.clone());
@@ -587,7 +726,7 @@ pub async fn run<P: Provider>(
             &last_usage,
         );
 
-        let extra = drain_inbox(&mut cfg.inbox);
+        let extra = drain_session(&mut cfg);
         if !extra.is_empty() {
             for msg in extra {
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
@@ -614,7 +753,7 @@ pub async fn run<P: Provider>(
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
-        match wait_inbox(&mut cfg.inbox).await {
+        match wait_session(&mut cfg).await {
             Some(msgs) if !msgs.is_empty() => {
                 for msg in msgs {
                     append_user(&mut history, &mut pending, &msg, &cfg.workspace);
@@ -647,6 +786,7 @@ mod tests {
     use super::*;
     use crate::compact::COMPACT_MARK;
     use crate::events::AgentEvent;
+    use crate::memory::ProjectMemoryTool;
     use crate::provider::{CacheUsage, CompactRequest, CompactResponse, CompleteResponse, FunctionCall};
     use crate::tools::{NowTool, ReadImageTool, ToolRegistry, WriteFileTool};
     use std::sync::Mutex;
@@ -707,8 +847,10 @@ mod tests {
             reasoning_effort: crate::provider::ReasoningEffort::High,
             knobs: None,
             inbox: None,
+            bg_notify: None,
             workspace: PathBuf::from("."),
             images: Vec::new(),
+            closed_backgrounds: None,
         }
     }
 
@@ -932,9 +1074,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_memory_is_not_in_context_until_the_model_reads() {
+        let mem = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        crate::memory::MemoryStore::open_at(mem.path().to_path_buf())
+            .slot(ws.path())
+            .unwrap()
+            .write("goal.md", "need A2A workers")
+            .unwrap();
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    function_calls: vec![FunctionCall {
+                        call_id: "c1".into(),
+                        name: "project_memory".into(),
+                        arguments: r#"{"action":"read","path":"goal.md"}"#.into(),
+                    }],
+                    ..CompleteResponse::new("1")
+                },
+                CompleteResponse {
+                    text: "the goal is A2A".into(),
+                    ..CompleteResponse::new("2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("what next?", 4);
+        c.workspace = ws.path().to_path_buf();
+        let tools = ToolRegistry::new(vec![Box::new(ProjectMemoryTool::new(
+            mem.path().to_path_buf(),
+            ws.path().to_path_buf(),
+        ))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "the goal is A2A");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].input.len(), 1);
+        assert_eq!(calls[0].input[0]["content"], "what next?");
+        let first = calls[0].input[0].to_string();
+        assert!(!first.contains("need A2A workers"), "{first}");
+        let output = calls[1].input[0]["output"].as_str().unwrap();
+        assert!(output.contains("need A2A workers"), "{output}");
+        assert!(!ws.path().join("goal.md").exists());
+    }
+
+    #[tokio::test]
+    async fn project_memory_write_stays_outside_workspace() {
+        let mem = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    function_calls: vec![FunctionCall {
+                        call_id: "c1".into(),
+                        name: "project_memory".into(),
+                        arguments: r#"{"action":"write","path":"goal.md","body":"ship kernel"}"#.into(),
+                    }],
+                    ..CompleteResponse::new("1")
+                },
+                CompleteResponse {
+                    text: "noted".into(),
+                    ..CompleteResponse::new("2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("remember the goal", 4);
+        c.workspace = ws.path().to_path_buf();
+        let tools = ToolRegistry::new(vec![Box::new(ProjectMemoryTool::new(
+            mem.path().to_path_buf(),
+            ws.path().to_path_buf(),
+        ))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "noted");
+        assert!(!ws.path().join("goal.md").exists());
+        let body = crate::memory::MemoryStore::open_at(mem.path().to_path_buf())
+            .slot(ws.path())
+            .unwrap()
+            .read("goal.md")
+            .unwrap();
+        assert_eq!(body, "ship kernel");
+        let dumped = std::fs::read_dir(ws.path()).unwrap().count();
+        assert_eq!(dumped, 0);
+    }
+
+    #[tokio::test]
     async fn read_image_is_attached_on_next_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let img = crate::vision::from_rgba(4, 4, vec![255, 0, 0, 255].repeat(16)).unwrap();
+        let img = crate::vision::from_rgba(32, 32, vec![255, 0, 0, 255].repeat(32 * 32)).unwrap();
         crate::vision::save_jpeg(&dir.path().join("p.jpg"), &img).unwrap();
         let provider = Scripted {
             calls: Mutex::new(Vec::new()),
@@ -981,9 +1214,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_image_tiny_file_tells_the_model_instead_of_attaching() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = crate::vision::from_rgba(16, 16, vec![255, 0, 0, 255].repeat(16 * 16)).unwrap();
+        crate::vision::save_jpeg(&dir.path().join("star.jpg"), &img).unwrap();
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    function_calls: vec![FunctionCall {
+                        call_id: "c1".into(),
+                        name: "read_image".into(),
+                        arguments: r#"{"path":"star.jpg"}"#.into(),
+                    }],
+                    ..CompleteResponse::new("1")
+                },
+                CompleteResponse {
+                    text: "I will enlarge it".into(),
+                    ..CompleteResponse::new("2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("look at star.jpg", 4);
+        c.workspace = dir.path().to_path_buf();
+        let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(c.workspace.clone()))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "I will enlarge it");
+        let calls = provider.calls.lock().unwrap();
+        let item = calls[1]
+            .input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("missing function_call_output");
+        let text = item["output"].as_str().expect("tiny image must stay JSON text, not parts");
+        assert!(text.contains("512"), "{text}");
+        assert!(text.contains("attach_image"), "{text}");
+        assert!(!crate::vision::input_has_image(&calls[1].input));
+    }
+
+    #[tokio::test]
+    async fn provider_error_tells_the_model_and_continues() {
+        struct FailThenOk {
+            n: Mutex<u32>,
+            calls: Mutex<Vec<CompleteRequest>>,
+            replies: Mutex<Vec<CompleteResponse>>,
+        }
+        impl Provider for FailThenOk {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                self.calls.lock().unwrap().push(req);
+                let n = {
+                    let mut g = self.n.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                if n == 1 {
+                    return Err(Error::Provider(
+                        "xAI HTTP 400: invalid_image below 512 pixels".into(),
+                    ));
+                }
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .ok_or_else(|| Error::Provider("no reply".into()))
+            }
+            async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+                Err(Error::Provider("no compact".into()))
+            }
+        }
+        let provider = FailThenOk {
+            n: Mutex::new(0),
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(vec![CompleteResponse {
+                text: "I will enlarge the image".into(),
+                ..CompleteResponse::new("2")
+            }]),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, cfg("look", 4)).await.unwrap();
+        assert_eq!(out.text, "I will enlarge the image");
+        assert_eq!(out.turns, 2);
+        let events = rec.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AwaitingInput { .. })));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::RunFinished { reason, .. } if reason == "error"
+        )));
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].previous_response_id, None);
+        let blob = calls[1].input.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(blob.contains("invalid_image"), "{blob}");
+        assert!(blob.contains("512"), "{blob}");
+        assert!(!crate::vision::input_has_image(&calls[1].input));
+    }
+
+    #[tokio::test]
     async fn first_user_turn_can_attach_images() {
         let dir = tempfile::tempdir().unwrap();
-        let img = crate::vision::from_rgba(4, 4, vec![0, 255, 0, 255].repeat(16)).unwrap();
+        let img = crate::vision::from_rgba(32, 32, vec![0, 255, 0, 255].repeat(32 * 32)).unwrap();
         crate::vision::save_jpeg(&dir.path().join("a.jpg"), &img).unwrap();
         let provider = Scripted {
             calls: Mutex::new(Vec::new()),
@@ -1281,6 +1617,106 @@ mod tests {
         assert_eq!(calls[1].input.len(), 1);
         assert_eq!(calls[1].input[0]["role"], "user");
         assert_eq!(calls[1].input[0]["content"], "follow up");
+    }
+
+    #[tokio::test]
+    async fn background_notice_wakes_waiting_session() {
+        let (user_tx, user_rx) = mpsc::unbounded_channel::<UserTurn>();
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let _ = bg_tx.send(UserTurn::from(format!(
+                "{}\nname: echo\ndetail: exit 0",
+                crate::background::EXIT_NOTICE_PREFIX
+            )));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(user_tx);
+        });
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    text: "started".into(),
+                    ..CompleteResponse::new("resp_1")
+                },
+                CompleteResponse {
+                    text: "echo died".into(),
+                    ..CompleteResponse::new("resp_2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("run echo", 8);
+        c.inbox = Some(user_rx);
+        c.bg_notify = Some(bg_rx);
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "echo died");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let blob = calls[1]
+            .input
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            blob.contains(crate::background::EXIT_NOTICE_PREFIX),
+            "{blob}"
+        );
+        assert!(blob.contains("name: echo"), "{blob}");
+        let events = rec.0.lock().unwrap().clone();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AwaitingInput { .. })));
+    }
+
+    #[tokio::test]
+    async fn closed_backgrounds_notice_precedes_user_prompt() {
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![CompleteResponse {
+                text: "ok, they were killed".into(),
+                ..CompleteResponse::new("1")
+            }])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("what happened?", 4);
+        c.closed_backgrounds = Some(crate::background::format_closed_notice(&[
+            crate::background::ClosedBackground {
+                name: "dev".into(),
+                command: "npm run dev".into(),
+                log: vec!["out listening".into()],
+            },
+        ]));
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "ok, they were killed");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input.len(), 2);
+        let closed = calls[0].input[0]["content"].as_str().unwrap();
+        assert!(
+            closed.contains(crate::background::CLOSED_NOTICE_PREFIX),
+            "{closed}"
+        );
+        assert!(
+            closed.contains("killed because the conversation was closed"),
+            "{closed}"
+        );
+        assert!(closed.contains("npm run dev"), "{closed}");
+        assert_eq!(calls[0].input[1]["content"], "what happened?");
+        let events = rec.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| match e {
+            AgentEvent::Notice { message, .. } => {
+                message.contains(crate::background::CLOSED_NOTICE_PREFIX)
+            }
+            _ => false,
+        }));
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ pub mod install;
 pub mod instructions;
 pub mod kit;
 pub mod md;
+pub mod memory;
 pub mod monitor;
 pub mod nursery;
 pub mod preview;

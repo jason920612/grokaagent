@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -175,6 +176,33 @@ impl SessionStore {
         }
         Ok(())
     }
+
+    /// Persist backgrounds that were still alive when this conversation's run ended.
+    /// No-op unless this id is a real session (`meta.json` exists).
+    pub fn save_closed_backgrounds<T: Serialize>(&self, id: &str, items: &[T]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let dir = self.dir(id);
+        if !dir.join("meta.json").exists() {
+            return Ok(());
+        }
+        atomic_write(
+            &dir.join("closed-backgrounds.json"),
+            &serde_json::to_vec_pretty(items)?,
+        )?;
+        Ok(())
+    }
+
+    /// Read and delete the closed-background snapshot. Empty if none.
+    pub fn take_closed_backgrounds<T: DeserializeOwned>(&self, id: &str) -> Vec<T> {
+        let path = self.dir(id).join("closed-backgrounds.json");
+        let Ok(raw) = fs::read(&path) else {
+            return Vec::new();
+        };
+        let _ = fs::remove_file(&path);
+        serde_json::from_slice(&raw).unwrap_or_default()
+    }
 }
 
 pub fn default_sessions_dir() -> Result<PathBuf> {
@@ -287,6 +315,7 @@ Just generate the session_title and nothing else"#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::background::ClosedBackground;
     use crate::provider::{CompleteResponse, FunctionCall};
 
     #[test]
@@ -424,5 +453,41 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, b.id);
         assert!(!store.root().join(&a.id).exists());
+    }
+
+    #[test]
+    fn closed_backgrounds_save_take_is_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().to_path_buf()).unwrap();
+        let a = store.create(PathBuf::from("/tmp/a")).unwrap();
+        let item = ClosedBackground {
+            name: "dev".into(),
+            command: "npm run dev".into(),
+            log: vec!["out listening".into()],
+        };
+        store.save_closed_backgrounds(&a.id, &[item.clone()]).unwrap();
+        let first: Vec<ClosedBackground> = store.take_closed_backgrounds(&a.id);
+        assert_eq!(first, vec![item]);
+        assert!(store.take_closed_backgrounds::<ClosedBackground>(&a.id).is_empty());
+    }
+
+    #[test]
+    fn closed_backgrounds_skip_unknown_session_and_vanish_on_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().to_path_buf()).unwrap();
+        let item = ClosedBackground {
+            name: "hang".into(),
+            command: "sleep 60".into(),
+            log: vec![],
+        };
+        store
+            .save_closed_backgrounds("missing-id", &[item.clone()])
+            .unwrap();
+        assert!(store.take_closed_backgrounds::<ClosedBackground>("missing-id").is_empty());
+
+        let a = store.create(PathBuf::from("/tmp/a")).unwrap();
+        store.save_closed_backgrounds(&a.id, &[item]).unwrap();
+        store.delete(&a.id).unwrap();
+        assert!(store.take_closed_backgrounds::<ClosedBackground>(&a.id).is_empty());
     }
 }

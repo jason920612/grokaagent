@@ -2737,6 +2737,15 @@ fn tool_started_line(name: &str, args: &Value) -> String {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             format!("▸ {name}  {path}")
         }
+        "project_memory" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                format!("▸ project_memory  {action}")
+            } else {
+                format!("▸ project_memory  {action}  {path}")
+            }
+        }
         "spawn_agent" => {
             let n = args
                 .get("name")
@@ -2755,7 +2764,7 @@ fn tool_started_line(name: &str, args: &Value) -> String {
 
 fn tool_finished_line(name: &str, output: &str) -> String {
     match name {
-        "write_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
+        "write_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" | "project_memory" => {
             format!("✓ {name}")
         }
         "run_command" => {
@@ -2853,6 +2862,15 @@ fn live_tool_activity(name: &str, args: &Value, phase: &str) -> String {
         "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             format!("{phase}  {name}  {path}")
+        }
+        "project_memory" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                format!("{phase}  project_memory  {action}")
+            } else {
+                format!("{phase}  project_memory  {action}  {path}")
+            }
         }
         _ => format!("{phase}  {name}"),
     }
@@ -4001,6 +4019,7 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
             caret = pos;
         }
     }
+    crate::preview::reveal_obscured_graphics(f.buffer_mut(), &mut app.graphic_blits);
     caret
 }
 
@@ -4721,6 +4740,8 @@ fn paint_chat_graphic(f: &mut Frame, app: &mut App, proto: &Protocol, draw: Rect
         app.graphic_blits.push(crate::preview::GraphicBlit {
             x: draw.x,
             y: draw.y,
+            width: draw.width,
+            height: draw.height,
             data: data.to_string(),
         });
         return;
@@ -5025,7 +5046,7 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
         "Enter 完成編輯  ·  Esc 或點取消 還原  ·  工作結束也不會送出，直到編輯完成".to_string()
     } else {
         format!(
-            "Enter 送出  ·  點「貼上圖片」附圖  ·  點訊息後 Ctrl+C 複製  ·  {} · {}",
+            "Enter 送出  ·  點「貼上圖片」附圖  ·  點訊息後 Ctrl+C 複製  ·  Ctrl+Q 離開  ·  {} · {}",
             opts.model,
             opts.reasoning_effort.label()
         )
@@ -6319,6 +6340,12 @@ fn handle_key(
     sink: &Arc<FanoutSink>,
     done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
 ) -> bool {
+    if matches!(code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        && mods.contains(KeyModifiers::CONTROL)
+    {
+        app.cancel_ask();
+        return true;
+    }
     if matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL) {
         if app.copy_selection() {
             return false;
@@ -7589,6 +7616,93 @@ mod tests {
         );
     }
 
+    fn sample_bg(name: &str) -> SideBg {
+        SideBg {
+            name: name.into(),
+            command: "sleep 1".into(),
+            pid: 1,
+            status: "running".into(),
+            alive: true,
+            detail: String::new(),
+            log: vec!["out".into()],
+        }
+    }
+
+    #[test]
+    fn inspector_over_sixel_drops_blit_and_unskips_so_the_overlay_erases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = write_red_png(dir.path(), "red.png");
+        let mut app = test_app();
+        app.session.workspace = dir.path().to_path_buf();
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        app.picker = Some(picker);
+        app.backgrounds.push(sample_bg("job"));
+        app.push(Row::User(UserMsg {
+            text: "see".into(),
+            images: vec![rel],
+        }));
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: app.session.workspace.clone(),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            !app.graphic_blits.is_empty(),
+            "sixel must blit while the inspector is closed"
+        );
+        let graphic = app.graphic_blits[0].area();
+
+        app.inspector = Some(Inspector::Background("job".into()));
+        let completed = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            app.graphic_blits.is_empty(),
+            "inspector must hide sixel instead of painting it over the overlay"
+        );
+        let panel = inspector_rect(Rect::new(0, 0, 90, 32));
+        let overlap = graphic.intersection(panel);
+        assert!(
+            overlap.width > 0 && overlap.height > 0,
+            "setup must overlap graphic={graphic:?} panel={panel:?}"
+        );
+        let buf = completed.buffer;
+        for y in overlap.y..overlap.bottom() {
+            for x in overlap.x..overlap.right() {
+                assert!(
+                    !buf[(x, y)].skip,
+                    "overlay cell {x},{y} must be written so sixel is erased"
+                );
+            }
+        }
+
+        app.close_inspector();
+        let completed = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            !app.graphic_blits.is_empty(),
+            "closing the inspector must restore the sixel blit"
+        );
+        let blit = &app.graphic_blits[0];
+        assert!(completed.buffer[(blit.x, blit.y)].skip);
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut opts = TuiOptions {
@@ -7956,6 +8070,32 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_q_quits_even_when_a_row_is_selected() {
+        let mut app = test_app();
+        app.push(Row::User("copy me".into()));
+        app.chat_sel = ChatSel::Row(0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: PathBuf::from("."),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let sink = Arc::new(FanoutSink { sinks: vec![] });
+        let quit = handle_key(
+            &mut app,
+            &mut opts,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &sink,
+            &tx,
+        );
+        assert!(quit, "ctrl-q must quit even with a chat selection");
+    }
+
+    #[test]
     fn tool_started_shows_command_and_path() {
         let cmd = tool_started_line("run_command", &serde_json::json!({"command": "git status"}));
         assert!(cmd.contains("$ git status"), "{cmd}");
@@ -7970,6 +8110,12 @@ mod tests {
         assert!(path.contains("src/a.rs"), "{path}");
         let ask = tool_started_line("ask_user", &serde_json::json!({"question": "挑一個"}));
         assert!(ask.contains("挑一個"), "{ask}");
+        let mem = tool_started_line(
+            "project_memory",
+            &serde_json::json!({"action": "write", "path": "goal.md"}),
+        );
+        assert!(mem.contains("goal.md"), "{mem}");
+        assert!(mem.contains("write"), "{mem}");
     }
 
     #[test]

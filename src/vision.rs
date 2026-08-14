@@ -12,8 +12,21 @@ use crate::error::{Error, Result};
 use crate::tools::resolve_in_workspace;
 
 const MAX_EDGE: u32 = 1280;
+/// xAI `invalid_image` if width×height is below this.
+pub const MIN_VISION_PIXELS: u32 = 512;
 const JPEG_QUALITY: u8 = 82;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn below_vision_min(width: u32, height: u32) -> bool {
+    width.saturating_mul(height) < MIN_VISION_PIXELS
+}
+
+pub fn enlarge_yourself_note(width: u32, height: u32) -> String {
+    format!(
+        "This image is {width}x{height} ({} pixels). xAI vision rejects images below {MIN_VISION_PIXELS} pixels, so pixels were not attached. Enlarge or regenerate the file in the workspace (nearest-neighbor scale is fine), then read_image again. Do not ask the user to upscale it.",
+        width.saturating_mul(height)
+    )
+}
 
 pub fn input_has_image(items: &[Value]) -> bool {
     items.iter().any(value_has_image)
@@ -143,9 +156,11 @@ pub fn user_message(text: &str, images: &[PathBuf], workspace: &Path) -> Value {
                 "image_url": uri,
                 "detail": "high"
             })),
-            Err(_) => {
-                let miss = format!("(無法附加圖片 {rel})");
-                parts.push(json!({"type": "input_text", "text": miss}));
+            Err(e) => {
+                parts.push(json!({
+                    "type": "input_text",
+                    "text": format!("({rel}: {e})")
+                }));
             }
         }
     }
@@ -284,6 +299,9 @@ pub fn save_jpeg(path: &Path, img: &DynamicImage) -> Result<(u32, u32, usize)> {
 
 pub fn data_uri_from_file(path: &Path) -> Result<String> {
     let img = image::open(path).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    if below_vision_min(img.width(), img.height()) {
+        return Err(Error::Tool(enlarge_yourself_note(img.width(), img.height())));
+    }
     let prepared = prepare(&img);
     let bytes = encode_jpeg(&prepared)?;
     Ok(format!(
@@ -346,6 +364,10 @@ mod tests {
         from_rgba(8, 8, vec![255, 0, 0, 255].repeat(64)).unwrap()
     }
 
+    fn vision_ok_square() -> DynamicImage {
+        from_rgba(32, 32, vec![255, 0, 0, 255].repeat(32 * 32)).unwrap()
+    }
+
     #[test]
     fn jpeg_roundtrip_is_under_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -353,6 +375,32 @@ mod tests {
         let (w, h, n) = save_jpeg(&path, &red_square()).unwrap();
         assert_eq!((w, h), (8, 8));
         assert!(n > 0 && n < MAX_BYTES);
+    }
+
+    #[test]
+    fn tiny_image_is_not_attached_and_tells_the_model_to_enlarge() {
+        assert!(below_vision_min(16, 16));
+        assert!(!below_vision_min(32, 32));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.jpg");
+        save_jpeg(&path, &red_square()).unwrap();
+        let err = data_uri_from_file(&path).unwrap_err().to_string();
+        assert!(err.contains("512"), "{err}");
+        assert!(err.contains("8x8"), "{err}");
+        assert!(err.contains("Enlarge") || err.contains("enlarge"), "{err}");
+        let v = user_message("look", &[PathBuf::from("tiny.jpg")], dir.path());
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "input_text", "{v}");
+        let note = parts[1]["text"].as_str().unwrap();
+        assert!(note.contains("512"), "{note}");
+        assert!(!input_has_image(&[v]));
+    }
+
+    #[test]
+    fn large_enough_image_attaches_as_data_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.jpg");
+        save_jpeg(&path, &vision_ok_square()).unwrap();
         let uri = data_uri_from_file(&path).unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,"));
         assert!(uri.len() > 32);
@@ -381,7 +429,7 @@ mod tests {
     #[test]
     fn attach_flag_loads_workspace_image() {
         let dir = tempfile::tempdir().unwrap();
-        save_jpeg(&dir.path().join("shot.jpg"), &red_square()).unwrap();
+        save_jpeg(&dir.path().join("shot.jpg"), &vision_ok_square()).unwrap();
         let out = json!({"attach_image": true, "path": "shot.jpg"}).to_string();
         let uri = data_uri_for_tool(dir.path(), &out).unwrap().unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,"));
@@ -411,7 +459,7 @@ mod tests {
     #[test]
     fn user_message_embeds_workspace_image() {
         let dir = tempfile::tempdir().unwrap();
-        save_jpeg(&dir.path().join("a.jpg"), &red_square()).unwrap();
+        save_jpeg(&dir.path().join("a.jpg"), &vision_ok_square()).unwrap();
         let v = user_message("look", &[PathBuf::from("a.jpg")], dir.path());
         assert_eq!(v["role"], "user");
         let parts = v["content"].as_array().unwrap();

@@ -765,12 +765,24 @@ impl ReadImageTool {
             .ok_or_else(|| Error::Tool("path is required".into()))?;
         let resolved = resolve_in_workspace(&self.workspace, path)?;
         let img = image::open(&resolved).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+        let (width, height) = (img.width(), img.height());
+        if crate::vision::below_vision_min(width, height) {
+            return Ok(json!({
+                "path": path.replace('\\', "/"),
+                "attach_image": false,
+                "width": width,
+                "height": height,
+                "pixels": width.saturating_mul(height),
+                "error": crate::vision::enlarge_yourself_note(width, height)
+            })
+            .to_string());
+        }
         Ok(json!({
             "path": path.replace('\\', "/"),
             "attach_image": true,
             "mime": "image/jpeg",
-            "width": img.width(),
-            "height": img.height()
+            "width": width,
+            "height": height
         })
         .to_string())
     }
@@ -780,7 +792,7 @@ impl ClientTool for ReadImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_image".into(),
-            description: "Load a PNG or JPEG from the workspace and attach the pixels so you can see the image on the next turn. Use after screenshot, or to inspect an image file the user or a web app wrote.".into(),
+            description: "Load a PNG or JPEG from the workspace and attach the pixels so you can see the image on the next turn. xAI rejects images under 512 total pixels (for example 16x16); those are not attached — enlarge or regenerate the file, then call again.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -969,17 +981,33 @@ mod tests {
     }
 
     #[test]
-    fn read_image_flags_attach() {
+    fn read_image_tiny_file_asks_the_model_to_enlarge() {
         let dir = tempfile::tempdir().unwrap();
         let img = crate::vision::from_rgba(4, 4, vec![0, 255, 0, 255].repeat(16)).unwrap();
         crate::vision::save_jpeg(&dir.path().join("pic.jpg"), &img).unwrap();
         let tool = ReadImageTool::new(dir.path().to_path_buf());
         let out: Value = serde_json::from_str(&tool.call_sync(&json!({"path": "pic.jpg"})).unwrap())
             .unwrap();
-        assert_eq!(out["attach_image"], true);
-        assert_eq!(out["path"], "pic.jpg");
+        assert_eq!(out["attach_image"], false);
         assert_eq!(out["width"], 4);
         assert_eq!(out["height"], 4);
+        let err = out["error"].as_str().unwrap();
+        assert!(err.contains("512"), "{err}");
+        assert!(err.contains("4x4"), "{err}");
+    }
+
+    #[test]
+    fn read_image_flags_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = crate::vision::from_rgba(32, 32, vec![0, 255, 0, 255].repeat(32 * 32)).unwrap();
+        crate::vision::save_jpeg(&dir.path().join("pic.jpg"), &img).unwrap();
+        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let out: Value = serde_json::from_str(&tool.call_sync(&json!({"path": "pic.jpg"})).unwrap())
+            .unwrap();
+        assert_eq!(out["attach_image"], true);
+        assert_eq!(out["path"], "pic.jpg");
+        assert_eq!(out["width"], 32);
+        assert_eq!(out["height"], 32);
     }
 
     #[test]

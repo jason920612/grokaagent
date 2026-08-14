@@ -11,6 +11,7 @@ use crate::background::{
 use crate::error::Result;
 use crate::events::EventSink;
 use crate::instructions::STATIC_INSTRUCTIONS;
+use crate::memory::ProjectMemoryTool;
 use crate::monitor::{AttachMonitorTool, MonitorHub, MonitorSink};
 use crate::nursery::{Nursery, SendMessageTool, SpawnAgentTool, DEFAULT_MAX_DEPTH};
 use crate::provider::Provider;
@@ -66,11 +67,13 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         run_id.clone(),
         spec.parent_run_id.clone(),
     );
+    let (bg_tx, bg_rx) = tokio::sync::mpsc::unbounded_channel();
     let bg = BackgroundHub::new(
         spec.workspace.clone(),
         spec.agent_name.clone(),
         run_id.clone(),
         spec.parent_run_id.clone(),
+        Some(bg_tx),
     );
     let tee: Arc<dyn EventSink> = Arc::new(MonitorSink {
         inner: sink,
@@ -81,6 +84,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         spec.model.clone(),
         spec.workspace.clone(),
     ));
+    let memory_root = crate::memory::default_dir()?;
     let mut tools: Vec<Box<dyn crate::tools::ClientTool>> = vec![
         Box::new(NowTool),
         Box::new(ReadFileTool::new(spec.workspace.clone())),
@@ -111,6 +115,10 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         )),
         Box::new(ReadBackgroundTool::new(bg.clone())),
         Box::new(KillBackgroundTool::new(bg.clone())),
+        Box::new(ProjectMemoryTool::new(
+            memory_root.clone(),
+            spec.workspace.clone(),
+        )),
     ];
     if let Some(ask_hub) = spec.ask {
         tools.push(Box::new(AskUserTool::new(
@@ -139,6 +147,17 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     } else {
         None
     };
+    let is_root = spec.parent_run_id.is_none();
+    let persist_id = run_id.clone();
+    let closed_backgrounds = if is_root {
+        crate::session::SessionStore::open()
+            .ok()
+            .map(|s| s.take_closed_backgrounds::<crate::background::ClosedBackground>(&persist_id))
+            .filter(|v| !v.is_empty())
+            .map(|items| crate::background::format_closed_notice(&items))
+    } else {
+        None
+    };
     let tools = ToolRegistry::new(tools);
     let out = agent::run(
         provider,
@@ -158,13 +177,16 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             reasoning_effort: spec.reasoning_effort,
             knobs: spec.knobs,
             inbox: spec.inbox,
+            bg_notify: Some(bg_rx),
             workspace: spec.workspace,
             images: spec.images,
+            closed_backgrounds,
         },
     )
     .await;
     hub.shutdown().await;
-    bg.shutdown().await;
+    let _ = bg.begin_shutdown();
+    bg.wait_shutdown().await;
     if let Some(n) = nursery {
         n.shutdown(tee.as_ref()).await;
     }

@@ -133,7 +133,15 @@ pub fn protocol_for(picker: &Picker, path: &Path, cols: u16, rows: u16) -> Optio
 pub struct GraphicBlit {
     pub x: u16,
     pub y: u16,
+    pub width: u16,
+    pub height: u16,
     pub data: String,
+}
+
+impl GraphicBlit {
+    pub fn area(&self) -> Rect {
+        Rect::new(self.x, self.y, self.width, self.height)
+    }
 }
 
 pub fn immediate_payload(proto: &Protocol) -> Option<&str> {
@@ -154,6 +162,37 @@ pub fn reserve_graphic_cells(buf: &mut Buffer, area: Rect) {
             }
         }
     }
+}
+
+/// Sixel cannot be clipped. If an overlay painted over any cell of a graphic,
+/// drop the blit and un-skip the whole area so those cells erase the image
+/// instead of leaving a remnant around (or on top of) the overlay.
+pub fn reveal_obscured_graphics(buf: &mut Buffer, blits: &mut Vec<GraphicBlit>) {
+    blits.retain(|blit| {
+        let area = blit.area();
+        if !graphic_is_obscured(buf, area) {
+            return true;
+        }
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_skip(false);
+                }
+            }
+        }
+        false
+    });
+}
+
+fn graphic_is_obscured(buf: &Buffer, area: Rect) -> bool {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if buf.cell((x, y)).is_some_and(|c| !c.skip) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn write_blits<W: Write>(out: &mut W, blits: &[GraphicBlit]) -> io::Result<()> {
@@ -389,5 +428,41 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         write_blits(&mut out, &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    fn sample_blit(x: u16, y: u16, w: u16, h: u16) -> GraphicBlit {
+        GraphicBlit {
+            x,
+            y,
+            width: w,
+            height: h,
+            data: "\x1bPq#0;2;0;0;0$".into(),
+        }
+    }
+
+    #[test]
+    fn unobscured_graphic_stays_skipped_and_queued() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 6));
+        reserve_graphic_cells(&mut buf, Rect::new(1, 1, 4, 3));
+        let mut blits = vec![sample_blit(1, 1, 4, 3)];
+        reveal_obscured_graphics(&mut buf, &mut blits);
+        assert_eq!(blits.len(), 1);
+        assert!(buf[(1, 1)].skip);
+        assert!(buf[(4, 3)].skip);
+    }
+
+    #[test]
+    fn overlay_on_part_of_graphic_drops_blit_and_unskips_the_rest() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 6));
+        reserve_graphic_cells(&mut buf, Rect::new(1, 1, 4, 3));
+        buf[(2, 2)].set_skip(false);
+        buf[(2, 2)].set_symbol("W");
+        let mut blits = vec![sample_blit(1, 1, 4, 3)];
+        reveal_obscured_graphics(&mut buf, &mut blits);
+        assert!(blits.is_empty(), "sixel cannot clip; the whole blit must drop");
+        assert!(!buf[(1, 1)].skip, "uncovered remnant cells must be written to erase sixel");
+        assert_eq!(buf[(1, 1)].symbol(), " ");
+        assert!(!buf[(2, 2)].skip);
+        assert_eq!(buf[(2, 2)].symbol(), "W");
     }
 }
