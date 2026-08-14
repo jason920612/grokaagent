@@ -1190,6 +1190,8 @@ struct App {
     preview: HashMap<(String, u16), Vec<Line<'static>>>,
     picker: Option<Picker>,
     image_proto: HashMap<(String, u16, u16), Protocol>,
+    graphic_blits: Vec<crate::preview::GraphicBlit>,
+    last_graphic_blits: Vec<crate::preview::GraphicBlit>,
     image_hits: Vec<String>,
     children: Vec<SideChild>,
     monitors: Vec<SideMon>,
@@ -2070,6 +2072,8 @@ impl App {
         self.chat_sel = ChatSel::None;
         self.preview.clear();
         self.image_proto.clear();
+        self.graphic_blits.clear();
+        self.last_graphic_blits.clear();
         self.children = p.children;
         self.monitors = p.monitors;
         self.backgrounds = p.backgrounds;
@@ -3913,6 +3917,7 @@ fn win_rect(w: &Win, area: Rect) -> Rect {
 
 fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     app.hits.clear();
+    app.graphic_blits.clear();
     app.area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(TEXT)), f.area());
     app.refresh_session_list();
@@ -4667,7 +4672,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
                             area.height.min(height),
                         );
                         if draw.width > 0 && draw.height > 0 {
-                            f.render_widget(Image::new(&proto), draw);
+                            paint_chat_graphic(f, app, &proto, draw);
                         }
                     } else {
                         f.render_widget(
@@ -4708,6 +4713,28 @@ fn cached_graphic(app: &mut App, rel: &str, w: u16, h: u16) -> Option<Protocol> 
     let proto = crate::preview::protocol_for(&picker, &abs, w, h)?;
     app.image_proto.insert(key, proto.clone());
     Some(proto)
+}
+
+fn paint_chat_graphic(f: &mut Frame, app: &mut App, proto: &Protocol, draw: Rect) {
+    if let Some(data) = crate::preview::immediate_payload(proto) {
+        crate::preview::reserve_graphic_cells(f.buffer_mut(), draw);
+        app.graphic_blits.push(crate::preview::GraphicBlit {
+            x: draw.x,
+            y: draw.y,
+            data: data.to_string(),
+        });
+        return;
+    }
+    f.render_widget(Image::new(proto), draw);
+}
+
+fn flush_image_blits(app: &mut App) -> Result<()> {
+    if app.graphic_blits == app.last_graphic_blits {
+        return Ok(());
+    }
+    crate::preview::write_blits(&mut io::stdout(), &app.graphic_blits)?;
+    app.last_graphic_blits.clone_from(&app.graphic_blits);
+    Ok(())
 }
 
 fn draw_tool_panel(f: &mut Frame, app: &mut App, chat: Rect, tool_hits: &[(Rect, Hit)]) {
@@ -5834,6 +5861,8 @@ async fn tui_loop(
             preview: HashMap::new(),
             picker: Some(crate::preview::detect_picker()),
             image_proto: HashMap::new(),
+            graphic_blits: Vec::new(),
+            last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
             children: Vec::new(),
             monitors: Vec::new(),
@@ -5916,6 +5945,7 @@ async fn tui_loop(
                 f.set_cursor_position(pos);
             })
             .map_err(Error::Io)?;
+        flush_image_blits(&mut app)?;
 
         tokio::select! {
             maybe = keys.next() => {
@@ -7447,6 +7477,118 @@ mod tests {
         assert!(image_hits.iter().any(|l| format!("{:?}", l.line).contains("圖片")));
     }
 
+    fn draw_sixel_chat(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: app.session.workspace.clone(),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, app, &opts);
+            })
+            .unwrap();
+        terminal
+    }
+
+    #[test]
+    fn sixel_image_does_not_leave_wide_symbols_in_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = write_red_png(dir.path(), "red.png");
+        let mut app = test_app();
+        app.session.workspace = dir.path().to_path_buf();
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        app.picker = Some(picker);
+        app.push(Row::User(UserMsg {
+            text: "see".into(),
+            images: vec![rel],
+        }));
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: app.session.workspace.clone(),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        let completed = terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let buf = completed.buffer;
+        let wide: Vec<_> = buf
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.symbol().len() > 80)
+            .map(|(i, c)| (i, c.symbol().len()))
+            .collect();
+        assert!(
+            wide.is_empty(),
+            "sixel payload in a cell poisons ratatui Buffer::diff: {wide:?}"
+        );
+        assert!(
+            !app.graphic_blits.is_empty(),
+            "immediate sixel must be queued for a post-diff blit"
+        );
+        assert!(
+            app.graphic_blits[0].data.starts_with('\x1b'),
+            "{:?}",
+            &app.graphic_blits[0].data[..app.graphic_blits[0].data.len().min(20)]
+        );
+        let skipped = buf.content.iter().filter(|c| c.skip).count();
+        assert!(skipped >= 2, "graphic area should be skipped, got {skipped}");
+        let blit = &app.graphic_blits[0];
+        let cell = &buf[(blit.x, blit.y)];
+        assert!(cell.skip);
+        assert_eq!(cell.symbol(), " ");
+    }
+
+    #[test]
+    fn typing_does_not_rebuild_sixel_blit() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = write_red_png(dir.path(), "red.png");
+        let mut app = test_app();
+        app.session.workspace = dir.path().to_path_buf();
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        app.picker = Some(picker);
+        app.push(Row::User(UserMsg {
+            text: "see".into(),
+            images: vec![rel],
+        }));
+        let mut terminal = draw_sixel_chat(&mut app);
+        let first = app.graphic_blits.clone();
+        assert!(!first.is_empty());
+        app.edit.insert_str("hello");
+        let opts = TuiOptions {
+            model: "grok-4.6".into(),
+            events: PathBuf::from("events.jsonl"),
+            workspace: app.session.workspace.clone(),
+            max_turns: 0,
+            web_search: false,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert_eq!(
+            app.graphic_blits, first,
+            "composer edits must not move or re-encode the image"
+        );
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut opts = TuiOptions {
@@ -7938,6 +8080,8 @@ mod tests {
             preview: HashMap::new(),
             picker: None,
             image_proto: HashMap::new(),
+            graphic_blits: Vec::new(),
+            last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
             children: Vec::new(),
             monitors: Vec::new(),

@@ -2,9 +2,13 @@
 //! graphics, otherwise half-block `▀` cells.
 
 use std::env;
+use std::io::{self, Write};
 use std::path::Path;
 
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::queue;
 use image::{imageops::FilterType, DynamicImage, Rgb, Rgba};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -119,6 +123,50 @@ pub fn protocol_for(picker: &Picker, path: &Path, cols: u16, rows: u16) -> Optio
             Resize::Fit(None),
         )
         .ok()
+}
+
+/// Graphics sequence that ratatui-image stores in a single cell (Sixel / iTerm2).
+/// Those payloads have a huge unicode width; leaving them in the buffer makes
+/// `Buffer::diff` treat every following cell as invalidated, so the terminal
+/// punches holes in the image on every keystroke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphicBlit {
+    pub x: u16,
+    pub y: u16,
+    pub data: String,
+}
+
+pub fn immediate_payload(proto: &Protocol) -> Option<&str> {
+    match proto {
+        Protocol::Sixel(s) => Some(s.data.as_str()),
+        Protocol::ITerm2(i) => Some(i.data.as_str()),
+        _ => None,
+    }
+}
+
+/// Mark the graphic area skipped and width-1 so ratatui will not rewrite it.
+pub fn reserve_graphic_cells(buf: &mut Buffer, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(" ");
+                cell.set_skip(true);
+            }
+        }
+    }
+}
+
+pub fn write_blits<W: Write>(out: &mut W, blits: &[GraphicBlit]) -> io::Result<()> {
+    if blits.is_empty() {
+        return Ok(());
+    }
+    queue!(out, SavePosition)?;
+    for blit in blits {
+        queue!(out, MoveTo(blit.x, blit.y))?;
+        out.write_all(blit.data.as_bytes())?;
+    }
+    queue!(out, RestorePosition)?;
+    out.flush()
 }
 
 pub fn cell_size_for(picker: &Picker, path: &Path, max_cols: u16, max_rows: u16) -> (u16, u16) {
@@ -310,5 +358,36 @@ mod tests {
         let (w, h) = cell_size_for(&picker, &path, 56, 12);
         assert!(w >= 1 && w <= 56, "{w}");
         assert!(h >= 1 && h <= 12, "{h}");
+        let payload = immediate_payload(&proto).expect("sixel is an immediate protocol");
+        assert!(payload.starts_with('\x1b'), "{payload:?}");
+        let printable = payload.chars().filter(|c| !c.is_control()).count();
+        assert!(
+            printable > 1,
+            "sixel printable width {printable} (len {}) would invalidate following cells in Buffer::diff",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn reserve_graphic_cells_are_skip_and_width_one() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
+        buf[(2, 1)].set_symbol("X");
+        reserve_graphic_cells(&mut buf, Rect::new(2, 1, 3, 2));
+        for y in 1..3 {
+            for x in 2..5 {
+                let cell = &buf[(x, y)];
+                assert!(cell.skip, "{x},{y}");
+                assert_eq!(cell.symbol(), " ");
+            }
+        }
+        assert!(!buf[(1, 1)].skip);
+        assert_eq!(buf[(1, 1)].symbol(), " ");
+    }
+
+    #[test]
+    fn write_blits_is_a_no_op_when_empty() {
+        let mut out: Vec<u8> = Vec::new();
+        write_blits(&mut out, &[]).unwrap();
+        assert!(out.is_empty());
     }
 }
