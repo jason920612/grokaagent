@@ -20,6 +20,7 @@ pub mod preview;
 pub mod procgroup;
 pub mod provider;
 pub mod session;
+pub mod skills;
 pub mod shellguard;
 pub mod shot;
 pub mod diff;

@@ -1,7 +1,7 @@
 //! Shared wiring for root/worker runs: tools + optional nursery + kernel.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::agent::{self, RunConfig, RunOutcome};
 use crate::ask::{AskUserHub, AskUserTool};
@@ -16,6 +16,7 @@ use crate::monitor::{AttachMonitorTool, MonitorHub, MonitorSink};
 use crate::nursery::{Nursery, SendMessageTool, SpawnAgentTool, DEFAULT_MAX_DEPTH};
 use crate::provider::Provider;
 use crate::shellguard::{CommandReviewer, ProviderGuard};
+use crate::skills::{SkillStore, SkillTool};
 use crate::timer::{TimerHub, TimerTool};
 use crate::tools::{
     DeleteFileTool, ListDirTool, NowTool, ReadFileTool, ReadImageTool, RunCommandTool,
@@ -51,6 +52,8 @@ pub struct KernelSpec {
     pub ask: Option<AskUserHub>,
     /// TUI Esc trips this; headless runs leave it `None`.
     pub cancel: Option<crate::agent::CancelFlag>,
+    /// Shared with the TUI so Settings toggles apply on the next turn.
+    pub skills: Option<std::sync::Arc<std::sync::Mutex<SkillStore>>>,
 }
 
 pub async fn run_with_nursery<P: Provider + Clone + 'static>(
@@ -95,6 +98,14 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         spec.workspace.clone(),
     ));
     let memory_root = crate::memory::default_dir()?;
+    let skills = spec.skills.clone().unwrap_or_else(|| {
+        Arc::new(Mutex::new(SkillStore::open().unwrap_or_else(|_| {
+            SkillStore::open_at(
+                spec.workspace.join(".groka").join("skills-store"),
+                spec.workspace.clone(),
+            )
+        })))
+    });
     let mut tools: Vec<Box<dyn crate::tools::ClientTool>> = vec![
         Box::new(NowTool),
         Box::new(ReadFileTool::new(spec.workspace.clone())),
@@ -134,6 +145,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             memory_root.clone(),
             spec.workspace.clone(),
         )),
+        Box::new(SkillTool::new(skills.clone(), spec.workspace.clone())),
     ];
     if let Some(ask_hub) = spec.ask {
         tools.push(Box::new(AskUserTool::new(
@@ -197,6 +209,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             images: spec.images,
             closed_backgrounds,
             cancel: spec.cancel,
+            skills: Some(skills),
         },
     )
     .await;

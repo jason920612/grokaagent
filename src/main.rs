@@ -203,6 +203,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     images: Vec::new(),
                     ask: None,
                     cancel: None,
+                    skills: None,
                 },
             )
             .await?;

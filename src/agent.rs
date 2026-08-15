@@ -51,6 +51,7 @@ pub struct RunConfig {
     pub closed_backgrounds: Option<String>,
     /// TUI Esc trips this so an in-flight stream or tool is dropped, then the session pauses.
     pub cancel: Option<CancelFlag>,
+    pub skills: Option<Arc<Mutex<crate::skills::SkillStore>>>,
 }
 
 /// Shared flag so the TUI can abort the current model turn without ending the session.
@@ -175,6 +176,19 @@ fn emit_model_finished(
         input_tokens: usage.input_tokens,
         cached_tokens: usage.cached_tokens,
     });
+}
+
+fn live_instructions(cfg: &RunConfig) -> String {
+    let extra = cfg.skills.as_ref().map(|s| {
+        s.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .catalog_suffix(&cfg.workspace)
+    }).unwrap_or_default();
+    if extra.is_empty() {
+        cfg.instructions.clone()
+    } else {
+        format!("{}{extra}", cfg.instructions)
+    }
 }
 
 fn live_knobs(cfg: &RunConfig) -> (String, ReasoningEffort, bool, Vec<String>) {
@@ -724,7 +738,7 @@ pub async fn run<P: Provider>(
 
         let used = last_usage
             .input_tokens
-            .max(compact::estimate_tokens(&cfg.instructions, &history));
+            .max(compact::estimate_tokens(&live_instructions(&cfg), &history));
         if compact::should_compact(used, window, history.len(), keep_recent) {
             let head = compact::split_head_tail(&history, keep_recent).0.to_vec();
             loop {
@@ -732,7 +746,7 @@ pub async fn run<P: Provider>(
                     &cfg.cancel,
                     ask_lived_memory(
                         provider,
-                        &cfg.instructions,
+                        &live_instructions(&cfg),
                         &cfg.prompt,
                         &model,
                         effort,
@@ -841,7 +855,7 @@ pub async fn run<P: Provider>(
         // turn start with a different prefix, so cached_tokens stays 0.
         let has_image = crate::vision::input_has_image(&history);
         let req = CompleteRequest {
-            instructions: cfg.instructions.clone(),
+            instructions: live_instructions(&cfg),
             input: history.clone(),
             client_tools: tools.specs(),
             server_tools: server_tools.clone(),
@@ -1224,6 +1238,7 @@ mod tests {
             images: Vec::new(),
             closed_backgrounds: None,
             cancel: None,
+            skills: None,
         }
     }
 

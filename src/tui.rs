@@ -34,6 +34,7 @@ use crate::kit;
 use crate::md;
 use crate::provider::{ReasoningEffort, XaiOauthProvider};
 use crate::session::{self, SessionMeta, SessionStore};
+use crate::skills::{Skill, SkillStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -247,6 +248,9 @@ enum SettingField {
     Model,
     Effort,
     Search,
+    ImportClaude,
+    ImportCodex,
+    Skills,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +307,14 @@ enum Hit {
     SettingEffort,
     CatalogPick(u16),
     Search,
+    ImportClaude,
+    ImportCodex,
+    SkillToggle(u16),
+    SkillRow(u16),
+    SkillList,
+    SkillView,
+    SkillViewClose,
+    SkillViewDismiss,
     AccountBtn,
     LoginCode,
     Dock,
@@ -716,34 +728,32 @@ fn picture_from_tool(name: &str, output: &str) -> Option<(String, String)> {
     Some((path.clone(), format!("模型在看  {name}  {path}")))
 }
 
-fn row_copy_text(row: &Row) -> String {
-    match row {
-        Row::User(u) => u.text.clone(),
-        Row::Agent(a) => a.text.clone(),
-        Row::Meta(s) | Row::Err(s) => s.clone(),
-        Row::Think(t) => t.text.clone(),
-        Row::Picture { path, label } => format!("{label}\n{path}"),
-        Row::Tools(g) => g
-            .calls
-            .iter()
-            .map(|c| {
-                if c.output.is_empty() {
-                    c.name.clone()
-                } else {
-                    format!("{}\n{}", c.name, c.output)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
 fn hit_at(hits: &[(Rect, Hit)], col: u16, row: u16) -> Option<Hit> {
     let p = Position::new(col, row);
     hits.iter()
         .rev()
         .find(|(r, _)| r.contains(p))
         .map(|(_, h)| *h)
+}
+
+fn chat_pos_at(glyphs: &[ChatGlyphLine], col: u16, row: u16) -> Option<ChatPos> {
+    if glyphs.is_empty() {
+        return None;
+    }
+    let line = glyphs
+        .iter()
+        .find(|g| g.y == row)
+        .or_else(|| glyphs.iter().min_by_key(|g| g.y.abs_diff(row)))?;
+    let rel = col.saturating_sub(line.x);
+    let idx = if line.chars.is_empty() || rel >= line.text_w {
+        line.start + line.chars.len()
+    } else {
+        line.start + index_at_width(&line.chars, rel)
+    };
+    Some(ChatPos {
+        row: line.row,
+        idx,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -940,12 +950,52 @@ impl Queued {
     }
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChatPos {
+    row: usize,
+    idx: usize,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 enum ChatSel {
     #[default]
     None,
-    Row(usize),
+    Text { anchor: ChatPos, caret: ChatPos },
     Image(String),
+}
+
+impl ChatSel {
+    fn text_range(&self) -> Option<(ChatPos, ChatPos)> {
+        match *self {
+            ChatSel::Text { anchor, caret } if anchor != caret => {
+                if anchor <= caret {
+                    Some((anchor, caret))
+                } else {
+                    Some((caret, anchor))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Visible glyph run of a selectable chat line, in screen cells.
+struct ChatGlyphLine {
+    y: u16,
+    x: u16,
+    text_w: u16,
+    row: usize,
+    start: usize,
+    chars: Vec<char>,
+}
+
+struct SkillView {
+    title: String,
+    origin: String,
+    edit: Edit,
+    scroll: u16,
+    inner: Rect,
+    dragging: bool,
 }
 
 #[derive(Clone)]
@@ -1175,6 +1225,8 @@ struct App {
     chat_max_off: u16,
     composer_vscroll: u16,
     input_dragging: bool,
+    chat_dragging: bool,
+    chat_glyphs: Vec<ChatGlyphLine>,
     catalog: ModelCatalog,
     catalog_status: CatalogStatus,
     drop: Option<DropKind>,
@@ -1221,6 +1273,11 @@ struct App {
     /// When routing an event into a parked session, do not open the overlay.
     ask_passive: bool,
     workspace_pick: Option<WorkspacePick>,
+    skills: Arc<Mutex<SkillStore>>,
+    skill_list: Vec<Skill>,
+    skill_cursor: usize,
+    skill_scroll: u16,
+    skill_view: Option<SkillView>,
 }
 
 impl App {
@@ -1232,6 +1289,7 @@ impl App {
         self.rows.push(row);
         if self.rows.len() > 2_000 {
             self.rows.drain(0..self.rows.len() - 1_500);
+            self.chat_sel = ChatSel::None;
         }
         if self.stick_bottom {
             self.scroll = 0;
@@ -1643,6 +1701,83 @@ impl App {
         self.focus = Focus::Chat;
     }
 
+    fn refresh_skills(&mut self) {
+        let ws = self.session.workspace.clone();
+        let list = self
+            .skills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scan(&ws);
+        if self.skill_cursor >= list.len() && !list.is_empty() {
+            self.skill_cursor = list.len() - 1;
+        }
+        self.skill_list = list;
+    }
+
+    fn toggle_import_claude(&mut self) {
+        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let on = !g.prefs().import_claude;
+        let _ = g.set_import_claude(on);
+        drop(g);
+        self.refresh_skills();
+        self.status = if on {
+            "已引入 Claude Code 技能".into()
+        } else {
+            "已停止引入 Claude Code 技能".into()
+        };
+    }
+
+    fn toggle_import_codex(&mut self) {
+        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let on = !g.prefs().import_codex;
+        let _ = g.set_import_codex(on);
+        drop(g);
+        self.refresh_skills();
+        self.status = if on {
+            "已引入 Codex 技能".into()
+        } else {
+            "已停止引入 Codex 技能".into()
+        };
+    }
+
+    fn toggle_skill(&mut self, i: usize) {
+        let Some(id) = self.skill_list.get(i).map(|s| s.id.clone()) else {
+            return;
+        };
+        let enabled = self.skill_list.get(i).map(|s| s.enabled).unwrap_or(false);
+        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = g.set_enabled(&id, !enabled);
+        drop(g);
+        self.refresh_skills();
+    }
+
+    fn open_skill_view(&mut self, i: usize) {
+        let Some(skill) = self.skill_list.get(i).cloned() else {
+            return;
+        };
+        let body = crate::skills::read_skill_file(&skill.path).unwrap_or_else(|e| e.to_string());
+        let mut edit = Edit::at_end(body);
+        edit.home(false);
+        self.skill_view = Some(SkillView {
+            title: skill.name,
+            origin: skill.origin.label().to_string(),
+            edit,
+            scroll: 0,
+            inner: Rect::default(),
+            dragging: false,
+        });
+        self.focus = Focus::Settings;
+    }
+
+    fn close_skill_view(&mut self) {
+        self.skill_view = None;
+        if self.settings.is_some() {
+            self.focus = Focus::Settings;
+        } else {
+            self.focus = Focus::Chat;
+        }
+    }
+
     fn attach_pending(&mut self, rel: String) -> bool {
         if self.pending.len() >= crate::vision::MAX_USER_IMAGES {
             self.status = format!("最多 {} 張圖片", crate::vision::MAX_USER_IMAGES);
@@ -1745,6 +1880,16 @@ impl App {
     }
 
     fn copy_selection(&mut self) -> bool {
+        if let Some(view) = self.skill_view.as_ref() {
+            if let Some(s) = view.edit.selected_text() {
+                if clipboard_set(&s) {
+                    self.status = "已複製".into();
+                } else {
+                    self.status = "無法複製到剪貼簿".into();
+                }
+                return true;
+            }
+        }
         if self.edit.has_sel() {
             if let Some(s) = self.edit.selected_text() {
                 if clipboard_set(&s) {
@@ -1767,8 +1912,8 @@ impl App {
                 }
                 true
             }
-            ChatSel::Row(i) => {
-                let Some(text) = self.rows.get(*i).map(row_copy_text) else {
+            ChatSel::Text { .. } => {
+                let Some(text) = chat_selected_text(&self.rows, &self.chat_sel) else {
                     return false;
                 };
                 if text.is_empty() {
@@ -3051,6 +3196,8 @@ struct ChatLine {
     wrap: bool,
     /// When set, this item occupies `height` rows and is painted via a graphics protocol.
     graphic: Option<(String, u16, u16)>,
+    /// Selectable text: transcript row + char offset of this logical line.
+    select: Option<(usize, usize)>,
 }
 
 fn chat_line(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
@@ -3059,6 +3206,17 @@ fn chat_line(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
         hit,
         wrap: true,
         graphic: None,
+        select: None,
+    }
+}
+
+fn chat_line_sel(line: Line<'static>, hit: Option<Hit>, row: usize, start: usize) -> ChatLine {
+    ChatLine {
+        line,
+        hit,
+        wrap: true,
+        graphic: None,
+        select: Some((row, start)),
     }
 }
 
@@ -3068,6 +3226,7 @@ fn chat_line_raw(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
         hit,
         wrap: false,
         graphic: None,
+        select: None,
     }
 }
 
@@ -3077,6 +3236,7 @@ fn chat_graphic(rel: String, width: u16, height: u16, hit: Option<Hit>) -> ChatL
         hit,
         wrap: false,
         graphic: Some((rel, width.max(1), height.max(1))),
+        select: None,
     }
 }
 
@@ -3149,7 +3309,6 @@ fn chat_logical_rows(app: &mut App, cols: u16) -> Vec<ChatLine> {
     let open_tool = app.open_tool;
     let mut out = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
-        let row_sel = matches!(sel, ChatSel::Row(i) if i == ri);
         match row {
             Row::Tools(g) => {
                 out.push(chat_line(group_header_line(g), Some(Hit::ToolGroup(ri))));
@@ -3175,57 +3334,155 @@ fn chat_logical_rows(app: &mut App, cols: u16) -> Vec<ChatLine> {
                 }
             }
             Row::User(u) => {
-                let hit = Some(Hit::ChatRow(ri as u16));
-                for mut line in prefixed_text("you   ", USER, &u.text) {
-                    if row_sel {
-                        line = tint_line(line);
-                    }
-                    out.push(chat_line(line, hit));
-                }
+                push_selectable(
+                    &mut out,
+                    prefixed_text("you   ", USER, &u.text),
+                    ri,
+                );
                 for img in &u.images {
                     let img_sel = matches!(&sel, ChatSel::Image(p) if p == img);
                     push_image_block(app, &mut out, img, format!("圖片  {img}"), cols, img_sel);
                 }
             }
             Row::Picture { path, label } => {
-                let hit = Some(Hit::ChatRow(ri as u16));
-                let style = if row_sel {
-                    Style::default().fg(Color::Black).bg(ACCENT)
-                } else {
-                    Style::default().fg(DIM)
-                };
-                out.push(chat_line(
-                    Line::from(Span::styled(label.clone(), style)),
-                    hit,
-                ));
+                push_selectable(
+                    &mut out,
+                    vec![Line::from(Span::styled(
+                        label.clone(),
+                        Style::default().fg(DIM),
+                    ))],
+                    ri,
+                );
                 let img_sel = matches!(&sel, ChatSel::Image(p) if p == path);
                 push_image_block(app, &mut out, path, String::new(), cols, img_sel);
             }
             other => {
-                let hit = Some(Hit::ChatRow(ri as u16));
-                for mut line in row_lines(other) {
-                    if row_sel {
-                        line = tint_line(line);
-                    }
-                    out.push(chat_line(line, hit));
-                }
+                push_selectable(&mut out, row_lines(other), ri);
             }
         }
     }
     out
 }
 
-fn tint_line(line: Line<'static>) -> Line<'static> {
-    Line::from(
-        line.spans
-            .into_iter()
-            .map(|s| {
-                let mut st = s.style;
-                st.bg = Some(Color::Rgb(48, 64, 88));
-                Span::styled(s.content, st)
-            })
-            .collect::<Vec<_>>(),
+fn push_selectable(out: &mut Vec<ChatLine>, lines: Vec<Line<'static>>, ri: usize) {
+    let hit = Some(Hit::ChatRow(ri as u16));
+    let mut off = 0usize;
+    for line in lines {
+        let n = selectable_line_text(&line).chars().count();
+        out.push(chat_line_sel(line, hit, ri, off));
+        off = off.saturating_add(n).saturating_add(1);
+    }
+}
+
+fn row_sel_lines(row: &Row) -> Option<Vec<Line<'static>>> {
+    match row {
+        Row::User(u) => Some(prefixed_text("you   ", USER, &u.text)),
+        Row::Agent(a) => Some(agent_lines(a)),
+        Row::Meta(s) => Some(vec![Line::from(Span::styled(
+            s.clone(),
+            Style::default().fg(DIM),
+        ))]),
+        Row::Err(s) => Some(vec![Line::from(Span::styled(
+            s.clone(),
+            Style::default().fg(WARN),
+        ))]),
+        Row::Picture { label, .. } => Some(vec![Line::from(Span::styled(
+            label.clone(),
+            Style::default().fg(DIM),
+        ))]),
+        Row::Tools(_) | Row::Think(_) => None,
+    }
+}
+
+fn selectable_text(row: &Row) -> Option<String> {
+    let lines = row_sel_lines(row)?;
+    Some(
+        lines
+            .iter()
+            .map(selectable_line_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
+}
+
+fn chat_selected_text(rows: &[Row], sel: &ChatSel) -> Option<String> {
+    let (lo, hi) = sel.text_range()?;
+    if lo.row >= rows.len() {
+        return None;
+    }
+    if lo.row == hi.row {
+        let s = selectable_text(&rows[lo.row])?;
+        let n = s.chars().count();
+        let a = lo.idx.min(n);
+        let b = hi.idx.min(n);
+        if a >= b {
+            return None;
+        }
+        return Some(s.chars().skip(a).take(b - a).collect());
+    }
+    let mut parts = Vec::new();
+    for ri in lo.row..=hi.row.min(rows.len().saturating_sub(1)) {
+        let Some(s) = selectable_text(&rows[ri]) else {
+            continue;
+        };
+        let n = s.chars().count();
+        let a = if ri == lo.row { lo.idx.min(n) } else { 0 };
+        let b = if ri == hi.row { hi.idx.min(n) } else { n };
+        if a < b {
+            parts.push(s.chars().skip(a).take(b - a).collect::<String>());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn tint_char_range(line: Line<'static>, lo: usize, hi: usize) -> Line<'static> {
+    if lo >= hi {
+        return line;
+    }
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        let mut buf_style = style;
+        for c in span.content.chars() {
+            let mut st = style;
+            if i >= lo && i < hi {
+                st.bg = Some(Color::Rgb(48, 64, 88));
+            }
+            if !buf.is_empty() && st != buf_style {
+                spans.push(Span::styled(std::mem::take(&mut buf), buf_style));
+            }
+            buf.push(c);
+            buf_style = st;
+            i += 1;
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, buf_style));
+        }
+    }
+    Line::from(spans)
+}
+
+fn piece_tint_range(sel: &ChatSel, row: usize, start: usize, n: usize) -> Option<(usize, usize)> {
+    let (lo, hi) = sel.text_range()?;
+    if row < lo.row || row > hi.row {
+        return None;
+    }
+    let a = if row == lo.row { lo.idx } else { 0 };
+    let b = if row == hi.row { hi.idx } else { usize::MAX };
+    let piece_hi = start.saturating_add(n);
+    let a = a.max(start);
+    let b = b.min(piece_hi);
+    if a >= b {
+        None
+    } else {
+        Some((a - start, b - start))
+    }
 }
 
 fn group_header_line(g: &ToolGroup) -> Line<'static> {
@@ -3435,10 +3692,15 @@ fn call_detail_lines(c: &ToolCall) -> Vec<Line<'static>> {
     lines
 }
 
-fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-    let width = width.max(1);
+struct WrapPiece {
+    line: Line<'static>,
+    start: usize,
+    chars: Vec<char>,
+}
+
+fn line_cells(line: &Line<'_>) -> Vec<(char, Style)> {
     let mut cells: Vec<(char, Style)> = Vec::new();
-    for span in line.spans {
+    for span in &line.spans {
         let style = span.style;
         for c in span.content.chars() {
             if c == '\t' {
@@ -3450,8 +3712,22 @@ fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
             }
         }
     }
+    cells
+}
+
+fn selectable_line_text(line: &Line<'_>) -> String {
+    line_cells(line).into_iter().map(|(c, _)| c).collect()
+}
+
+fn wrap_line_indexed(line: Line<'static>, width: u16) -> Vec<WrapPiece> {
+    let width = width.max(1);
+    let cells = line_cells(&line);
     if cells.is_empty() {
-        return vec![Line::from("")];
+        return vec![WrapPiece {
+            line: Line::from(""),
+            start: 0,
+            chars: Vec::new(),
+        }];
     }
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -3464,7 +3740,7 @@ fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         if ch == '\n' {
-            out.push(line_from_cells(&cells[start..i]));
+            out.push(piece_from_cells(&cells, start, i));
             start = i + 1;
             col = 0;
             i += 1;
@@ -3472,7 +3748,7 @@ fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         }
         let w = ch_width(ch).max(1);
         if col > 0 && col.saturating_add(w) > width {
-            out.push(line_from_cells(&cells[start..i]));
+            out.push(piece_from_cells(&cells, start, i));
             start = i;
             col = 0;
             continue;
@@ -3481,9 +3757,25 @@ fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         i += 1;
     }
     if start < cells.len() || out.is_empty() {
-        out.push(line_from_cells(&cells[start..]));
+        out.push(piece_from_cells(&cells, start, cells.len()));
     }
     out
+}
+
+fn piece_from_cells(cells: &[(char, Style)], start: usize, end: usize) -> WrapPiece {
+    let slice = &cells[start..end];
+    WrapPiece {
+        line: line_from_cells(slice),
+        start,
+        chars: slice.iter().map(|(c, _)| *c).collect(),
+    }
+}
+
+fn wrap_visual(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    wrap_line_indexed(line, width)
+        .into_iter()
+        .map(|p| p.line)
+        .collect()
 }
 
 fn line_from_cells(cells: &[(char, Style)]) -> Line<'static> {
@@ -4026,8 +4318,8 @@ fn open_settings(app: &mut App) {
         return;
     }
     let area = app.area;
-    let w = 56u16.min(area.width.saturating_sub(4)).max(28);
-    let h = 22u16.min(area.height.saturating_sub(4)).max(14);
+    let w = 64u16.min(area.width.saturating_sub(4)).max(36);
+    let h = 28u16.min(area.height.saturating_sub(4)).max(16);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + 2;
     app.settings = Some(Win {
@@ -4062,6 +4354,7 @@ fn win_rect(w: &Win, area: Rect) -> Rect {
 
 fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     app.hits.clear();
+    app.chat_glyphs.clear();
     app.graphic_blits.clear();
     app.area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(TEXT)), f.area());
@@ -4139,6 +4432,11 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     }
     if app.image_view.is_some() {
         draw_image_view(f, app, f.area());
+    }
+    if app.skill_view.is_some() {
+        if let Some(pos) = draw_skill_view(f, app, f.area()) {
+            caret = pos;
+        }
     }
     if app.ask.is_some() {
         if let Some(pos) = draw_ask(f, app) {
@@ -4753,7 +5051,11 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
     }
 
     enum Paint {
-        Line(Line<'static>, Option<Hit>),
+        Line {
+            line: Line<'static>,
+            hit: Option<Hit>,
+            glyph: Option<(usize, usize, Vec<char>)>,
+        },
         Graphic {
             rel: String,
             width: u16,
@@ -4772,19 +5074,43 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
             });
             continue;
         }
-        let wrapped = if item.wrap {
-            wrap_visual(item.line, inner.width)
+        if let Some((row, start)) = item.select {
+            let pieces = if item.wrap {
+                wrap_line_indexed(item.line, inner.width)
+            } else {
+                let chars: Vec<char> = selectable_line_text(&item.line).chars().collect();
+                vec![WrapPiece {
+                    line: item.line,
+                    start: 0,
+                    chars,
+                }]
+            };
+            for p in pieces {
+                paints.push(Paint::Line {
+                    line: p.line,
+                    hit: item.hit,
+                    glyph: Some((row, start.saturating_add(p.start), p.chars)),
+                });
+            }
         } else {
-            vec![item.line]
-        };
-        for wrapped in wrapped {
-            paints.push(Paint::Line(wrapped, item.hit));
+            let wrapped = if item.wrap {
+                wrap_visual(item.line, inner.width)
+            } else {
+                vec![item.line]
+            };
+            for wrapped in wrapped {
+                paints.push(Paint::Line {
+                    line: wrapped,
+                    hit: item.hit,
+                    glyph: None,
+                });
+            }
         }
     }
     let total: u16 = paints
         .iter()
         .map(|p| match p {
-            Paint::Line(..) => 1,
+            Paint::Line { .. } => 1,
             Paint::Graphic { height, .. } => *height,
         })
         .sum();
@@ -4797,10 +5123,11 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         max_off.saturating_sub(app.scroll.min(max_off))
     };
     let vis_end = scroll.saturating_add(inner.height);
+    let sel = app.chat_sel.clone();
     let mut logical = 0u16;
     for paint in paints {
         let h = match &paint {
-            Paint::Line(..) => 1,
+            Paint::Line { .. } => 1,
             Paint::Graphic { height, .. } => *height,
         };
         let start = logical;
@@ -4812,10 +5139,33 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         let screen_y = inner.y + start.saturating_sub(scroll);
         let vis_h = end.min(vis_end).saturating_sub(start.max(scroll)).max(1);
         match paint {
-            Paint::Line(line, hit) => {
+            Paint::Line { mut line, hit, glyph } => {
+                if let Some((row, gstart, chars)) = &glyph {
+                    if let Some((lo, hi)) = piece_tint_range(&sel, *row, *gstart, chars.len()) {
+                        line = tint_char_range(line, lo, hi);
+                    }
+                }
                 let r = Rect::new(inner.x, screen_y, inner.width, 1);
                 f.render_widget(Paragraph::new(line), r);
-                if let Some(kind) = hit {
+                if let Some((grow, gstart, chars)) = glyph {
+                    let text_w: u16 = chars.iter().map(|c| ch_width(*c).max(1)).sum();
+                    let text_w = text_w.min(inner.width);
+                    if text_w > 0 {
+                        if let Some(kind) = hit {
+                            let hr = Rect::new(inner.x, screen_y, text_w, 1);
+                            app.hits.push((hr, kind));
+                            tool_hits.push((hr, kind));
+                        }
+                    }
+                    app.chat_glyphs.push(ChatGlyphLine {
+                        y: screen_y,
+                        x: inner.x,
+                        text_w,
+                        row: grow,
+                        start: gstart,
+                        chars,
+                    });
+                } else if let Some(kind) = hit {
                     app.hits.push((r, kind));
                     tool_hits.push((r, kind));
                 }
@@ -5123,6 +5473,71 @@ fn draw_image_view(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let lines = crate::preview::from_path(&abs, inner.width, inner.height);
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_skill_view(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position> {
+    app.hits.push((area, Hit::SkillViewDismiss));
+    let panel = image_view_rect(area);
+    f.render_widget(Clear, panel);
+    let title = app
+        .skill_view
+        .as_ref()
+        .map(|v| format!(" 技能  {}  · {}  · 只讀  · 可選取複製  · Esc 關閉 ", v.title, v.origin))
+        .unwrap_or_else(|| " 技能 ".into());
+    f.render_widget(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL).fg(TEXT)),
+        panel,
+    );
+    let close = Rect::new(panel.x + panel.width.saturating_sub(4), panel.y, 3, 1);
+    f.render_widget(
+        Paragraph::new(Span::styled(" × ", Style::default().fg(WARN))),
+        close,
+    );
+    app.hits.push((panel, Hit::SkillView));
+    app.hits.push((close, Hit::SkillViewClose));
+    let inner = Rect::new(
+        panel.x.saturating_add(1),
+        panel.y.saturating_add(1),
+        panel.width.saturating_sub(2),
+        panel.height.saturating_sub(2),
+    );
+    let Some(view) = app.skill_view.as_mut() else {
+        return None;
+    };
+    view.inner = inner;
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let mut line = Line::from(view.edit.text.clone());
+    if let Some((lo, hi)) = view.edit.sel_range() {
+        line = tint_char_range(line, lo, hi);
+    }
+    let wrapped = wrap_visual(line, inner.width.max(1));
+    let total = wrapped.len() as u16;
+    let max_off = total.saturating_sub(inner.height);
+    view.scroll = view.scroll.min(max_off);
+    let start = view.scroll as usize;
+    let vis: Vec<Line<'static>> = wrapped
+        .into_iter()
+        .skip(start)
+        .take(inner.height as usize)
+        .collect();
+    f.render_widget(Paragraph::new(vis), inner);
+    let ranges = wrap_lines(&view.edit.text, inner.width.max(1));
+    let (row, col) = caret_row_col(&view.edit.text, &ranges, view.edit.caret);
+    if row >= view.scroll && row.saturating_sub(view.scroll) < inner.height {
+        Some(Position::new(
+            inner.x.saturating_add(col.min(inner.width.saturating_sub(1))),
+            inner.y + row.saturating_sub(view.scroll),
+        ))
+    } else {
+        None
+    }
 }
 
 fn draw_tool_panel(f: &mut Frame, app: &mut App, chat: Rect, tool_hits: &[(Rect, Hit)]) {
@@ -5838,7 +6253,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(4),
         ])
         .split(body);
 
@@ -6006,17 +6424,47 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     );
     app.hits.push((search_cell, Hit::Search));
 
-    let hint = match &app.catalog_status {
-        CatalogStatus::Loading => "正在載入可用模型…".to_string(),
-        CatalogStatus::Failed(e) => format!("目錄載入失敗：{e}"),
-        CatalogStatus::Idle if app.logged_in => "登入後會自動載入可用模型".to_string(),
-        CatalogStatus::Idle => "登入後可載入模型目錄".to_string(),
-        CatalogStatus::Ready => String::new(),
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+    app.refresh_skills();
+    let import_claude = app
+        .skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prefs()
+        .import_claude;
+    let import_codex = app
+        .skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prefs()
+        .import_codex;
+    draw_import_row(
+        f,
+        app,
         lines[9],
+        "引入 Claude Code 技能",
+        import_claude,
+        focused && app.setting_field == SettingField::ImportClaude,
+        Hit::ImportClaude,
     );
+    draw_import_row(
+        f,
+        app,
+        lines[10],
+        "引入 Codex 技能",
+        import_codex,
+        focused && app.setting_field == SettingField::ImportCodex,
+        Hit::ImportCodex,
+    );
+
+    let skills_focus = focused && app.setting_field == SettingField::Skills;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "技能（點名稱查看 · 不可編輯）",
+            Style::default().fg(if skills_focus { ACCENT } else { DIM }),
+        )),
+        lines[11],
+    );
+    draw_skill_list(f, app, lines[12], skills_focus);
 
     if let Some(kind) = app.drop {
         let anchor = match kind {
@@ -6027,6 +6475,125 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     }
 
     None
+}
+
+fn draw_import_row(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    label: &str,
+    on: bool,
+    focus: bool,
+    hit: Hit,
+) {
+    let chip = if on { " 開 " } else { " 關 " };
+    let chip_style = if on {
+        Style::default()
+            .bg(ACCENT)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else if focus {
+        Style::default().fg(ACCENT).bg(COMPOSER)
+    } else {
+        Style::default().fg(DIM).bg(COMPOSER)
+    };
+    let chip_w = 5u16;
+    f.render_widget(
+        Paragraph::new(Span::styled(label, Style::default().fg(if focus { TEXT } else { DIM }))),
+        Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(chip_w.saturating_add(1)),
+            1,
+        ),
+    );
+    let cell = Rect::new(
+        area.x + area.width.saturating_sub(chip_w),
+        area.y,
+        chip_w.min(area.width),
+        1,
+    );
+    f.render_widget(Paragraph::new(Span::styled(chip, chip_style)), cell);
+    app.hits.push((area, hit));
+}
+
+fn draw_skill_list(f: &mut Frame, app: &mut App, area: Rect, focus: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focus { ACCENT } else { BORDER }))
+        .style(Style::default().bg(COMPOSER));
+    f.render_widget(block, area);
+    app.hits.push((area, Hit::SkillList));
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.skill_list.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "尚無技能 — 請模型寫一個，或開啟上方引入",
+                Style::default().fg(DIM),
+            )),
+            inner,
+        );
+        return;
+    }
+    let vis = inner.height as usize;
+    if app.skill_cursor < app.skill_scroll as usize {
+        app.skill_scroll = app.skill_cursor as u16;
+    }
+    if app.skill_cursor >= app.skill_scroll as usize + vis && vis > 0 {
+        app.skill_scroll = (app.skill_cursor + 1 - vis) as u16;
+    }
+    let start = app.skill_scroll as usize;
+    let rows: Vec<(usize, String, String, bool)> = app
+        .skill_list
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(vis)
+        .map(|(i, s)| (i, s.name.clone(), s.origin.label().to_string(), s.enabled))
+        .collect();
+    for (row, (i, name, origin, enabled)) in rows.into_iter().enumerate() {
+        let y = inner.y + row as u16;
+        let selected = i == app.skill_cursor && focus;
+        let chip = if enabled { " 開 " } else { " 關 " };
+        let chip_style = if enabled {
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM).bg(PANEL)
+        };
+        let chip_cell = Rect::new(inner.x, y, 5.min(inner.width), 1);
+        f.render_widget(Paragraph::new(Span::styled(chip, chip_style)), chip_cell);
+        app.hits.push((chip_cell, Hit::SkillToggle(i as u16)));
+        let rest_x = inner.x.saturating_add(6);
+        if rest_x >= inner.x + inner.width {
+            continue;
+        }
+        let rest_w = inner.x + inner.width - rest_x;
+        let label = format!("{name}  · {origin}");
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let shown: String = label.chars().take(rest_w as usize).collect();
+        let rest = Rect::new(rest_x, y, rest_w, 1);
+        f.render_widget(Paragraph::new(Span::styled(shown, style)), rest);
+        app.hits.push((rest, Hit::SkillRow(i as u16)));
+    }
 }
 
 fn draw_combo(f: &mut Frame, app: &mut App, area: Rect, label: &str, focus: bool, hit: Hit) {
@@ -6193,6 +6760,7 @@ async fn tui_loop(
         listed.insert(0, session.clone());
     }
 
+    let skills_fallback = launch_workspace.clone();
     let mut app = App {
         rows: boot.rows,
         edit: Edit::default(),
@@ -6228,6 +6796,8 @@ async fn tui_loop(
         chat_max_off: 0,
         composer_vscroll: 0,
         input_dragging: false,
+        chat_dragging: false,
+        chat_glyphs: Vec::new(),
         catalog: ModelCatalog::default(),
         catalog_status: CatalogStatus::Idle,
         drop: None,
@@ -6271,6 +6841,18 @@ async fn tui_loop(
             ask_fill_inner: Rect::default(),
             ask_passive: false,
             workspace_pick: None,
+            skills: Arc::new(Mutex::new(
+                SkillStore::open().unwrap_or_else(|_| {
+                    SkillStore::open_at(
+                        skills_fallback.join(".groka").join("skills-store"),
+                        skills_fallback,
+                    )
+                }),
+            )),
+            skill_list: Vec::new(),
+            skill_cursor: 0,
+            skill_scroll: 0,
+            skill_view: None,
     };
     app.catalog.ensure_current(&opts.model, opts.reasoning_effort);
     app.want_catalog = app.logged_in;
@@ -6496,12 +7078,13 @@ fn start_or_send(
     opts.workspace = app.session.workspace.clone();
     let sink = sink.clone();
     let knobs = app.knobs.clone();
+    let skills = app.skills.clone();
     let run_id = app.session.id.clone();
     let done_tx = done_tx.clone();
     let ask = Some(app.attach_ask_hub(&run_id));
     tokio::spawn(async move {
         let sid = run_id.clone();
-        let out = run_one(opts, turn, sink, knobs, inbox_rx, run_id, ask, cancel).await;
+        let out = run_one(opts, turn, sink, knobs, skills, inbox_rx, run_id, ask, cancel).await;
         let _ = done_tx.send((
             sid,
             out.unwrap_or_else(|e| crate::agent::RunOutcome {
@@ -6741,12 +7324,17 @@ fn handle_key(
         || (matches!(code, KeyCode::Char('g')) && mods.contains(KeyModifiers::CONTROL))
     {
         if app.settings.as_ref().is_some_and(|w| !w.minimized) && app.focus == Focus::Settings {
+            app.close_skill_view();
             app.settings = None;
             app.focus = Focus::Chat;
         } else {
             open_settings(app);
         }
         return false;
+    }
+
+    if app.skill_view.is_some() {
+        return handle_skill_view_key(app, code, mods);
     }
 
     if app.focus == Focus::Settings {
@@ -7023,7 +7611,7 @@ fn handle_settings_key(
     app: &mut App,
     opts: &mut TuiOptions,
     code: KeyCode,
-    mods: KeyModifiers,
+    _mods: KeyModifiers,
 ) -> bool {
     if app.drop.is_some() {
         match code {
@@ -7058,6 +7646,8 @@ fn handle_settings_key(
         KeyCode::Esc => {
             if login_in_flight(&app.login_ui) {
                 cancel_login(app);
+            } else if app.skill_view.is_some() {
+                app.close_skill_view();
             } else {
                 app.settings = None;
                 app.focus = Focus::Chat;
@@ -7068,7 +7658,10 @@ fn handle_settings_key(
                 SettingField::Account => SettingField::Model,
                 SettingField::Model => SettingField::Effort,
                 SettingField::Effort => SettingField::Search,
-                SettingField::Search => SettingField::Account,
+                SettingField::Search => SettingField::ImportClaude,
+                SettingField::ImportClaude => SettingField::ImportCodex,
+                SettingField::ImportCodex => SettingField::Skills,
+                SettingField::Skills => SettingField::Account,
             };
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::Account => {
@@ -7077,6 +7670,26 @@ fn handle_settings_key(
         KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::Search => {
             opts.web_search = !opts.web_search;
             sync_knobs(&app.knobs, opts, &app.catalog);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::ImportClaude => {
+            app.toggle_import_claude();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::ImportCodex => {
+            app.toggle_import_codex();
+        }
+        KeyCode::Enter if app.setting_field == SettingField::Skills => {
+            app.open_skill_view(app.skill_cursor);
+        }
+        KeyCode::Char(' ') if app.setting_field == SettingField::Skills => {
+            app.toggle_skill(app.skill_cursor);
+        }
+        KeyCode::Up if app.setting_field == SettingField::Skills => {
+            app.skill_cursor = app.skill_cursor.saturating_sub(1);
+        }
+        KeyCode::Down if app.setting_field == SettingField::Skills => {
+            if !app.skill_list.is_empty() {
+                app.skill_cursor = (app.skill_cursor + 1).min(app.skill_list.len() - 1);
+            }
         }
         KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Down
             if app.setting_field == SettingField::Model =>
@@ -7108,7 +7721,60 @@ fn handle_settings_key(
         }
         _ => {}
     }
-    let _ = mods;
+    false
+}
+
+fn handle_skill_view_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    match code {
+        KeyCode::Esc => app.close_skill_view(),
+        KeyCode::Left => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.move_left(shift);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.move_right(shift);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.home(shift);
+            }
+        }
+        KeyCode::End => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.end(shift);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.move_visual(v.inner.width.max(1), -1, shift);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.move_visual(v.inner.width.max(1), 1, shift);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.scroll = v.scroll.saturating_sub(v.inner.height.max(1));
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.scroll = v.scroll.saturating_add(v.inner.height.max(1));
+            }
+        }
+        KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+            if let Some(v) = app.skill_view.as_mut() {
+                v.edit.select_all();
+            }
+        }
+        _ => {}
+    }
     false
 }
 
@@ -7125,7 +7791,11 @@ fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             app.drag = None;
             app.input_dragging = false;
+            app.chat_dragging = false;
             app.scroll_grab = None;
+            if let Some(v) = app.skill_view.as_mut() {
+                v.dragging = false;
+            }
             let hit = hit_at(&app.hits, col, row);
             if app.workspace_pick.is_some() {
                 match hit {
@@ -7188,6 +7858,22 @@ fn handle_mouse(
                 }
                 return;
             }
+            if app.skill_view.is_some() {
+                match hit {
+                    Some(Hit::SkillViewClose) | Some(Hit::SkillViewDismiss) => {
+                        app.close_skill_view();
+                    }
+                    Some(Hit::SkillView) => {
+                        if let Some(v) = app.skill_view.as_mut() {
+                            let idx = click_to_index(&v.edit.text, v.inner, v.scroll, col, row);
+                            v.edit.click(idx, shift);
+                            v.dragging = true;
+                        }
+                    }
+                    _ => app.close_skill_view(),
+                }
+                return;
+            }
             match hit {
                 Some(Hit::Gear) | Some(Hit::ModelChip) => open_settings(app),
                 Some(Hit::QueueChip) => {
@@ -7245,11 +7931,23 @@ fn handle_mouse(
                     }
                     app.focus = Focus::Chat;
                 }
-                Some(Hit::ChatRow(i)) => {
+                Some(Hit::ChatRow(_)) => {
                     app.commit_rename();
                     app.focus = Focus::Chat;
-                    app.chat_sel = ChatSel::Row(i as usize);
                     let _ = app.dismiss_tool_ui();
+                    if let Some(pos) = chat_pos_at(&app.chat_glyphs, col, row) {
+                        app.edit.clear_sel();
+                        let anchor = if shift {
+                            match app.chat_sel {
+                                ChatSel::Text { anchor, .. } => anchor,
+                                _ => pos,
+                            }
+                        } else {
+                            pos
+                        };
+                        app.chat_sel = ChatSel::Text { anchor, caret: pos };
+                        app.chat_dragging = true;
+                    }
                 }
                 Some(Hit::ChatImage(i)) => {
                     app.commit_rename();
@@ -7261,6 +7959,7 @@ fn handle_mouse(
                 Some(Hit::Composer) => {
                     app.commit_rename();
                     app.focus = Focus::Chat;
+                    app.chat_sel = ChatSel::None;
                     let idx = click_to_index(
                         &app.edit.text,
                         app.composer_inner,
@@ -7391,6 +8090,37 @@ fn handle_mouse(
                     opts.web_search = !opts.web_search;
                     sync_knobs(&app.knobs, opts, &app.catalog);
                 }
+                Some(Hit::ImportClaude) => {
+                    app.drop = None;
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::ImportClaude;
+                    app.toggle_import_claude();
+                }
+                Some(Hit::ImportCodex) => {
+                    app.drop = None;
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::ImportCodex;
+                    app.toggle_import_codex();
+                }
+                Some(Hit::SkillToggle(i)) => {
+                    app.drop = None;
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Skills;
+                    app.skill_cursor = i as usize;
+                    app.toggle_skill(i as usize);
+                }
+                Some(Hit::SkillRow(i)) => {
+                    app.drop = None;
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Skills;
+                    app.skill_cursor = i as usize;
+                    app.open_skill_view(i as usize);
+                }
+                Some(Hit::SkillList) => {
+                    app.drop = None;
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Skills;
+                }
                 Some(Hit::AccountBtn) => {
                     app.drop = None;
                     app.focus = Focus::Settings;
@@ -7419,7 +8149,10 @@ fn handle_mouse(
                 | Some(Hit::WsCancel)
                 | Some(Hit::ImageView)
                 | Some(Hit::ImageViewClose)
-                | Some(Hit::ImageViewDismiss) => {}
+                | Some(Hit::ImageViewDismiss)
+                | Some(Hit::SkillView)
+                | Some(Hit::SkillViewClose)
+                | Some(Hit::SkillViewDismiss) => {}
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -7429,6 +8162,17 @@ fn handle_mouse(
                 if !w.maximized {
                     w.x = (col as i16 - dx).max(0) as u16;
                     w.y = (row as i16 - dy).max(0) as u16;
+                }
+            } else if app.skill_view.as_ref().is_some_and(|v| v.dragging) {
+                if let Some(v) = app.skill_view.as_mut() {
+                    let idx = click_to_index(&v.edit.text, v.inner, v.scroll, col, row);
+                    v.edit.click(idx, true);
+                }
+            } else if app.chat_dragging {
+                if let Some(pos) = chat_pos_at(&app.chat_glyphs, col, row) {
+                    if let ChatSel::Text { anchor, .. } = app.chat_sel {
+                        app.chat_sel = ChatSel::Text { anchor, caret: pos };
+                    }
                 }
             } else if app.input_dragging {
                 let idx = click_to_index(
@@ -7444,10 +8188,25 @@ fn handle_mouse(
         MouseEventKind::Up(_) => {
             app.drag = None;
             app.input_dragging = false;
+            app.chat_dragging = false;
             app.scroll_grab = None;
+            if let Some(v) = app.skill_view.as_mut() {
+                v.dragging = false;
+            }
         }
         MouseEventKind::ScrollUp => {
             if app.image_view.is_some() {
+                return;
+            }
+            if let Some(v) = app.skill_view.as_mut() {
+                v.scroll = v.scroll.saturating_sub(3);
+                return;
+            }
+            if matches!(
+                hit_at(&app.hits, col, row),
+                Some(Hit::SkillList | Hit::SkillRow(_) | Hit::SkillToggle(_))
+            ) {
+                app.skill_cursor = app.skill_cursor.saturating_sub(1);
                 return;
             }
             if app.workspace_pick.is_some() {
@@ -7463,6 +8222,19 @@ fn handle_mouse(
         }
         MouseEventKind::ScrollDown => {
             if app.image_view.is_some() {
+                return;
+            }
+            if let Some(v) = app.skill_view.as_mut() {
+                v.scroll = v.scroll.saturating_add(3);
+                return;
+            }
+            if matches!(
+                hit_at(&app.hits, col, row),
+                Some(Hit::SkillList | Hit::SkillRow(_) | Hit::SkillToggle(_))
+            ) {
+                if !app.skill_list.is_empty() {
+                    app.skill_cursor = (app.skill_cursor + 1).min(app.skill_list.len() - 1);
+                }
                 return;
             }
             if app.workspace_pick.is_some() {
@@ -7502,6 +8274,9 @@ fn handle_input(
             false
         }
         Event::Paste(s) => {
+            if app.skill_view.is_some() {
+                return false;
+            }
             if app.workspace_pick.is_some() {
                 if let Some(p) = app.workspace_pick.as_mut() {
                     p.edit.insert_str(&s);
@@ -7528,6 +8303,7 @@ async fn run_one(
     turn: UserTurn,
     sink: Arc<FanoutSink>,
     knobs: Arc<Mutex<SessionKnobs>>,
+    skills: Arc<Mutex<SkillStore>>,
     inbox: mpsc::UnboundedReceiver<UserTurn>,
     run_id: String,
     ask: Option<AskUserHub>,
@@ -7570,6 +8346,7 @@ async fn run_one(
             inbox: Some(inbox),
             ask,
             cancel: Some(cancel),
+            skills: Some(skills),
         },
     )
     .await
@@ -7918,7 +8695,6 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(pic.1.contains("模型在看"), "{}", pic.1);
-        assert_eq!(row_copy_text(app.rows.last().unwrap()).contains(".groka/shots/a.jpg"), true);
     }
 
     fn write_red_png(dir: &std::path::Path, name: &str) -> String {
@@ -8532,7 +9308,11 @@ mod tests {
     fn copy_selection_of_row_does_not_quit() {
         let mut app = test_app();
         app.push(Row::User("copy me".into()));
-        app.chat_sel = ChatSel::Row(0);
+        let n = selectable_text(&app.rows[0]).unwrap().chars().count();
+        app.chat_sel = ChatSel::Text {
+            anchor: ChatPos { row: 0, idx: 0 },
+            caret: ChatPos { row: 0, idx: n },
+        };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut opts = TuiOptions {
             model: "grok-4.6".into(),
@@ -8558,7 +9338,11 @@ mod tests {
     fn ctrl_q_quits_even_when_a_row_is_selected() {
         let mut app = test_app();
         app.push(Row::User("copy me".into()));
-        app.chat_sel = ChatSel::Row(0);
+        let n = selectable_text(&app.rows[0]).unwrap().chars().count();
+        app.chat_sel = ChatSel::Text {
+            anchor: ChatPos { row: 0, idx: 0 },
+            caret: ChatPos { row: 0, idx: n },
+        };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut opts = TuiOptions {
             model: "grok-4.6".into(),
@@ -9007,6 +9791,8 @@ mod tests {
             chat_max_off: 0,
             composer_vscroll: 0,
             input_dragging: false,
+            chat_dragging: false,
+            chat_glyphs: Vec::new(),
             catalog: ModelCatalog::default(),
             catalog_status: CatalogStatus::Idle,
             drop: None,
@@ -9050,6 +9836,14 @@ mod tests {
             ask_fill_inner: Rect::default(),
             ask_passive: false,
             workspace_pick: None,
+            skills: Arc::new(Mutex::new(SkillStore::open_at(
+                PathBuf::from("missing-groka-skills"),
+                PathBuf::from("missing-home"),
+            ))),
+            skill_list: Vec::new(),
+            skill_cursor: 0,
+            skill_scroll: 0,
+            skill_view: None,
         }
     }
 
@@ -9461,6 +10255,233 @@ mod tests {
         assert_eq!(click_to_index("你好", inner, 0, 11, 5), 1);
         assert_eq!(click_to_index("你好", inner, 0, 12, 5), 1);
         assert_eq!(click_to_index("你好", inner, 0, 14, 5), 2);
+    }
+
+    #[test]
+    fn selectable_user_text_keeps_prefix_and_body() {
+        let row = Row::User("hello".into());
+        assert_eq!(selectable_text(&row).as_deref(), Some("you   hello"));
+    }
+
+    #[test]
+    fn chat_selected_text_is_a_char_range_not_the_whole_row() {
+        let rows = vec![Row::User("hello".into())];
+        let sel = ChatSel::Text {
+            anchor: ChatPos { row: 0, idx: 7 },
+            caret: ChatPos { row: 0, idx: 9 },
+        };
+        assert_eq!(chat_selected_text(&rows, &sel).as_deref(), Some("el"));
+        let collapsed = ChatSel::Text {
+            anchor: ChatPos { row: 0, idx: 7 },
+            caret: ChatPos { row: 0, idx: 7 },
+        };
+        assert_eq!(chat_selected_text(&rows, &collapsed), None);
+    }
+
+    #[test]
+    fn empty_after_glyphs_hits_chat_not_the_row() {
+        let hits = vec![
+            (Rect::new(0, 0, 40, 10), Hit::Chat),
+            (Rect::new(2, 3, 11, 1), Hit::ChatRow(0)),
+        ];
+        assert_eq!(hit_at(&hits, 2, 3), Some(Hit::ChatRow(0)));
+        assert_eq!(hit_at(&hits, 12, 3), Some(Hit::ChatRow(0)));
+        assert_eq!(hit_at(&hits, 13, 3), Some(Hit::Chat));
+        assert_eq!(hit_at(&hits, 20, 3), Some(Hit::Chat));
+    }
+
+    fn hello_glyphs() -> Vec<ChatGlyphLine> {
+        let chars: Vec<char> = "you   hello".chars().collect();
+        let text_w: u16 = chars.iter().map(|c| ch_width(*c).max(1)).sum();
+        vec![ChatGlyphLine {
+            y: 3,
+            x: 2,
+            text_w,
+            row: 0,
+            start: 0,
+            chars,
+        }]
+    }
+
+    #[test]
+    fn chat_drag_selects_substring() {
+        let mut app = test_app();
+        app.push(Row::User("hello".into()));
+        app.chat_glyphs = hello_glyphs();
+        let w = app.chat_glyphs[0].text_w;
+        app.hits = vec![
+            (Rect::new(0, 0, 40, 10), Hit::Chat),
+            (Rect::new(2, 3, w, 1), Hit::ChatRow(0)),
+        ];
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            8,
+            3,
+            KeyModifiers::NONE,
+        );
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Drag(MouseButton::Left),
+            2 + w,
+            3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            chat_selected_text(&app.rows, &app.chat_sel).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn chat_click_empty_clears_selection() {
+        let mut app = test_app();
+        app.push(Row::User("hello".into()));
+        app.chat_sel = ChatSel::Text {
+            anchor: ChatPos { row: 0, idx: 6 },
+            caret: ChatPos { row: 0, idx: 11 },
+        };
+        let w = 11;
+        app.hits = vec![
+            (Rect::new(0, 0, 40, 10), Hit::Chat),
+            (Rect::new(2, 3, w, 1), Hit::ChatRow(0)),
+        ];
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            20,
+            3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.chat_sel, ChatSel::None);
+    }
+
+    #[test]
+    fn chat_click_does_not_select_the_whole_row() {
+        let mut app = test_app();
+        app.push(Row::User("hello".into()));
+        app.chat_glyphs = hello_glyphs();
+        let w = app.chat_glyphs[0].text_w;
+        app.hits = vec![
+            (Rect::new(0, 0, 40, 10), Hit::Chat),
+            (Rect::new(2, 3, w, 1), Hit::ChatRow(0)),
+        ];
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            8,
+            3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(chat_selected_text(&app.rows, &app.chat_sel), None);
+        assert!(matches!(
+            app.chat_sel,
+            ChatSel::Text {
+                anchor: ChatPos { row: 0, idx: 6 },
+                caret: ChatPos { row: 0, idx: 6 }
+            }
+        ));
+    }
+
+    #[test]
+    fn chat_pos_at_maps_cjk_display_columns() {
+        let glyphs = vec![ChatGlyphLine {
+            y: 0,
+            x: 10,
+            text_w: 4,
+            row: 0,
+            start: 0,
+            chars: "你好".chars().collect(),
+        }];
+        assert_eq!(chat_pos_at(&glyphs, 10, 0).unwrap().idx, 0);
+        assert_eq!(chat_pos_at(&glyphs, 11, 0).unwrap().idx, 1);
+        assert_eq!(chat_pos_at(&glyphs, 12, 0).unwrap().idx, 1);
+        assert_eq!(chat_pos_at(&glyphs, 14, 0).unwrap().idx, 2);
+    }
+
+    #[test]
+    fn wrap_line_indexed_keeps_char_offsets() {
+        let line = Line::from("you   abcdefghij");
+        let pieces = wrap_line_indexed(line, 10);
+        assert!(pieces.len() >= 2, "{}", pieces.len());
+        assert_eq!(pieces[0].start, 0);
+        assert_eq!(pieces[0].chars.len(), 10);
+        assert_eq!(pieces[1].start, 10);
+        let joined: String = pieces.iter().flat_map(|p| p.chars.iter().copied()).collect();
+        assert_eq!(joined, "you   abcdefghij");
+    }
+
+    #[test]
+    fn settings_import_claude_lists_foreign_skill() {
+        let groka = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude").join("skills").join("review");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code\n---\nBe strict.\n",
+        )
+        .unwrap();
+        let mut app = test_app();
+        app.skills = Arc::new(Mutex::new(SkillStore::open_at(
+            groka.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )));
+        app.refresh_skills();
+        assert!(app.skill_list.is_empty());
+        app.toggle_import_claude();
+        assert_eq!(app.skill_list.len(), 1);
+        assert_eq!(app.skill_list[0].name, "review");
+        assert!(app.skill_list[0].enabled);
+    }
+
+    #[test]
+    fn skill_view_allows_select_but_not_edit() {
+        let groka = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(groka.path().join("demo")).unwrap();
+        std::fs::write(
+            groka.path().join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nHello body\n",
+        )
+        .unwrap();
+        let mut app = test_app();
+        app.skills = Arc::new(Mutex::new(SkillStore::open_at(
+            groka.path().to_path_buf(),
+            groka.path().to_path_buf(),
+        )));
+        app.refresh_skills();
+        app.open_skill_view(0);
+        let original = app.skill_view.as_ref().unwrap().edit.text.clone();
+        assert!(original.contains("Hello body"));
+        let (mut opts, sink, tx) = dummy_key_env();
+        handle_key(
+            &mut app,
+            &mut opts,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            &sink,
+            &tx,
+        );
+        assert_eq!(app.skill_view.as_ref().unwrap().edit.text, original);
+        handle_key(
+            &mut app,
+            &mut opts,
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+            &sink,
+            &tx,
+        );
+        assert_eq!(
+            app.skill_view.as_ref().unwrap().edit.selected_text().as_deref(),
+            Some(original.as_str())
+        );
     }
 
     #[test]
