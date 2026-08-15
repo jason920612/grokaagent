@@ -5,7 +5,7 @@ use std::env;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use image::{imageops::FilterType, DynamicImage, Rgb, Rgba};
 use ratatui::buffer::Buffer;
@@ -199,12 +199,10 @@ pub fn write_blits<W: Write>(out: &mut W, blits: &[GraphicBlit]) -> io::Result<(
     if blits.is_empty() {
         return Ok(());
     }
-    queue!(out, SavePosition)?;
     for blit in blits {
         queue!(out, MoveTo(blit.x, blit.y))?;
         out.write_all(blit.data.as_bytes())?;
     }
-    queue!(out, RestorePosition)?;
     out.flush()
 }
 
@@ -459,6 +457,18 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         write_blits(&mut out, &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn write_blits_moves_without_saving_cursor() {
+        let mut out: Vec<u8> = Vec::new();
+        write_blits(&mut out, &[sample_blit(3, 4, 2, 1)]).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("\x1b7") && !s.contains("\x1b[s"),
+            "DECSC would let sixel steal the composer cursor: {s:?}"
+        );
+        assert!(s.contains("\x1b[5;4H"), "{s:?}");
     }
 
     fn sample_blit(x: u16, y: u16, w: u16, h: u16) -> GraphicBlit {

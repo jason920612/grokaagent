@@ -10,6 +10,7 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::{FutureExt, StreamExt};
@@ -4148,6 +4149,13 @@ fn login_in_flight(ui: &LoginUi) -> bool {
     matches!(ui, LoginUi::Starting | LoginUi::Waiting { .. })
 }
 
+fn is_pulsing(app: &App) -> bool {
+    app.running
+        || app.children.iter().any(|c| c.alive)
+        || app.monitors.iter().any(|m| m.alive)
+        || app.backgrounds.iter().any(|b| b.alive)
+}
+
 fn begin_login(app: &mut App) {
     if app.logged_in || login_in_flight(&app.login_ui) {
         return;
@@ -5238,11 +5246,14 @@ fn paint_chat_graphic(f: &mut Frame, app: &mut App, proto: &Protocol, draw: Rect
     f.render_widget(Image::new(proto), draw);
 }
 
-fn flush_image_blits(app: &mut App) -> Result<()> {
+fn flush_image_blits(app: &mut App, caret: Position) -> Result<()> {
     if app.graphic_blits == app.last_graphic_blits {
         return Ok(());
     }
     crate::preview::write_blits(&mut io::stdout(), &app.graphic_blits)?;
+    if !app.graphic_blits.is_empty() {
+        execute!(io::stdout(), MoveTo(caret.x, caret.y)).map_err(Error::Io)?;
+    }
     app.last_graphic_blits.clone_from(&app.graphic_blits);
     Ok(())
 }
@@ -5806,16 +5817,20 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
             "編輯排隊訊息…  Enter 完成  ·  空白則移除  ·  點取消或 Esc 還原".into()
         } else if app.running {
             let act = if app.activity.is_empty() {
-                "模型工作中".into()
+                "模型工作中".to_string()
             } else {
-                format!("{} {}", spinner(app.tick), app.activity)
+                app.activity.clone()
             };
             format!("{act}  — Esc 中斷  ·  Enter 排隊，Ctrl+Enter 插入…")
         } else {
             "傳訊息，或點「貼上圖片」…".into()
         };
         f.render_widget(
-            Paragraph::new(Span::styled(placeholder, Style::default().fg(DIM))),
+            Paragraph::new(Span::styled(
+                placeholder,
+                Style::default().fg(DIM).bg(COMPOSER),
+            ))
+            .style(Style::default().bg(COMPOSER)),
             inner_box,
         );
         app.composer_vscroll = 0;
@@ -5858,7 +5873,10 @@ fn draw_edit(f: &mut Frame, inner: Rect, edit: &Edit, vscroll: &mut u16) -> Posi
     if lines.is_empty() {
         lines.push(Line::from(""));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(TEXT).bg(COMPOSER)),
+        inner,
+    );
     let screen_row = crow.saturating_sub(*vscroll);
     Position::new(
         inner.x.saturating_add(ccol.min(width.saturating_sub(1))),
@@ -5872,7 +5890,7 @@ fn edit_line(chars: &[char], a: usize, b: usize, sel: Option<(usize, usize)>) ->
     }
     let Some((lo, hi)) = sel else {
         let s: String = chars[a..b].iter().collect();
-        return Line::from(Span::styled(s, Style::default().fg(TEXT)));
+        return Line::from(Span::styled(s, Style::default().fg(TEXT).bg(COMPOSER)));
     };
     let mut spans = Vec::new();
     let mut i = a;
@@ -5886,7 +5904,7 @@ fn edit_line(chars: &[char], a: usize, b: usize, sel: Option<(usize, usize)>) ->
         let style = if selected {
             Style::default().bg(ACCENT).fg(Color::Black)
         } else {
-            Style::default().fg(TEXT)
+            Style::default().fg(TEXT).bg(COMPOSER)
         };
         spans.push(Span::styled(s, style));
         i = j;
@@ -6868,16 +6886,21 @@ async fn tui_loop(
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(String, crate::agent::RunOutcome)>();
     let (cat_tx, mut cat_rx) = mpsc::unbounded_channel();
     let (login_tx, mut login_rx) = mpsc::unbounded_channel();
+    let mut last_size = terminal.size().map_err(Error::Io)?;
+    let mut dirty = true;
 
     loop {
         while let Ok(ev) = ev_rx.try_recv() {
             app.route_event(ev);
+            dirty = true;
         }
         while let Ok(result) = cat_rx.try_recv() {
             ingest_catalog(&mut app, &mut opts, result);
+            dirty = true;
         }
         while let Ok(ev) = login_rx.try_recv() {
             apply_login_event(&mut app, ev);
+            dirty = true;
         }
         if app.want_catalog
             && app.logged_in
@@ -6885,6 +6908,7 @@ async fn tui_loop(
         {
             app.want_catalog = false;
             app.catalog_status = CatalogStatus::Loading;
+            dirty = true;
             let tx = cat_tx.clone();
             let auth = auth_path.clone();
             tokio::spawn(async move {
@@ -6897,6 +6921,7 @@ async fn tui_loop(
         }
         if app.want_login {
             app.want_login = false;
+            dirty = true;
             let tx = login_tx.clone();
             let path = app.auth_path.clone();
             let gen = app.login_gen;
@@ -6904,31 +6929,43 @@ async fn tui_loop(
                 run_settings_login(path, gen, tx).await;
             });
         }
-        if app.running
-            || app.children.iter().any(|c| c.alive)
-            || app.monitors.iter().any(|m| m.alive)
-            || app.backgrounds.iter().any(|b| b.alive)
-        {
-            app.tick = app.tick.wrapping_add(1);
-        }
         flush_all(&mut app);
         while let Ok((sid, out)) = done_rx.try_recv() {
             app.finish_run(&sid, out);
+            dirty = true;
         }
         kick_idle_queue(&mut app, &opts, &sink, &done_tx);
+        let pulse = is_pulsing(&app);
+        if pulse {
+            app.tick = app.tick.wrapping_add(1);
+            dirty = true;
+        }
+        match terminal.size() {
+            Ok(size) if size != last_size => {
+                last_size = size;
+                dirty = true;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
 
-        terminal
-            .draw(|f| {
-                let pos = draw(f, &mut app, &opts);
-                f.set_cursor_position(pos);
-            })
-            .map_err(Error::Io)?;
-        flush_image_blits(&mut app)?;
+        if dirty {
+            let mut caret = Position::ORIGIN;
+            terminal
+                .draw(|f| {
+                    caret = draw(f, &mut app, &opts);
+                    f.set_cursor_position(caret);
+                })
+                .map_err(Error::Io)?;
+            flush_image_blits(&mut app, caret)?;
+            dirty = false;
+        }
 
         tokio::select! {
             maybe = keys.next() => {
                 match maybe {
                     Some(Ok(ev)) => {
+                        dirty = true;
                         if handle_input(&mut app, &mut opts, ev, &sink, &done_tx) {
                             break;
                         }
@@ -9186,6 +9223,72 @@ mod tests {
         app.paste_from_terminal("hello");
         assert_eq!(app.edit.text, "hello");
         assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn composer_cells_keep_composer_background() {
+        let mut app = test_app();
+        app.edit.insert_str("hi");
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let inner = app.composer_inner;
+        assert!(inner.width > 1 && inner.height > 0, "{inner:?}");
+        let buf = terminal.backend().buffer();
+        let typed = &buf[(inner.x, inner.y)];
+        assert_eq!(typed.symbol(), "h", "{typed:?}");
+        assert_eq!(typed.bg, COMPOSER, "{typed:?}");
+        let rest = &buf[(inner.x.saturating_add(2), inner.y)];
+        assert_eq!(rest.bg, COMPOSER, "{rest:?}");
+    }
+
+    #[test]
+    fn running_placeholder_does_not_spin_inside_composer() {
+        let mut app = test_app();
+        app.running = true;
+        app.activity = "思考中".into();
+        app.tick = 3;
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let inner = app.composer_inner;
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for x in inner.x..inner.right() {
+            text.push_str(buf[(x, inner.y)].symbol());
+        }
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("思考中"), "{text}");
+        assert!(
+            !['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+                .iter()
+                .any(|c| compact.contains(*c)),
+            "spinner must stay out of the composer: {text}"
+        );
+        assert_eq!(buf[(inner.x, inner.y)].bg, COMPOSER);
+    }
+
+    #[test]
+    fn idle_app_does_not_need_pulse() {
+        let app = test_app();
+        assert!(!is_pulsing(&app));
+    }
+
+    #[test]
+    fn running_app_needs_pulse() {
+        let mut app = test_app();
+        app.running = true;
+        assert!(is_pulsing(&app));
     }
 
     #[test]
