@@ -41,7 +41,7 @@ jobs:
             pkg-config libclang-dev clang \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libxkbcommon-dev \
-            libpipewire-0.3-dev libwayland-dev libegl-dev
+            libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev
       - name: Test
         run: cargo test --lib --locked -- --skip screenshot
       - name: Build
