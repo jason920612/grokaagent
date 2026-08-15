@@ -30,7 +30,22 @@ pub fn kind_for(before: Option<&str>, after: Option<&str>) -> &'static str {
 pub fn file_change_json(path: &str, before: Option<&str>, after: Option<&str>) -> Value {
     let kind = kind_for(before, after);
     let diff = unified_diff(path, before.unwrap_or(""), after.unwrap_or(""));
-    json!({ "path": path, "kind": kind, "diff": diff })
+    let plus = diff
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .count();
+    let minus = diff
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .count();
+    json!({
+        "path": path,
+        "kind": kind,
+        "diff": diff,
+        "plus": plus,
+        "minus": minus,
+        "unchanged": diff.is_empty()
+    })
 }
 
 /// Workspace-relative git changes after a command. Empty if not a git repo.
@@ -177,6 +192,14 @@ mod tests {
         assert!(d.contains("-old"), "{d}");
         assert!(d.contains("+new"), "{d}");
         assert_eq!(kind_for(Some("old"), Some("new")), "modify");
+        let j = file_change_json("a.txt", Some("old\n"), Some("new\n"));
+        assert_eq!(j["plus"], 1);
+        assert_eq!(j["minus"], 1);
+        assert_eq!(j["unchanged"], false);
+        let d = j["diff"].as_str().unwrap();
+        assert!(d.contains("--- a/a.txt"), "{d}");
+        assert!(d.contains("+++ b/a.txt"), "{d}");
+        assert!(d.contains("@@"), "{d}");
     }
 
     #[test]

@@ -106,6 +106,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             )
         })))
     });
+    let win = crate::wintrack::WindowHub::new();
     let mut tools: Vec<Box<dyn crate::tools::ClientTool>> = vec![
         Box::new(NowTool),
         Box::new(ReadFileTool::new(spec.workspace.clone())),
@@ -115,14 +116,23 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         Box::new(RunCommandTool::with_guard(
             spec.workspace.clone(),
             guard.clone(),
-        )),
+        )
+        .with_windows(win.clone())),
         Box::new(ScreenshotTool::with_spawned(
             spec.workspace.clone(),
             {
                 let bg = bg.clone();
-                Arc::new(move || bg.alive_pids())
+                let win = win.clone();
+                Arc::new(move || {
+                    let mut pids = bg.alive_pids();
+                    pids.extend(win.pids());
+                    pids.sort_unstable();
+                    pids.dedup();
+                    pids
+                })
             },
-        )),
+        )
+        .with_windows(win.clone())),
         Box::new(ReadImageTool::new(spec.workspace.clone())),
         Box::new(AttachMonitorTool::new(
             hub.clone(),
@@ -133,7 +143,8 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             bg.clone(),
             tee.clone(),
             Some(guard.clone()),
-        )),
+        )
+        .with_windows(win.clone())),
         Box::new(ReadBackgroundTool::new(bg.clone())),
         Box::new(KillBackgroundTool::new(bg.clone())),
         Box::new(TimerTool::new(

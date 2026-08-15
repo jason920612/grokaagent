@@ -1200,6 +1200,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

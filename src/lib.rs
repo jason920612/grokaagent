@@ -29,6 +29,7 @@ pub mod timer;
 pub mod tui;
 pub mod update;
 pub mod vision;
+pub mod wintrack;
 pub mod worker;
 
 pub use error::{Error, Result};

@@ -14,11 +14,12 @@ use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::{FutureExt, StreamExt};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use ratatui::{backend::CrosstermBackend, Frame, Terminal};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
+use ratatui::{backend::{Backend, CrosstermBackend}, Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Image;
@@ -1220,6 +1221,8 @@ struct App {
     area: Rect,
     streaming: bool,
     composer_inner: Rect,
+    header_bar: Rect,
+    last_caret: Position,
     chat_inner: Rect,
     chat_bar: Rect,
     chat_total: u16,
@@ -2955,11 +2958,39 @@ fn dummy_session() -> SessionMeta {
     m
 }
 
+fn file_tool_target(_name: &str, args: &Value) -> String {
+    if _name == "screenshot" {
+        if let Some(n) = args.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return format!("name={n}");
+        }
+        if let Some(pid) = args.get("pid") {
+            return format!("pid={pid}");
+        }
+    }
+    let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    if let Some(pattern) = args.get("pattern").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        return format!("{path}  /{pattern}/");
+    }
+    if let Some(line) = args.get("line").or_else(|| args.get("start_line")) {
+        let end = args.get("end_line");
+        match end {
+            Some(end) => format!("{path}  :{line}-{end}"),
+            None => format!("{path}  :{line}"),
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 fn tool_started_line(name: &str, args: &Value) -> String {
     match name {
         "run_command" | "attach_monitor" | "run_background" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-            format!("▸ {name}  $ {cmd}")
+            if let Some(w) = args.get("window").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                format!("▸ {name}  [{w}] $ {cmd}")
+            } else {
+                format!("▸ {name}  $ {cmd}")
+            }
         }
         "kill_background" | "read_background" => {
             let n = args.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2990,8 +3021,7 @@ fn tool_started_line(name: &str, args: &Value) -> String {
             }
         }
         "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("▸ {name}  {path}")
+            format!("▸ {name}  {}", file_tool_target(name, args))
         }
         "project_memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -3123,8 +3153,7 @@ fn live_tool_activity(name: &str, args: &Value, phase: &str) -> String {
             format!("{phase}  timer  {secs}s")
         }
         "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("{phase}  {name}  {path}")
+            format!("{phase}  {name}  {}", file_tool_target(name, args))
         }
         "project_memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -4156,6 +4185,38 @@ fn is_pulsing(app: &App) -> bool {
         || app.backgrounds.iter().any(|b| b.alive)
 }
 
+fn pulse_spinner(app: &mut App) {
+    if is_pulsing(app) {
+        app.tick = app.tick.wrapping_add(1);
+    }
+}
+
+fn header_pulse_ok(app: &App) -> bool {
+    app.running
+        && app.header_bar.width > 0
+        && app.image_view.is_none()
+        && app.inspector.is_none()
+        && app.workspace_pick.is_none()
+        && app.skill_view.is_none()
+        && app.ask.is_none()
+        && app.settings.as_ref().is_none_or(|s| s.minimized)
+}
+
+/// Hardware cursor on an empty running composer sits on the placeholder and
+/// blinks every redraw. Overlays and a typed draft still need it.
+fn want_hardware_cursor(app: &App) -> bool {
+    if app.workspace_pick.is_some()
+        || app.ask.is_some()
+        || app.skill_view.is_some()
+        || app.focus == Focus::Rename
+        || (app.focus == Focus::Settings && app.settings.as_ref().is_some_and(|s| !s.minimized))
+        || app.queue_edit.is_some()
+    {
+        return true;
+    }
+    !(app.running && app.edit.is_empty())
+}
+
 fn begin_login(app: &mut App) {
     if app.logged_in || login_in_flight(&app.login_ui) {
         return;
@@ -4954,7 +5015,7 @@ fn truncate_width(s: &str, cols: u16) -> String {
     out
 }
 
-fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
+fn header_copy(app: &App, opts: &TuiOptions) -> (String, String) {
     let auth = if app.logged_in { "已登入" } else { "未登入" };
     let kids = if app.child_count == 0 {
         String::new()
@@ -4996,12 +5057,11 @@ fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
         format!(" · {}", opts.reasoning_effort.as_str())
     };
     let right = format!("{}{}  * ", opts.model, effort_bit);
-    let right_w = Line::from(right.as_str()).width() as u16;
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(right_w.max(12))])
-        .split(area);
-    let left_style = if app.running {
+    (left, right)
+}
+
+fn header_styles(running: bool) -> (Style, Style) {
+    let left = if running {
         Style::default()
             .fg(Color::Black)
             .bg(ACCENT)
@@ -5009,14 +5069,66 @@ fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
     } else {
         Style::default().fg(DIM).bg(BG)
     };
-    f.render_widget(Paragraph::new(Span::styled(left, left_style)), split[0]);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            right,
-            Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
-        )),
-        split[1],
-    );
+    let right = Style::default()
+        .fg(ACCENT)
+        .bg(BG)
+        .add_modifier(Modifier::BOLD);
+    (left, right)
+}
+
+fn render_header_widgets(buf: &mut Buffer, app: &App, opts: &TuiOptions, area: Rect) {
+    let (left, right) = header_copy(app, opts);
+    let (left_style, right_style) = header_styles(app.running);
+    let right_w = Line::from(right.as_str()).width() as u16;
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_w.max(12))])
+        .split(area);
+    Paragraph::new(Span::styled(left, left_style)).render(split[0], buf);
+    Paragraph::new(Span::styled(right, right_style)).render(split[1], buf);
+}
+
+fn render_header_buffer(app: &App, opts: &TuiOptions, area: Rect) -> Buffer {
+    let mut buf = Buffer::empty(area);
+    render_header_widgets(&mut buf, app, opts, area);
+    buf
+}
+
+fn paint_header_pulse(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
+    opts: &TuiOptions,
+) -> Result<()> {
+    let area = app.header_bar;
+    if area.width == 0 || area.height == 0 {
+        return Ok(());
+    }
+    let buf = render_header_buffer(app, opts, area);
+    let blank = Buffer::empty(area);
+    let updates = blank.diff(&buf);
+    let show = want_hardware_cursor(app);
+    let _ = terminal.hide_cursor();
+    terminal
+        .backend_mut()
+        .draw(updates.into_iter())
+        .map_err(Error::Io)?;
+    terminal.backend_mut().flush().map_err(Error::Io)?;
+    execute!(io::stdout(), MoveTo(app.last_caret.x, app.last_caret.y)).map_err(Error::Io)?;
+    if show {
+        let _ = terminal.show_cursor();
+    }
+    Ok(())
+}
+
+fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
+    app.header_bar = area;
+    render_header_widgets(f.buffer_mut(), app, opts, area);
+    let (_, right) = header_copy(app, opts);
+    let right_w = Line::from(right.as_str()).width() as u16;
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_w.max(12))])
+        .split(area);
     app.hits.push((split[1], Hit::ModelChip));
     let gear = Rect::new(
         split[1].x + split[1].width.saturating_sub(3),
@@ -5813,17 +5925,12 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
     app.composer_inner = inner_box;
 
     let caret = if app.edit.is_empty() {
-        let placeholder = if app.queue_edit.is_some() {
-            "編輯排隊訊息…  Enter 完成  ·  空白則移除  ·  點取消或 Esc 還原".into()
+        let placeholder: &str = if app.queue_edit.is_some() {
+            "編輯排隊訊息…  Enter 完成  ·  空白則移除  ·  點取消或 Esc 還原"
         } else if app.running {
-            let act = if app.activity.is_empty() {
-                "模型工作中".to_string()
-            } else {
-                app.activity.clone()
-            };
-            format!("{act}  — Esc 中斷  ·  Enter 排隊，Ctrl+Enter 插入…")
+            "模型工作中  — Esc 中斷  ·  Enter 排隊，Ctrl+Enter 插入…"
         } else {
-            "傳訊息，或點「貼上圖片」…".into()
+            "傳訊息，或點「貼上圖片」…"
         };
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -6808,6 +6915,8 @@ async fn tui_loop(
         area: Rect::default(),
         streaming: false,
         composer_inner: Rect::default(),
+        header_bar: Rect::default(),
+        last_caret: Position::ORIGIN,
         chat_inner: Rect::default(),
         chat_bar: Rect::default(),
         chat_total: 0,
@@ -6935,11 +7044,7 @@ async fn tui_loop(
             dirty = true;
         }
         kick_idle_queue(&mut app, &opts, &sink, &done_tx);
-        let pulse = is_pulsing(&app);
-        if pulse {
-            app.tick = app.tick.wrapping_add(1);
-            dirty = true;
-        }
+        pulse_spinner(&mut app);
         match terminal.size() {
             Ok(size) if size != last_size => {
                 last_size = size;
@@ -6951,14 +7056,21 @@ async fn tui_loop(
 
         if dirty {
             let mut caret = Position::ORIGIN;
+            let show_caret = want_hardware_cursor(&app);
+            let _ = terminal.hide_cursor();
             terminal
                 .draw(|f| {
                     caret = draw(f, &mut app, &opts);
-                    f.set_cursor_position(caret);
+                    if show_caret {
+                        f.set_cursor_position(caret);
+                    }
                 })
                 .map_err(Error::Io)?;
+            app.last_caret = caret;
             flush_image_blits(&mut app, caret)?;
             dirty = false;
+        } else if header_pulse_ok(&app) {
+            paint_header_pulse(terminal, &app, &opts)?;
         }
 
         tokio::select! {
@@ -9268,7 +9380,11 @@ mod tests {
             text.push_str(buf[(x, inner.y)].symbol());
         }
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(compact.contains("思考中"), "{text}");
+        assert!(compact.contains("模型工作中"), "{text}");
+        assert!(
+            !compact.contains("思考中"),
+            "live activity belongs in the header, not the composer: {text}"
+        );
         assert!(
             !['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
                 .iter()
@@ -9289,6 +9405,66 @@ mod tests {
         let mut app = test_app();
         app.running = true;
         assert!(is_pulsing(&app));
+    }
+
+    #[test]
+    fn pulse_advances_spinner_without_being_a_redraw_signal() {
+        let mut app = test_app();
+        app.running = true;
+        let before = app.tick;
+        pulse_spinner(&mut app);
+        assert_eq!(app.tick, before.wrapping_add(1));
+    }
+
+    #[test]
+    fn header_pulse_is_independent_of_composer_text() {
+        let mut app = test_app();
+        app.running = true;
+        app.header_bar = Rect::new(0, 0, 80, 1);
+        assert!(header_pulse_ok(&app));
+        app.edit.insert_str("queue this while it works");
+        assert!(header_pulse_ok(&app), "clock must keep ticking while typing");
+        assert!(want_hardware_cursor(&app));
+    }
+
+    #[test]
+    fn header_line_includes_spinner_and_elapsed_clock() {
+        let mut app = test_app();
+        app.running = true;
+        app.status = "工作中".into();
+        app.activity = "思考中".into();
+        app.tick = 3;
+        app.work_started = Some(Instant::now() - Duration::from_millis(3_400));
+        app.edit.insert_str("keep me");
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let buf = render_header_buffer(&app, &opts, Rect::new(0, 0, 100, 1));
+        let mut text = String::new();
+        for x in 0..100 {
+            text.push_str(buf[(x, 0)].symbol());
+        }
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(spinner(3)), "{text}");
+        assert!(compact.contains("思考中"), "{text}");
+        assert!(compact.contains("3.4s"), "{text}");
+        assert!(!compact.contains("keepme"), "{text}");
+    }
+
+    #[test]
+    fn running_empty_composer_hides_hardware_cursor() {
+        let mut app = test_app();
+        app.running = true;
+        assert!(app.edit.is_empty());
+        assert!(!want_hardware_cursor(&app));
+        app.edit.insert_str("queue this");
+        assert!(want_hardware_cursor(&app));
+    }
+
+    #[test]
+    fn idle_empty_composer_keeps_hardware_cursor() {
+        let app = test_app();
+        assert!(app.edit.is_empty());
+        assert!(!app.running);
+        assert!(want_hardware_cursor(&app));
     }
 
     #[test]
@@ -9775,6 +9951,12 @@ mod tests {
     fn tool_started_shows_command_and_path() {
         let cmd = tool_started_line("run_command", &serde_json::json!({"command": "git status"}));
         assert!(cmd.contains("$ git status"), "{cmd}");
+        let named = tool_started_line(
+            "run_background",
+            &serde_json::json!({"command": "npm start", "window": "preview"}),
+        );
+        assert!(named.contains("[preview]"), "{named}");
+        assert!(named.contains("npm start"), "{named}");
         let bg = tool_started_line(
             "run_background",
             &serde_json::json!({"command": "npm run dev"}),
@@ -9888,6 +10070,8 @@ mod tests {
             area: Rect::default(),
             streaming: false,
             composer_inner: Rect::default(),
+            header_bar: Rect::default(),
+            last_caret: Position::ORIGIN,
             chat_inner: Rect::default(),
             chat_bar: Rect::default(),
             chat_total: 0,

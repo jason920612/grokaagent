@@ -14,12 +14,13 @@ pub struct WinMeta {
 pub struct ShotFilter<'a> {
     pub title: Option<&'a str>,
     pub app: Option<&'a str>,
+    pub pid: Option<u32>,
     pub spawned: &'a [u32],
     pub self_pids: &'a [u32],
     pub workspace_hint: Option<&'a str>,
 }
 
-const MIN_EDGE: u32 = 160;
+pub const MIN_EDGE: u32 = 160;
 
 fn contains_ci(hay: &str, needle: &str) -> bool {
     let n = needle.trim();
@@ -75,15 +76,20 @@ pub fn score_window(w: &WinMeta, f: &ShotFilter<'_>) -> Option<i64> {
     if w.minimized || w.width < MIN_EDGE || w.height < MIN_EDGE {
         return None;
     }
-    if w.title.trim().is_empty() {
+    if f.self_pids.contains(&w.pid) {
         return None;
     }
-    if f.self_pids.contains(&w.pid) {
+    if let Some(pid) = f.pid {
+        if w.pid != pid {
+            return None;
+        }
+    } else if w.title.trim().is_empty() {
         return None;
     }
     let title_f = f.title.map(str::trim).filter(|s| !s.is_empty());
     let app_f = f.app.map(str::trim).filter(|s| !s.is_empty());
-    let asked_for_this = title_f.is_some_and(|t| contains_ci(&w.title, t))
+    let asked_for_this = f.pid.is_some_and(|p| p == w.pid)
+        || title_f.is_some_and(|t| contains_ci(&w.title, t))
         || app_f.is_some_and(|a| contains_ci(&w.app, a) || contains_ci(&norm_app(&w.app), &norm_app(a)));
     if is_host_ui(&w.app, &w.title) && !asked_for_this {
         return None;
@@ -100,6 +106,9 @@ pub fn score_window(w: &WinMeta, f: &ShotFilter<'_>) -> Option<i64> {
     }
     let area = (w.width as i64) * (w.height as i64);
     let mut s = area / 1000;
+    if f.pid == Some(w.pid) {
+        s += 2_000_000;
+    }
     if f.spawned.contains(&w.pid) {
         s += 1_000_000;
     }
@@ -187,6 +196,7 @@ mod tests {
         ShotFilter {
             title: None,
             app: None,
+            pid: None,
             spawned,
             self_pids,
             workspace_hint: None,
@@ -227,6 +237,7 @@ mod tests {
         let f = ShotFilter {
             title: Some("Cursor"),
             app: None,
+            pid: None,
             spawned: &[],
             self_pids: &[99],
             workspace_hint: None,
@@ -244,6 +255,7 @@ mod tests {
         let f = ShotFilter {
             title: None,
             app: Some("edge"),
+            pid: None,
             spawned: &[],
             self_pids: &[9],
             workspace_hint: None,
@@ -279,6 +291,7 @@ mod tests {
         let f = ShotFilter {
             title: None,
             app: None,
+            pid: None,
             spawned: &[],
             self_pids: &[9],
             workspace_hint: Some("grokaagent"),
@@ -296,5 +309,23 @@ mod tests {
         let spawned = [2u32];
         let order = ranked_indices(&windows, &filter(&spawned, &[9]));
         assert_eq!(order[0], 1);
+    }
+
+    #[test]
+    fn pid_filter_picks_that_window_not_a_larger_one() {
+        let windows = vec![
+            win("Unrelated docs", "WINWORD", 50, 1920, 1080),
+            win("demo — Electron", "electron", 77, 800, 600),
+        ];
+        let f = ShotFilter {
+            title: None,
+            app: None,
+            pid: Some(77),
+            spawned: &[],
+            self_pids: &[1],
+            workspace_hint: None,
+        };
+        let i = pick_index(&windows, &f).unwrap();
+        assert_eq!(windows[i].pid, 77);
     }
 }

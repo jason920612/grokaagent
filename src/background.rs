@@ -14,6 +14,7 @@ use crate::events::{AgentEvent, EventMeta, EventSink};
 use crate::procgroup::ProcessGuard;
 use crate::shellguard::{self, CommandReviewer};
 use crate::tools::{hide_window, resolve_in_workspace, shell_command, ClientTool, ToolCallFut, ToolSpec};
+use crate::wintrack::{self, WindowHub};
 
 pub const MAX_BACKGROUNDS: usize = 4;
 pub const EXIT_NOTICE_PREFIX: &str = "[background exited]";
@@ -435,6 +436,7 @@ pub struct RunBackgroundTool {
     hub: Arc<BackgroundHub>,
     sink: Arc<dyn EventSink>,
     guard: Option<Arc<dyn CommandReviewer>>,
+    windows: Option<Arc<WindowHub>>,
 }
 
 impl RunBackgroundTool {
@@ -443,7 +445,17 @@ impl RunBackgroundTool {
         sink: Arc<dyn EventSink>,
         guard: Option<Arc<dyn CommandReviewer>>,
     ) -> Self {
-        Self { hub, sink, guard }
+        Self {
+            hub,
+            sink,
+            guard,
+            windows: None,
+        }
+    }
+
+    pub fn with_windows(mut self, windows: Arc<WindowHub>) -> Self {
+        self.windows = Some(windows);
+        self
     }
 }
 
@@ -451,13 +463,14 @@ impl ClientTool for RunBackgroundTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_background".into(),
-            description: "Start a workspace shell command in the background and return immediately. Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command.".into(),
+            description: "Start a workspace shell command in the background and return immediately. Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command (cwd = workspace unless cwd is set)"},
                     "name": {"type": "string", "description": "Optional process name (ascii, dash, underscore)"},
-                    "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"}
+                    "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"},
+                    "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result includes windows[].pid; pass the same name to screenshot."}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -473,12 +486,30 @@ impl ClientTool for RunBackgroundTool {
             .to_string();
         let name = args.get("name").and_then(Value::as_str).map(str::to_string);
         let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let window = args.get("window").and_then(Value::as_str).map(str::to_string);
         let hub = self.hub.clone();
         let sink = self.sink.clone();
         let guard = self.guard.clone();
+        let windows = self.windows.clone();
         Box::pin(async move {
             shellguard::enforce(guard.as_ref(), &command, cwd.as_deref().unwrap_or(".")).await?;
-            hub.start(&command, name.as_deref(), cwd.as_deref(), sink)
+            let window = wintrack::optional_name(window.as_deref())?;
+            let before = if window.is_some() {
+                wintrack::snapshot().await
+            } else {
+                Default::default()
+            };
+            let raw = hub.start(&command, name.as_deref(), cwd.as_deref(), sink)?;
+            let mut body: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+            if let Some(label) = window {
+                let found = wintrack::watch(before).await;
+                let bound = match &windows {
+                    Some(h) => wintrack::bind_appeared(h, &label, &found),
+                    None => wintrack::label_appeared(&label, &found),
+                };
+                wintrack::attach_to(&mut body, &bound);
+            }
+            Ok(body.to_string())
         })
     }
 }
