@@ -24,6 +24,7 @@ pub mod shellguard;
 pub mod shot;
 pub mod diff;
 pub mod tools;
+pub mod timer;
 pub mod tui;
 pub mod vision;
 pub mod worker;

@@ -23,7 +23,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::Image;
 use tokio::sync::mpsc;
 
-use crate::agent::{SessionKnobs, UserTurn};
+use crate::agent::{CancelFlag, SessionKnobs, UserTurn};
 use crate::ask::{self, AskUserHub, Question};
 use crate::auth;
 use crate::error::{Error, Result};
@@ -326,6 +326,8 @@ enum Hit {
     ChatRow(u16),
     ChatImage(u16),
     JumpBottom,
+    ScrollBar,
+    ScrollThumb,
     ImageView,
     ImageViewClose,
     ImageViewDismiss,
@@ -965,6 +967,7 @@ struct ParkedChat {
     stick_bottom: bool,
     queue: VecDeque<Queued>,
     inbox_tx: Option<mpsc::UnboundedSender<UserTurn>>,
+    cancel: Option<CancelFlag>,
     streaming: bool,
     open_tool: Option<(usize, usize)>,
     seal_tools: bool,
@@ -1154,16 +1157,22 @@ struct App {
     send_mode: SendMode,
     queue: VecDeque<Queued>,
     inbox_tx: Option<mpsc::UnboundedSender<UserTurn>>,
+    cancel: Option<CancelFlag>,
     knobs: Arc<Mutex<SessionKnobs>>,
     focus: Focus,
     setting_field: SettingField,
     settings: Option<Win>,
     drag: Option<(i16, i16)>,
+    /// Mouse grab offset inside the chat scrollbar thumb.
+    scroll_grab: Option<i16>,
     hits: Vec<(Rect, Hit)>,
     area: Rect,
     streaming: bool,
     composer_inner: Rect,
     chat_inner: Rect,
+    chat_bar: Rect,
+    chat_total: u16,
+    chat_max_off: u16,
     composer_vscroll: u16,
     input_dragging: bool,
     catalog: ModelCatalog,
@@ -1406,6 +1415,38 @@ impl App {
                     b.detail = detail.clone();
                 }
                 self.push(Row::Meta(format!("後台 {name} 結束  {detail}")));
+            }
+            AgentEvent::TimerStarted {
+                name,
+                seconds,
+                command,
+                ..
+            } => {
+                let label = if command.is_empty() {
+                    format!("timer {seconds}s")
+                } else {
+                    format!("timer {seconds}s  $ {command}")
+                };
+                self.upsert_background(name.clone(), label, 0);
+                if let Some(b) = self.bg_named_mut(&name) {
+                    b.status = "倒數中".into();
+                }
+                self.push(Row::Meta(format!("計時器 {name} 開始  {seconds}s")));
+            }
+            AgentEvent::TimerFired { name, detail, .. } => {
+                if let Some(b) = self.bg_named_mut(&name) {
+                    b.alive = false;
+                    b.status = "已到時".into();
+                    b.detail = detail.clone();
+                }
+                self.push(Row::Meta(format!("計時器 {name} 到時")));
+            }
+            AgentEvent::TimerCancelled { name, .. } => {
+                if let Some(b) = self.bg_named_mut(&name) {
+                    b.alive = false;
+                    b.status = "已取消".into();
+                }
+                self.push(Row::Meta(format!("計時器 {name} 已取消")));
             }
             AgentEvent::AgentMessage {
                 from, to, text, ..
@@ -1960,6 +2001,21 @@ impl App {
         self.cancel_session_ask(&id);
     }
 
+    fn interrupt_work(&mut self) -> bool {
+        if !self.running {
+            return false;
+        }
+        if let Some(c) = &self.cancel {
+            c.trip();
+        }
+        self.cancel_ask();
+        self.streaming = false;
+        self.finish_open_think();
+        self.activity = "中斷中".into();
+        self.status = "中斷中".into();
+        true
+    }
+
     fn cancel_session_ask(&mut self, id: &str) {
         if let Some(h) = self.ask_hubs.get(id) {
             h.cancel();
@@ -2050,6 +2106,7 @@ impl App {
             stick_bottom: self.stick_bottom,
             queue: std::mem::take(&mut self.queue),
             inbox_tx: self.inbox_tx.take(),
+            cancel: self.cancel.clone(),
             streaming: self.streaming,
             open_tool: self.open_tool.take(),
             seal_tools: self.seal_tools,
@@ -2080,6 +2137,7 @@ impl App {
         self.stick_bottom = p.stick_bottom;
         self.queue = p.queue;
         self.inbox_tx = p.inbox_tx;
+        self.cancel = p.cancel;
         self.streaming = p.streaming;
         self.open_tool = p.open_tool;
         self.seal_tools = p.seal_tools;
@@ -2101,6 +2159,7 @@ impl App {
         self.inspector = p.inspector;
         self.inspector_scroll = p.inspector_scroll;
         self.composer_vscroll = 0;
+        self.scroll_grab = None;
         self.image_view = None;
         self.ask = None;
         if self.focus == Focus::Ask {
@@ -2407,6 +2466,7 @@ impl App {
             stick_bottom: true,
             queue: VecDeque::new(),
             inbox_tx: None,
+            cancel: None,
             streaming: false,
             open_tool: None,
             seal_tools: false,
@@ -2451,7 +2511,8 @@ impl App {
             self.running = false;
             self.awaiting = false;
             self.inbox_tx = None;
-            if self.status.starts_with("工作") || self.status.starts_with("第") {
+            self.cancel = None;
+            if self.status.starts_with("工作") || self.status.starts_with("第") || self.status.starts_with("中斷") {
                 self.status = format!("結束 ({} 輪)", out.turns);
             }
             return;
@@ -2460,7 +2521,8 @@ impl App {
             p.running = false;
             p.awaiting = false;
             p.inbox_tx = None;
-            if p.status.starts_with("工作") || p.status.starts_with("第") {
+            p.cancel = None;
+            if p.status.starts_with("工作") || p.status.starts_with("第") || p.status.starts_with("中斷") {
                 p.status = format!("結束 ({} 輪)", out.turns);
             }
         }
@@ -2596,6 +2658,7 @@ impl App {
         let deleting_current = self.current_id == id;
         if deleting_current {
             self.inbox_tx = None;
+            self.cancel = None;
             self.running = false;
             self.awaiting = false;
         } else {
@@ -2721,6 +2784,7 @@ fn fresh_chat(session: SessionMeta) -> ParkedChat {
         stick_bottom: true,
         queue: VecDeque::new(),
         inbox_tx: None,
+        cancel: None,
         streaming: false,
         open_tool: None,
         seal_tools: false,
@@ -2754,6 +2818,30 @@ fn tool_started_line(name: &str, args: &Value) -> String {
         "kill_background" | "read_background" => {
             let n = args.get("name").and_then(Value::as_str).unwrap_or("");
             format!("▸ {name}  {n}")
+        }
+        "timer" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("start");
+            if action == "cancel" || action == "list" {
+                let n = args.get("name").and_then(Value::as_str).unwrap_or("");
+                if n.is_empty() {
+                    format!("▸ timer  {action}")
+                } else {
+                    format!("▸ timer  {action}  {n}")
+                }
+            } else {
+                let secs = args
+                    .get("seconds")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
+                let mode = if block { "阻塞" } else { "背景" };
+                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                if cmd.is_empty() {
+                    format!("▸ timer  {secs}s {mode}")
+                } else {
+                    format!("▸ timer  {secs}s {mode}  $ {cmd}")
+                }
+            }
         }
         "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -2880,6 +2968,13 @@ fn live_tool_activity(name: &str, args: &Value, phase: &str) -> String {
         "run_command" | "run_background" | "attach_monitor" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
             format!("{phase}  $ {cmd}")
+        }
+        "timer" => {
+            let secs = args
+                .get("seconds")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            format!("{phase}  timer  {secs}s")
         }
         "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -4571,7 +4666,7 @@ fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
             .map(|t| format!("  {}", md::fmt_duration(t.elapsed().as_millis() as u64)))
             .unwrap_or_default();
         format!(
-            " grokaagent  {} {}{}  · {}  {}{}",
+            " grokaagent  {} {}{}  · {}  Esc 中斷  {}{}",
             spinner(app.tick),
             act,
             clock,
@@ -4634,13 +4729,24 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
     f.render_widget(block, area);
     app.hits.push((area, Hit::Chat));
 
+    let bar_w = if area.width >= 8 { 1 } else { 0 };
     let inner = Rect::new(
         area.x.saturating_add(1),
         area.y.saturating_add(1),
-        area.width.saturating_sub(2),
+        area.width.saturating_sub(2 + bar_w),
         area.height.saturating_sub(1),
     );
     app.chat_inner = inner;
+    app.chat_bar = if bar_w == 0 {
+        Rect::default()
+    } else {
+        Rect::new(
+            area.x + area.width.saturating_sub(1),
+            inner.y,
+            1,
+            inner.height,
+        )
+    };
     let mut tool_hits = Vec::new();
     if inner.width == 0 || inner.height == 0 {
         return tool_hits;
@@ -4683,6 +4789,8 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         })
         .sum();
     let max_off = total.saturating_sub(inner.height);
+    app.chat_total = total;
+    app.chat_max_off = max_off;
     let scroll = if app.stick_bottom {
         max_off
     } else {
@@ -4749,6 +4857,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
             }
         }
     }
+    draw_chat_scrollbar(f, app, max_off, inner.height);
     tool_hits
 }
 
@@ -4813,6 +4922,102 @@ fn scroll_chat(app: &mut App, delta: i32) {
 fn jump_chat_bottom(app: &mut App) {
     app.stick_bottom = true;
     app.scroll = 0;
+}
+
+fn scrollbar_thumb_h(total: u16, view_h: u16, track_h: u16) -> u16 {
+    if track_h == 0 {
+        return 0;
+    }
+    if total <= view_h {
+        return track_h;
+    }
+    let h = (view_h as u32 * track_h as u32) / total.max(1) as u32;
+    (h as u16).clamp(2.min(track_h).max(1), track_h)
+}
+
+/// Map thumb top (relative to track) to `app.scroll` (offset from bottom).
+fn scrollbar_offset(max_off: u16, track_h: u16, thumb_h: u16, rel_y: u16) -> u16 {
+    let travel = track_h.saturating_sub(thumb_h);
+    if travel == 0 || max_off == 0 {
+        return 0;
+    }
+    let rel = rel_y.min(travel);
+    let visual = (rel as u32 * max_off as u32 + (travel as u32 / 2)) / travel as u32;
+    max_off.saturating_sub(visual as u16)
+}
+
+fn scrollbar_thumb_rel(max_off: u16, track_h: u16, thumb_h: u16, scroll: u16) -> u16 {
+    let travel = track_h.saturating_sub(thumb_h);
+    if travel == 0 || max_off == 0 {
+        return 0;
+    }
+    let visual = max_off.saturating_sub(scroll.min(max_off));
+    ((visual as u32 * travel as u32) / max_off as u32) as u16
+}
+
+fn apply_scroll_from_row(app: &mut App, row: u16) {
+    let track = app.chat_bar;
+    if track.height == 0 {
+        return;
+    }
+    let thumb_h = scrollbar_thumb_h(app.chat_total, app.chat_inner.height, track.height);
+    let grab = app.scroll_grab.unwrap_or(0);
+    let y = (row as i16 - grab).clamp(track.y as i16, {
+        let last = track.y as i16 + track.height as i16 - thumb_h.max(1) as i16;
+        last.max(track.y as i16)
+    }) as u16;
+    let rel = y.saturating_sub(track.y);
+    app.scroll = scrollbar_offset(app.chat_max_off, track.height, thumb_h, rel);
+    app.stick_bottom = app.scroll == 0;
+}
+
+fn begin_scroll_drag(app: &mut App, row: u16, on_thumb: bool) {
+    let track = app.chat_bar;
+    if track.height == 0 {
+        return;
+    }
+    let thumb_h = scrollbar_thumb_h(app.chat_total, app.chat_inner.height, track.height);
+    let scroll = if app.stick_bottom {
+        0
+    } else {
+        app.scroll.min(app.chat_max_off)
+    };
+    let thumb_rel = scrollbar_thumb_rel(app.chat_max_off, track.height, thumb_h, scroll);
+    let thumb_y = track.y.saturating_add(thumb_rel);
+    if on_thumb {
+        app.scroll_grab = Some(row as i16 - thumb_y as i16);
+    } else {
+        app.scroll_grab = Some((thumb_h / 2) as i16);
+    }
+    apply_scroll_from_row(app, row);
+}
+
+fn draw_chat_scrollbar(f: &mut Frame, app: &mut App, max_off: u16, view_h: u16) {
+    let track = app.chat_bar;
+    if track.width == 0 || track.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Block::default().style(Style::default().bg(BORDER)),
+        track,
+    );
+    app.hits.push((track, Hit::ScrollBar));
+    if max_off == 0 {
+        return;
+    }
+    let thumb_h = scrollbar_thumb_h(app.chat_total, view_h, track.height);
+    let scroll = if app.stick_bottom {
+        0
+    } else {
+        app.scroll.min(max_off)
+    };
+    let rel = scrollbar_thumb_rel(max_off, track.height, thumb_h, scroll);
+    let thumb = Rect::new(track.x, track.y.saturating_add(rel), 1, thumb_h.max(1));
+    f.render_widget(
+        Block::default().style(Style::default().bg(ACCENT)),
+        thumb,
+    );
+    app.hits.push((thumb, Hit::ScrollThumb));
 }
 
 fn draw_jump_bottom(f: &mut Frame, app: &mut App, chat: Rect) {
@@ -5190,7 +5395,7 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
             } else {
                 format!("{} {}", spinner(app.tick), app.activity)
             };
-            format!("{act}  — Enter 排隊，Ctrl+Enter 插入…")
+            format!("{act}  — Esc 中斷  ·  Enter 排隊，Ctrl+Enter 插入…")
         } else {
             "傳訊息，或點「貼上圖片」…".into()
         };
@@ -6006,16 +6211,21 @@ async fn tui_loop(
         send_mode: SendMode::Queue,
         queue: VecDeque::new(),
         inbox_tx: None,
+        cancel: None,
         knobs: knobs.clone(),
         focus: Focus::Chat,
         setting_field: SettingField::Model,
         settings: None,
         drag: None,
+        scroll_grab: None,
         hits: Vec::new(),
         area: Rect::default(),
         streaming: false,
         composer_inner: Rect::default(),
         chat_inner: Rect::default(),
+        chat_bar: Rect::default(),
+        chat_total: 0,
+        chat_max_off: 0,
         composer_vscroll: 0,
         input_dragging: false,
         catalog: ModelCatalog::default(),
@@ -6279,7 +6489,9 @@ fn start_or_send(
     app.awaiting = false;
     app.status = "工作中".into();
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+    let cancel = CancelFlag::new();
     app.inbox_tx = Some(inbox_tx);
+    app.cancel = Some(cancel.clone());
     let mut opts = opts.clone();
     opts.workspace = app.session.workspace.clone();
     let sink = sink.clone();
@@ -6289,7 +6501,7 @@ fn start_or_send(
     let ask = Some(app.attach_ask_hub(&run_id));
     tokio::spawn(async move {
         let sid = run_id.clone();
-        let out = run_one(opts, turn, sink, knobs, inbox_rx, run_id, ask).await;
+        let out = run_one(opts, turn, sink, knobs, inbox_rx, run_id, ask, cancel).await;
         let _ = done_tx.send((
             sid,
             out.unwrap_or_else(|e| crate::agent::RunOutcome {
@@ -6554,6 +6766,8 @@ fn handle_key(
                 app.close_inspector();
             } else if app.queue_edit.is_some() {
                 app.cancel_queue_edit();
+            } else if app.running {
+                app.interrupt_work();
             } else if !app.dismiss_tool_ui() {
                 if app.edit.has_sel() {
                     app.edit.clear_sel();
@@ -6911,6 +7125,7 @@ fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             app.drag = None;
             app.input_dragging = false;
+            app.scroll_grab = None;
             let hit = hit_at(&app.hits, col, row);
             if app.workspace_pick.is_some() {
                 match hit {
@@ -7083,6 +7298,14 @@ fn handle_mouse(
                     app.focus = Focus::Chat;
                     jump_chat_bottom(app);
                 }
+                Some(Hit::ScrollThumb) => {
+                    app.focus = Focus::Chat;
+                    begin_scroll_drag(app, row, true);
+                }
+                Some(Hit::ScrollBar) => {
+                    app.focus = Focus::Chat;
+                    begin_scroll_drag(app, row, false);
+                }
                 Some(Hit::DismissTool) | Some(Hit::Chat) => {
                     app.commit_rename();
                     app.focus = Focus::Chat;
@@ -7200,7 +7423,9 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let (Some((dx, dy)), Some(w)) = (app.drag, app.settings.as_mut()) {
+            if app.scroll_grab.is_some() {
+                apply_scroll_from_row(app, row);
+            } else if let (Some((dx, dy)), Some(w)) = (app.drag, app.settings.as_mut()) {
                 if !w.maximized {
                     w.x = (col as i16 - dx).max(0) as u16;
                     w.y = (row as i16 - dy).max(0) as u16;
@@ -7219,6 +7444,7 @@ fn handle_mouse(
         MouseEventKind::Up(_) => {
             app.drag = None;
             app.input_dragging = false;
+            app.scroll_grab = None;
         }
         MouseEventKind::ScrollUp => {
             if app.image_view.is_some() {
@@ -7305,6 +7531,7 @@ async fn run_one(
     inbox: mpsc::UnboundedReceiver<UserTurn>,
     run_id: String,
     ask: Option<AskUserHub>,
+    cancel: crate::agent::CancelFlag,
 ) -> Result<crate::agent::RunOutcome> {
     let auth_path = auth::default_auth_path()?;
     let model = if opts.model.trim().is_empty() {
@@ -7342,6 +7569,7 @@ async fn run_one(
             knobs: Some(knobs),
             inbox: Some(inbox),
             ask,
+            cancel: Some(cancel),
         },
     )
     .await
@@ -7564,6 +7792,50 @@ mod tests {
         assert!(!app.backgrounds[0].alive);
         assert_eq!(app.backgrounds[0].status, "結束");
         assert_eq!(app.backgrounds[0].detail, "killed");
+    }
+
+    #[test]
+    fn timer_fills_the_side_rail() {
+        let mut app = test_app();
+        app.current_id = "r".into();
+        app.session.id = "r".into();
+        let meta = test_meta();
+        app.route_event(AgentEvent::TimerStarted {
+            meta: meta.clone(),
+            name: "n1".into(),
+            seconds: 30,
+            command: "echo hi".into(),
+        });
+        assert!(app.has_side());
+        assert_eq!(app.backgrounds.len(), 1);
+        assert_eq!(app.backgrounds[0].name, "n1");
+        assert!(app.backgrounds[0].alive);
+        assert_eq!(app.backgrounds[0].status, "倒數中");
+        assert!(app.backgrounds[0].command.contains("30s"), "{}", app.backgrounds[0].command);
+        assert!(app.rows.iter().any(|r| match r {
+            Row::Meta(s) => s.contains("計時器 n1"),
+            _ => false,
+        }));
+        app.route_event(AgentEvent::TimerFired {
+            meta: meta.clone(),
+            name: "n1".into(),
+            detail: "notified".into(),
+        });
+        assert!(!app.backgrounds[0].alive);
+        assert_eq!(app.backgrounds[0].status, "已到時");
+        app.route_event(AgentEvent::TimerStarted {
+            meta: meta.clone(),
+            name: "n2".into(),
+            seconds: 5,
+            command: String::new(),
+        });
+        app.route_event(AgentEvent::TimerCancelled {
+            meta,
+            name: "n2".into(),
+        });
+        let n2 = app.backgrounds.iter().find(|b| b.name == "n2").unwrap();
+        assert!(!n2.alive);
+        assert_eq!(n2.status, "已取消");
     }
 
     #[test]
@@ -8336,6 +8608,84 @@ mod tests {
         assert!(app.stick_bottom);
     }
 
+    #[test]
+    fn scrollbar_offset_maps_top_and_bottom() {
+        assert_eq!(scrollbar_offset(100, 20, 4, 0), 100);
+        assert_eq!(scrollbar_offset(100, 20, 4, 16), 0);
+        assert_eq!(scrollbar_thumb_rel(100, 20, 4, 0), 16);
+        assert_eq!(scrollbar_thumb_rel(100, 20, 4, 100), 0);
+    }
+
+    #[test]
+    fn esc_interrupts_running_work_and_does_not_quit() {
+        let mut app = test_app();
+        let flag = CancelFlag::new();
+        app.running = true;
+        app.cancel = Some(flag.clone());
+        app.status = "工作中".into();
+        let (mut opts, sink, tx) = dummy_key_env();
+        let quit = handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert!(!quit);
+        assert!(flag.is_set(), "Esc must trip the in-flight cancel flag");
+        assert_eq!(app.status, "中斷中");
+        assert!(!app.streaming);
+    }
+
+    #[test]
+    fn esc_when_idle_does_not_trip_cancel() {
+        let mut app = test_app();
+        let flag = CancelFlag::new();
+        app.running = false;
+        app.cancel = Some(flag.clone());
+        let (mut opts, sink, tx) = dummy_key_env();
+        let quit = handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert!(!quit);
+        assert!(!flag.is_set());
+    }
+
+    #[test]
+    fn drag_scrollbar_thumb_moves_chat_offset() {
+        let mut app = test_app();
+        for i in 0..40 {
+            app.push(Row::User(format!("msg-{i:02}").into()));
+        }
+        let (mut opts, _sink, _tx) = dummy_key_env();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 32)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &mut app, &opts);
+            })
+            .unwrap();
+        let thumb = app
+            .hits
+            .iter()
+            .rev()
+            .find(|(_, h)| *h == Hit::ScrollThumb)
+            .map(|(r, _)| *r)
+            .expect("overflowing chat must show a drag thumb");
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Down(MouseButton::Left),
+            thumb.x,
+            thumb.y,
+            KeyModifiers::NONE,
+        );
+        assert!(app.scroll_grab.is_some());
+        let top = app.chat_bar.y;
+        handle_mouse(
+            &mut app,
+            &mut opts,
+            MouseEventKind::Drag(MouseButton::Left),
+            thumb.x,
+            top,
+            KeyModifiers::NONE,
+        );
+        assert!(!app.stick_bottom, "dragging the thumb to the top must unstick");
+        assert!(app.scroll > 0, "scroll offset from bottom should increase");
+    }
+
     fn buf_hay(buf: &ratatui::buffer::Buffer) -> String {
         buf.content.iter().map(|c| c.symbol()).collect()
     }
@@ -8555,6 +8905,19 @@ mod tests {
         );
         assert!(mem.contains("goal.md"), "{mem}");
         assert!(mem.contains("write"), "{mem}");
+        let timer = tool_started_line(
+            "timer",
+            &serde_json::json!({"action": "start", "seconds": 30, "block": true, "command": "echo hi"}),
+        );
+        assert!(timer.contains("30"), "{timer}");
+        assert!(timer.contains("阻塞"), "{timer}");
+        assert!(timer.contains("echo hi"), "{timer}");
+        let cancel = tool_started_line(
+            "timer",
+            &serde_json::json!({"action": "cancel", "name": "n1"}),
+        );
+        assert!(cancel.contains("cancel"), "{cancel}");
+        assert!(cancel.contains("n1"), "{cancel}");
     }
 
     #[test]
@@ -8622,6 +8985,7 @@ mod tests {
             send_mode: SendMode::Queue,
             queue: VecDeque::new(),
             inbox_tx: None,
+            cancel: None,
             knobs: Arc::new(Mutex::new(SessionKnobs {
                 model: "grok-4.6".into(),
                 reasoning_effort: ReasoningEffort::High,
@@ -8632,11 +8996,15 @@ mod tests {
             setting_field: SettingField::Model,
             settings: None,
             drag: None,
+            scroll_grab: None,
             hits: Vec::new(),
             area: Rect::default(),
             streaming: false,
             composer_inner: Rect::default(),
             chat_inner: Rect::default(),
+            chat_bar: Rect::default(),
+            chat_total: 0,
+            chat_max_off: 0,
             composer_vscroll: 0,
             input_dragging: false,
             catalog: ModelCatalog::default(),
@@ -8700,6 +9068,7 @@ mod tests {
             stick_bottom: true,
             queue: VecDeque::new(),
             inbox_tx: None,
+            cancel: None,
             streaming: false,
             open_tool: None,
             seal_tools: false,
@@ -9158,6 +9527,7 @@ mod tests {
                 stick_bottom: true,
                 queue: VecDeque::new(),
                 inbox_tx: None,
+                cancel: None,
                 streaming: false,
                 open_tool: None,
                 seal_tools: false,
@@ -9231,6 +9601,7 @@ mod tests {
                 stick_bottom: true,
                 queue: VecDeque::new(),
                 inbox_tx: None,
+                cancel: None,
                 streaming: false,
                 open_tool: None,
                 seal_tools: false,

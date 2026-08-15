@@ -16,6 +16,7 @@ use crate::monitor::{AttachMonitorTool, MonitorHub, MonitorSink};
 use crate::nursery::{Nursery, SendMessageTool, SpawnAgentTool, DEFAULT_MAX_DEPTH};
 use crate::provider::Provider;
 use crate::shellguard::{CommandReviewer, ProviderGuard};
+use crate::timer::{TimerHub, TimerTool};
 use crate::tools::{
     DeleteFileTool, ListDirTool, NowTool, ReadFileTool, ReadImageTool, RunCommandTool,
     ScreenshotTool, ToolRegistry, WriteFileTool,
@@ -48,6 +49,8 @@ pub struct KernelSpec {
     pub images: Vec<PathBuf>,
     /// When set, the model may call `ask_user` and wait for a TUI pick.
     pub ask: Option<AskUserHub>,
+    /// TUI Esc trips this; headless runs leave it `None`.
+    pub cancel: Option<crate::agent::CancelFlag>,
 }
 
 pub async fn run_with_nursery<P: Provider + Clone + 'static>(
@@ -69,6 +72,13 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     );
     let (bg_tx, bg_rx) = tokio::sync::mpsc::unbounded_channel();
     let bg = BackgroundHub::new(
+        spec.workspace.clone(),
+        spec.agent_name.clone(),
+        run_id.clone(),
+        spec.parent_run_id.clone(),
+        Some(bg_tx.clone()),
+    );
+    let timers = TimerHub::new(
         spec.workspace.clone(),
         spec.agent_name.clone(),
         run_id.clone(),
@@ -115,6 +125,11 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         )),
         Box::new(ReadBackgroundTool::new(bg.clone())),
         Box::new(KillBackgroundTool::new(bg.clone())),
+        Box::new(TimerTool::new(
+            timers.clone(),
+            tee.clone(),
+            Some(guard.clone()),
+        )),
         Box::new(ProjectMemoryTool::new(
             memory_root.clone(),
             spec.workspace.clone(),
@@ -181,11 +196,13 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             workspace: spec.workspace,
             images: spec.images,
             closed_backgrounds,
+            cancel: spec.cancel,
         },
     )
     .await;
     hub.shutdown().await;
     let _ = bg.begin_shutdown();
+    timers.shutdown();
     bg.wait_shutdown().await;
     if let Some(n) = nursery {
         n.shutdown(tee.as_ref()).await;

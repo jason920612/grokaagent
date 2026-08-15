@@ -1,18 +1,18 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
 
 use crate::compact;
 use crate::error::{Error, Result};
 use crate::events::{AgentEvent, EventMeta, EventSink};
-use crate::provider::{
-    previous_response_unusable, prompt_cache_key, CacheUsage, CompleteRequest, Provider,
-    ReasoningEffort,
-};
-use crate::tools::ToolRegistry;
+use crate::provider::{prompt_cache_key, CacheUsage, CompleteRequest, Provider, ReasoningEffort};
+use crate::tools::{ToolRegistry, ToolSpec};
 
 /// Live model / effort / server tools for a long-lived TUI session. Read each turn.
 #[derive(Clone)]
@@ -49,6 +49,52 @@ pub struct RunConfig {
     pub images: Vec<PathBuf>,
     /// Notice from the previous run: backgrounds that were killed because this conversation closed.
     pub closed_backgrounds: Option<String>,
+    /// TUI Esc trips this so an in-flight stream or tool is dropped, then the session pauses.
+    pub cancel: Option<CancelFlag>,
+}
+
+/// Shared flag so the TUI can abort the current model turn without ending the session.
+#[derive(Clone)]
+pub struct CancelFlag {
+    inner: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl CancelFlag {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn trip(&self) {
+        self.inner.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn take(&self) -> bool {
+        self.inner.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.inner.load(Ordering::SeqCst)
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.is_set() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl Default for CancelFlag {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One user message, optionally with workspace images for vision.
@@ -187,12 +233,43 @@ async fn recv_pending(rx: &mut Option<mpsc::UnboundedReceiver<UserTurn>>) -> Opt
     }
 }
 
+async fn wait_if_cancel(cancel: &Option<CancelFlag>) {
+    match cancel {
+        Some(c) => c.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn race_cancel<T>(
+    cancel: &Option<CancelFlag>,
+    fut: impl Future<Output = T>,
+) -> std::result::Result<T, ()> {
+    if cancel.as_ref().is_some_and(CancelFlag::is_set) {
+        return Err(());
+    }
+    tokio::select! {
+        biased;
+        _ = wait_if_cancel(cancel) => Err(()),
+        out = fut => Ok(out),
+    }
+}
+
+const INTERRUPT_NOTE: &str = "The user pressed Esc and interrupted the previous model turn. Do not continue that turn. Follow their next message.";
+
+fn cancelled_tool_output() -> String {
+    json!({"error": "interrupted", "cancelled": true}).to_string()
+}
+
 /// Wait for the next user turn or background-exit notice. Closing the user inbox ends the session.
+/// Esc while paused is ignored so it cannot cancel the next turn.
 async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
     if cfg.inbox.is_none() {
         return None;
     }
     loop {
+        if let Some(c) = &cfg.cancel {
+            c.take();
+        }
         let mut msgs = drain_session(cfg);
         if !msgs.is_empty() {
             return Some(msgs);
@@ -219,12 +296,117 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
                 msgs.extend(drain_session(cfg));
                 return Some(msgs);
             }
+            _ = wait_if_cancel(&cfg.cancel) => {
+                if let Some(c) = &cfg.cancel {
+                    c.take();
+                }
+            }
         }
     }
 }
 
+/// Pause after Esc. `None` = session ended.
+async fn after_interrupt(
+    cfg: &mut RunConfig,
+    sink: &dyn EventSink,
+    run_id: &str,
+    last_text: &str,
+) -> Option<Vec<UserTurn>> {
+    if let Some(c) = &cfg.cancel {
+        c.take();
+    }
+    notice(
+        sink,
+        &cfg.agent_name,
+        run_id,
+        cfg.parent_run_id.as_deref(),
+        "使用者中斷（Esc）".into(),
+    );
+    if cfg.inbox.is_none() {
+        sink.emit(&AgentEvent::RunFinished {
+            meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+            reason: "interrupt".into(),
+            text: last_text.to_string(),
+        });
+        return None;
+    }
+    sink.emit(&AgentEvent::AwaitingInput {
+        meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+    });
+    wait_session(cfg).await
+}
+
+fn resume_after_interrupt(
+    cfg: &RunConfig,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    msgs: Vec<UserTurn>,
+) {
+    append_user(
+        history,
+        pending,
+        &UserTurn::from(INTERRUPT_NOTE),
+        &cfg.workspace,
+    );
+    for msg in msgs {
+        append_user(history, pending, &msg, &cfg.workspace);
+    }
+}
+
+/// `true` = keep the session. `false` = run ended.
+async fn take_interrupt(
+    cfg: &mut RunConfig,
+    sink: &dyn EventSink,
+    run_id: &str,
+    last_text: &str,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+) -> bool {
+    match after_interrupt(cfg, sink, run_id, last_text).await {
+        None => false,
+        Some(msgs) => {
+            resume_after_interrupt(cfg, history, pending, msgs);
+            true
+        }
+    }
+}
+
+fn emit_cancelled_tool(
+    sink: &dyn EventSink,
+    cfg: &RunConfig,
+    run_id: &str,
+    call_id: &str,
+    name: &str,
+    started: bool,
+    args: &Value,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+) {
+    if !started {
+        sink.emit(&AgentEvent::ToolStarted {
+            meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            args: args.clone(),
+            kind: "client".into(),
+        });
+    }
+    let output = cancelled_tool_output();
+    sink.emit(&AgentEvent::ToolFinished {
+        meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        output: output.clone(),
+    });
+    let item = crate::vision::function_call_output(call_id, &output, None);
+    history.push(item.clone());
+    pending.push(item);
+}
+
 /// Stop retrying the same failing request so we do not hammer the API.
 const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
+/// Lived fold is retried until it succeeds. Wait so a 400 does not spin.
+const COMPACT_RETRY: Duration = Duration::from_secs(2);
 
 /// Tell the model why the request failed and keep the loop going.
 /// Do not pause for the user: the model should enlarge/regenerate and continue.
@@ -234,15 +416,11 @@ async fn recover_from_provider_error(
     run_id: &str,
     history: &mut Vec<Value>,
     pending: &mut Vec<Value>,
-    previous_response_id: &mut Option<String>,
-    use_response_chain: &mut bool,
     consecutive: &mut u32,
     last_text: &str,
     err: Error,
 ) -> Result<()> {
     *consecutive += 1;
-    *use_response_chain = false;
-    *previous_response_id = None;
     sink.emit(&AgentEvent::Error {
         meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
         message: err.to_string(),
@@ -333,9 +511,30 @@ fn emit_file_changes(
     }
 }
 
+/// Replay every `function_call` into history when `output_items` omitted it.
+/// Full-history turns need the call sitting in front of `function_call_output`.
+fn append_missing_function_calls(history: &mut Vec<Value>, calls: &[crate::provider::FunctionCall]) {
+    for call in calls {
+        let already = history.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(Value::as_str) == Some(call.call_id.as_str())
+        });
+        if already {
+            continue;
+        }
+        history.push(json!({
+            "type": "function_call",
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }));
+    }
+}
+
 /// The working model writes long-term memory because it lived the turns.
-/// Not streamed to the TUI and not kept as a chat turn. `store: false` so
-/// this does not extend the Responses chain.
+/// Not streamed to the TUI and not kept as a chat turn. `store: false` and no
+/// `previous_response_id`. Uses the working conversation cache key so the
+/// fold stays on the same replica; the body is still a different prefix.
 async fn ask_lived_memory<P: Provider>(
     provider: &P,
     instructions: &str,
@@ -343,52 +542,36 @@ async fn ask_lived_memory<P: Provider>(
     model: &str,
     effort: ReasoningEffort,
     send_reasoning: bool,
+    cache_key: &str,
     head: &[Value],
-    previous_response_id: Option<&str>,
-    use_response_chain: bool,
-) -> Option<String> {
+    client_tools: Vec<ToolSpec>,
+    server_tools: Vec<String>,
+) -> Result<String> {
     if head.is_empty() {
-        return None;
+        return Err(Error::Provider("nothing to fold".into()));
     }
-    let ask = json!({
-        "role": "user",
-        "content": compact::memory_ask(goal, compact::previous_compact_text(head).as_deref())
-    });
-    let chained = use_response_chain && previous_response_id.is_some();
-    let input = if chained {
-        vec![ask]
-    } else {
-        let mut input = head.to_vec();
-        input.push(ask);
-        input
-    };
     let req = CompleteRequest {
         instructions: instructions.to_string(),
-        input,
-        client_tools: vec![],
-        server_tools: vec![],
-        cache_key: prompt_cache_key(model, &[], &[]),
-        previous_response_id: if chained {
-            previous_response_id.map(str::to_string)
-        } else {
-            None
-        },
+        input: compact::fold_input(head, goal),
+        client_tools,
+        server_tools,
+        cache_key: cache_key.to_string(),
+        previous_response_id: None,
         store: false,
         reasoning_effort: effort,
         send_reasoning,
         model: model.to_string(),
         tool_choice: Some("none".into()),
     };
-    match provider.complete(req).await {
-        Ok(r) if r.function_calls.is_empty() => {
-            let text = compact::lived_text_from_complete(&r.text, &r.output_items);
-            if compact::lived_brief_usable(&text) {
-                Some(text)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let r = provider.complete(req).await?;
+    if !r.function_calls.is_empty() {
+        return Err(Error::Provider("lived fold called tools".into()));
+    }
+    let text = compact::lived_text_from_complete(&r.text, &r.output_items);
+    if compact::lived_brief_usable(&text) {
+        Ok(text)
+    } else {
+        Err(Error::Provider("lived gist unusable".into()))
     }
 }
 
@@ -442,28 +625,49 @@ pub async fn run<P: Provider>(
         &cfg.images,
         &cfg.workspace,
     ));
-    let mut previous_response_id: Option<String> = None;
     let mut pending: Vec<Value> = history.clone();
     let mut last_text = String::new();
     let mut last_usage = CacheUsage::default();
     let mut cache_turns = Vec::new();
     let mut compacted = 0u32;
     let max_turns = cfg.max_turns;
-    let mut cache_key = prompt_cache_key(&start_model, &tools.specs(), &start_tools);
+    let mut cache_key = prompt_cache_key(&start_model, &tools.specs(), &start_tools, &run_id);
     let mut last_model = start_model;
     let mut last_server_tools = start_tools;
     let mut turn: u32 = 0;
     let mut total_turns: u32 = 0;
     let mut seen_model = false;
-    let mut use_response_chain = true;
     let mut consecutive_provider_errors: u32 = 0;
 
-    loop {
+    'run: loop {
         if seen_model {
             for msg in drain_session(&mut cfg) {
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
                 turn = 0;
             }
+        }
+
+        if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
+            if !take_interrupt(
+                &mut cfg,
+                sink,
+                &run_id,
+                &last_text,
+                &mut history,
+                &mut pending,
+            )
+            .await
+            {
+                return Ok(RunOutcome {
+                    run_id,
+                    text: last_text,
+                    turns: total_turns,
+                    cache_turns,
+                    compacted,
+                });
+            }
+            turn = 0;
+            continue;
         }
 
         turn += 1;
@@ -507,14 +711,10 @@ pub async fn run<P: Provider>(
 
         let (model, effort, send_reasoning, server_tools) = live_knobs(&cfg);
         if model != last_model || server_tools != last_server_tools {
-            cache_key = prompt_cache_key(&model, &tools.specs(), &server_tools);
-            previous_response_id = None;
+            cache_key = prompt_cache_key(&model, &tools.specs(), &server_tools, &run_id);
             pending = history.clone();
             last_model = model.clone();
             last_server_tools = server_tools.clone();
-        }
-        if !use_response_chain {
-            previous_response_id = None;
         }
 
         sink.emit(&AgentEvent::TurnStarted {
@@ -526,70 +726,128 @@ pub async fn run<P: Provider>(
             .input_tokens
             .max(compact::estimate_tokens(&cfg.instructions, &history));
         if compact::should_compact(used, window, history.len(), keep_recent) {
-            let (head, _) = compact::split_head_tail(&history, keep_recent);
-            let lived = ask_lived_memory(
-                provider,
-                &cfg.instructions,
-                &cfg.prompt,
-                &model,
-                effort,
-                send_reasoning,
-                head,
-                previous_response_id.as_deref(),
-                use_response_chain,
-            )
-            .await;
-            match compact::compact_history(&cfg.prompt, &history, keep_recent, lived.as_deref()) {
-                Ok(c) => {
-                    compacted += 1;
-                    sink.emit(&AgentEvent::ContextCompacted {
-                        meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                        input_tokens: used,
-                        window,
-                        dropped_items: c.dropped,
-                        kept_items: c.kept,
-                        method: c.method,
-                    });
-                    history = c.items;
-                    previous_response_id = None;
-                    pending = history.clone();
+            let head = compact::split_head_tail(&history, keep_recent).0.to_vec();
+            loop {
+                match race_cancel(
+                    &cfg.cancel,
+                    ask_lived_memory(
+                        provider,
+                        &cfg.instructions,
+                        &cfg.prompt,
+                        &model,
+                        effort,
+                        send_reasoning,
+                        &cache_key,
+                        &head,
+                        tools.specs(),
+                        server_tools.clone(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(text)) => {
+                        match compact::compact_history(&cfg.prompt, &history, keep_recent, &text) {
+                            Ok(c) => {
+                                compacted += 1;
+                                sink.emit(&AgentEvent::ContextCompacted {
+                                    meta: meta(
+                                        &cfg.agent_name,
+                                        &run_id,
+                                        cfg.parent_run_id.as_deref(),
+                                    ),
+                                    input_tokens: used,
+                                    window,
+                                    dropped_items: c.dropped,
+                                    kept_items: c.kept,
+                                    method: c.method,
+                                });
+                                history = c.items;
+                                pending = history.clone();
+                                break;
+                            }
+                            Err(e) => {
+                                notice(
+                                    sink,
+                                    &cfg.agent_name,
+                                    &run_id,
+                                    cfg.parent_run_id.as_deref(),
+                                    format!("壓縮重試: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        notice(
+                            sink,
+                            &cfg.agent_name,
+                            &run_id,
+                            cfg.parent_run_id.as_deref(),
+                            format!("壓縮重試: {e}"),
+                        );
+                    }
+                    Err(()) => {
+                        if !take_interrupt(
+                            &mut cfg,
+                            sink,
+                            &run_id,
+                            &last_text,
+                            &mut history,
+                            &mut pending,
+                        )
+                        .await
+                        {
+                            return Ok(RunOutcome {
+                                run_id,
+                                text: last_text,
+                                turns: total_turns,
+                                cache_turns,
+                                compacted,
+                            });
+                        }
+                        turn = 0;
+                        continue 'run;
+                    }
                 }
-                Err(e) => {
-                    notice(
-                        sink,
-                        &cfg.agent_name,
-                        &run_id,
-                        cfg.parent_run_id.as_deref(),
-                        format!("壓縮略過: {e}"),
-                    );
+                match race_cancel(&cfg.cancel, tokio::time::sleep(COMPACT_RETRY)).await {
+                    Ok(()) => {}
+                    Err(()) => {
+                        if !take_interrupt(
+                            &mut cfg,
+                            sink,
+                            &run_id,
+                            &last_text,
+                            &mut history,
+                            &mut pending,
+                        )
+                        .await
+                        {
+                            return Ok(RunOutcome {
+                                run_id,
+                                text: last_text,
+                                turns: total_turns,
+                                cache_turns,
+                                compacted,
+                            });
+                        }
+                        turn = 0;
+                        continue 'run;
+                    }
                 }
             }
         }
 
-        let chained = use_response_chain && previous_response_id.is_some();
-        let mut send_input = if chained {
-            pending.clone()
-        } else {
-            history.clone()
-        };
-        let has_image = crate::vision::input_has_image(&send_input)
-            || crate::vision::input_has_image(&history);
-        if has_image {
-            send_input = history.clone();
-        }
-
-        let mut req = CompleteRequest {
+        // Always resend the full append-only transcript. Chaining with
+        // `previous_response_id` and a pending-only `input` makes every tool
+        // turn start with a different prefix, so cached_tokens stays 0.
+        let has_image = crate::vision::input_has_image(&history);
+        let req = CompleteRequest {
             instructions: cfg.instructions.clone(),
-            input: send_input,
+            input: history.clone(),
             client_tools: tools.specs(),
             server_tools: server_tools.clone(),
             cache_key: cache_key.clone(),
-            previous_response_id: if chained && !has_image {
-                previous_response_id.clone()
-            } else {
-                None
-            },
-            store: !has_image,
+            previous_response_id: None,
+            store: false,
             reasoning_effort: effort,
             send_reasoning,
             model: model.clone(),
@@ -629,41 +887,42 @@ pub async fn run<P: Provider>(
             });
         };
 
-        let response = match provider.complete_stream(req.clone(), &on_text, &on_server, &on_reasoning).await {
-            Ok(r) => r,
-            Err(e) if chained && previous_response_unusable(&e) => {
-                use_response_chain = false;
-                req.previous_response_id = None;
-                req.input = history.clone();
-                match provider.complete_stream(req, &on_text, &on_server, &on_reasoning).await {
-                    Ok(r) => r,
-                    Err(e2) => {
-                        recover_from_provider_error(
-                            &mut cfg,
-                            sink,
-                            &run_id,
-                            &mut history,
-                            &mut pending,
-                            &mut previous_response_id,
-                            &mut use_response_chain,
-                            &mut consecutive_provider_errors,
-                            &last_text,
-                            e2,
-                        )
-                        .await?;
-                        continue;
-                    }
+        let response = match race_cancel(
+            &cfg.cancel,
+            provider.complete_stream(req, &on_text, &on_server, &on_reasoning),
+        )
+        .await
+        {
+            Err(()) => {
+                if !take_interrupt(
+                    &mut cfg,
+                    sink,
+                    &run_id,
+                    &last_text,
+                    &mut history,
+                    &mut pending,
+                )
+                .await
+                {
+                    return Ok(RunOutcome {
+                        run_id,
+                        text: last_text,
+                        turns: total_turns,
+                        cache_turns,
+                        compacted,
+                    });
                 }
+                turn = 0;
+                continue;
             }
-            Err(e) => {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 recover_from_provider_error(
                     &mut cfg,
                     sink,
                     &run_id,
                     &mut history,
                     &mut pending,
-                    &mut previous_response_id,
-                    &mut use_response_chain,
                     &mut consecutive_provider_errors,
                     &last_text,
                     e,
@@ -715,12 +974,8 @@ pub async fn run<P: Provider>(
             }
         }
 
-        if has_image || !use_response_chain || response.id.is_empty() {
-            previous_response_id = None;
-        } else {
-            previous_response_id = Some(response.id.clone());
-        }
         history.extend(response.output_items.iter().cloned());
+        append_missing_function_calls(&mut history, &response.function_calls);
         pending.clear();
         seen_model = true;
 
@@ -734,8 +989,24 @@ pub async fn run<P: Provider>(
                 "tool_calls",
                 &last_usage,
             );
+            let mut interrupted = false;
             for call in response.function_calls {
                 let args: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                if interrupted || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
+                    emit_cancelled_tool(
+                        sink,
+                        &cfg,
+                        &run_id,
+                        &call.call_id,
+                        &call.name,
+                        false,
+                        &args,
+                        &mut history,
+                        &mut pending,
+                    );
+                    interrupted = true;
+                    continue;
+                }
                 sink.emit(&AgentEvent::ToolStarted {
                     meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
                     call_id: call.call_id.clone(),
@@ -743,9 +1014,13 @@ pub async fn run<P: Provider>(
                     args: args.clone(),
                     kind: "client".into(),
                 });
-                let output = match tools.call(&call.name, &args).await {
-                    Ok(o) => o,
-                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                let output = match race_cancel(&cfg.cancel, tools.call(&call.name, &args)).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => json!({"error": e.to_string()}).to_string(),
+                    Err(()) => {
+                        interrupted = true;
+                        cancelled_tool_output()
+                    }
                 };
                 sink.emit(&AgentEvent::ToolFinished {
                     meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
@@ -753,6 +1028,12 @@ pub async fn run<P: Provider>(
                     name: call.name.clone(),
                     output: output.clone(),
                 });
+                if interrupted {
+                    let item = crate::vision::function_call_output(&call.call_id, &output, None);
+                    history.push(item.clone());
+                    pending.push(item);
+                    continue;
+                }
                 emit_file_changes(
                     sink,
                     &cfg.agent_name,
@@ -777,6 +1058,27 @@ pub async fn run<P: Provider>(
                     crate::vision::function_call_output(&call.call_id, &output, image_uri.as_deref());
                 history.push(item.clone());
                 pending.push(item);
+            }
+            if interrupted {
+                if !take_interrupt(
+                    &mut cfg,
+                    sink,
+                    &run_id,
+                    &last_text,
+                    &mut history,
+                    &mut pending,
+                )
+                .await
+                {
+                    return Ok(RunOutcome {
+                        run_id,
+                        text: last_text,
+                        turns: total_turns,
+                        cache_turns,
+                        compacted,
+                    });
+                }
+                turn = 0;
             }
             continue;
         }
@@ -921,6 +1223,7 @@ mod tests {
             workspace: PathBuf::from("."),
             images: Vec::new(),
             closed_backgrounds: None,
+            cancel: None,
         }
     }
 
@@ -1002,13 +1305,120 @@ mod tests {
         assert_eq!(calls[0].input[0]["content"], "what time?");
         assert_eq!(calls[0].cache_key, calls[1].cache_key);
         assert!(calls[0].cache_key.starts_with("grokaagent:v1:grok-4.6:"));
+        assert!(
+            calls[0].cache_key.ends_with(&format!(":{}", out.run_id)),
+            "{}",
+            calls[0].cache_key
+        );
         assert_eq!(calls[0].previous_response_id, None);
-        assert_eq!(calls[1].previous_response_id.as_deref(), Some("1"));
-        assert_eq!(calls[1].input.len(), 1);
-        assert_eq!(calls[1].input[0]["type"], "function_call_output");
-        let output = calls[1].input[0]["output"].as_str().unwrap();
+        assert_eq!(calls[1].previous_response_id, None);
+        assert!(
+            calls[1].input.len() > calls[0].input.len(),
+            "follow-up must resend the prefix plus the tool result, got {}",
+            calls[1].input.len()
+        );
+        assert_eq!(
+            calls[0].input[0], calls[1].input[0],
+            "input prefix must stay byte-identical so prompt cache can hit"
+        );
+        assert_eq!(calls[1].input.last().unwrap()["type"], "function_call_output");
+        let output = calls[1].input.last().unwrap()["output"].as_str().unwrap();
         assert!(output.contains("utc"), "{output}");
-        assert!(calls[0].store && calls[1].store);
+        assert!(!calls[0].store && !calls[1].store);
+        assert!(
+            calls[1]
+                .input
+                .iter()
+                .any(|i| i.get("type").and_then(Value::as_str) == Some("function_call")),
+            "function_call must be replayed in full history: {:?}",
+            calls[1].input
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_replays_encrypted_reasoning_in_the_prefix() {
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    function_calls: vec![FunctionCall {
+                        call_id: "c1".into(),
+                        name: "now".into(),
+                        arguments: "{}".into(),
+                    }],
+                    output_items: vec![
+                        json!({
+                            "type": "reasoning",
+                            "encrypted_content": "blob-turn-1",
+                            "summary": [{"type": "summary_text", "text": "check the clock"}]
+                        }),
+                        json!({
+                            "type": "function_call",
+                            "call_id": "c1",
+                            "name": "now",
+                            "arguments": "{}"
+                        }),
+                    ],
+                    ..CompleteResponse::new("1")
+                },
+                CompleteResponse {
+                    text: "late".into(),
+                    ..CompleteResponse::new("2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        run(&provider, &tools, &rec, cfg("what time?", 4))
+            .await
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls[0].input[0], calls[1].input[0]);
+        let reasoning = calls[1]
+            .input
+            .iter()
+            .find(|i| i.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("encrypted reasoning must stay in the prefix");
+        assert_eq!(reasoning["encrypted_content"], "blob-turn-1");
+        assert_eq!(
+            calls[1]
+                .input
+                .iter()
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
+                .count(),
+            1,
+            "must not duplicate the function_call item: {:?}",
+            calls[1].input
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_runs_get_separate_cache_keys() {
+        async fn one_run(id: &str) -> String {
+            let provider = Scripted {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(pop_front(vec![CompleteResponse {
+                    text: "ok".into(),
+                    ..CompleteResponse::new("1")
+                }])),
+                compact_calls: Mutex::new(Vec::new()),
+                compact_ok: false,
+            };
+            let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+            let rec = Rec(Mutex::new(Vec::new()));
+            let mut c = cfg("hi", 1);
+            c.run_id = id.into();
+            super::run(&provider, &tools, &rec, c).await.unwrap();
+            let key = provider.calls.lock().unwrap()[0].cache_key.clone();
+            key
+        }
+        let a = one_run("run-aaa").await;
+        let b = one_run("run-bbb").await;
+        assert!(a.ends_with(":run-aaa"), "{a}");
+        assert!(b.ends_with(":run-bbb"), "{b}");
+        assert_ne!(a, b);
     }
 
     #[tokio::test]
@@ -1186,7 +1596,12 @@ mod tests {
         assert_eq!(calls[0].input[0]["content"], "what next?");
         let first = calls[0].input[0].to_string();
         assert!(!first.contains("need A2A workers"), "{first}");
-        let output = calls[1].input[0]["output"].as_str().unwrap();
+        let output = calls[1]
+            .input
+            .iter()
+            .rev()
+            .find_map(|i| i.get("output").and_then(Value::as_str))
+            .expect("missing tool output");
         assert!(output.contains("need A2A workers"), "{output}");
         assert!(!ws.path().join("goal.md").exists());
     }
@@ -1558,7 +1973,12 @@ mod tests {
         let rec = Rec(Mutex::new(Vec::new()));
         run(&provider, &tools, &rec, cfg("x", 3)).await.unwrap();
         let calls = provider.calls.lock().unwrap();
-        let output = calls[1].input[0]["output"].as_str().unwrap();
+        let output = calls[1]
+            .input
+            .iter()
+            .rev()
+            .find_map(|i| i.get("output").and_then(Value::as_str))
+            .expect("missing tool output");
         assert!(output.contains("unknown tool"), "{output}");
     }
 
@@ -1622,10 +2042,27 @@ mod tests {
 
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
-        assert!(calls[1].client_tools.is_empty());
+        assert_eq!(calls[0].cache_key, calls[1].cache_key);
+        assert_eq!(calls[1].cache_key, calls[2].cache_key);
+        assert!(!calls[1].client_tools.is_empty());
         assert_eq!(calls[1].tool_choice.as_deref(), Some("none"));
         assert!(!calls[1].store);
-        assert_eq!(calls[1].previous_response_id.as_deref(), Some("1"));
+        assert_eq!(
+            calls[1].previous_response_id, None,
+            "memory-fold must not chain off the function-call response"
+        );
+        assert!(
+            calls[1].input.len() > 1,
+            "memory-fold must include the folded head, got {}",
+            calls[1].input.len()
+        );
+        assert_ne!(
+            calls[1].input[calls[1].input.len() - 2]
+                .get("type")
+                .and_then(Value::as_str),
+            Some("function_call"),
+            "fold must not follow function_call with the memory-ask user"
+        );
         let mem_ask = calls[1].input.last().unwrap()["content"].as_str().unwrap();
         assert!(mem_ask.contains(MEMORY_FOLD_MARK), "{mem_ask}");
         assert!(mem_ask.contains("not a new user task"), "{mem_ask}");
@@ -1650,6 +2087,225 @@ mod tests {
         );
         assert_eq!(calls[2].input.last().unwrap()["type"], "function_call_output");
         assert!(provider.compact_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lived_fold_closes_open_function_call_then_compacts() {
+        struct XaiShape {
+            inner: Scripted,
+        }
+        impl Provider for XaiShape {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                let fold = req.input.iter().any(|i| {
+                    i.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(MEMORY_FOLD_MARK))
+                });
+                if fold {
+                    let illegal = req.input.windows(2).any(|w| {
+                        w[0].get("type").and_then(Value::as_str) == Some("function_call")
+                            && w[1].get("role").and_then(Value::as_str) == Some("user")
+                    });
+                    self.inner.calls.lock().unwrap().push(req);
+                    if illegal {
+                        return Err(Error::Provider(
+                            "cannot follow a function_call with a new user message".into(),
+                        ));
+                    }
+                    return Ok(CompleteResponse {
+                        text: "## Original request\nship the kernel\n## Direction changes\nnone\n## Load-bearing facts\nkeep the ABI stable\n## Where you were\nporting the scheduler\n".into(),
+                        ..CompleteResponse::new("mem")
+                    });
+                }
+                self.inner.complete(req).await
+            }
+            async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+                self.inner.compact(req).await
+            }
+        }
+        let first = CompleteResponse {
+            function_calls: vec![FunctionCall {
+                call_id: "c1".into(),
+                name: "now".into(),
+                arguments: "{}".into(),
+            }],
+            usage: CacheUsage {
+                input_tokens: 60,
+                cached_tokens: 0,
+            },
+            output_items: vec![
+                json!({"role":"user","content":"pad-1"}),
+                json!({"role":"user","content":"pad-2"}),
+                json!({"role":"user","content":"pad-3"}),
+                json!({"role":"user","content":"pad-4"}),
+                json!({"type":"function_call","call_id":"orphan","name":"now","arguments":"{}"}),
+                json!({"role":"user","content":"keep-in-tail"}),
+                json!({"type":"function_call","call_id":"c1","name":"now","arguments":"{}"}),
+            ],
+            ..CompleteResponse::new("1")
+        };
+        let provider = XaiShape {
+            inner: Scripted {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(pop_front(vec![
+                    first,
+                    CompleteResponse {
+                        text: "done".into(),
+                        ..CompleteResponse::new("2")
+                    },
+                ])),
+                compact_calls: Mutex::new(Vec::new()),
+                compact_ok: false,
+            },
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut config = cfg("ship the kernel", 4);
+        config.context_window = 100;
+        config.compact_keep_recent = 2;
+        let out = run(&provider, &tools, &rec, config).await.unwrap();
+        assert_eq!(out.text, "done");
+        assert_eq!(out.compacted, 1);
+        let events = rec.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextCompacted { method, .. } if method == "lived"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice { message, .. } if message.contains("extractive")
+        )));
+        let calls = provider.inner.calls.lock().unwrap();
+        let fold = calls
+            .iter()
+            .find(|c| {
+                c.input.iter().any(|i| {
+                    i.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(MEMORY_FOLD_MARK))
+                })
+            })
+            .expect("fold request");
+        assert!(!fold.client_tools.is_empty());
+        assert_ne!(
+            fold.input[fold.input.len() - 2]
+                .get("type")
+                .and_then(Value::as_str),
+            Some("function_call")
+        );
+        assert!(fold.input.iter().any(|i| {
+            i.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && i.get("call_id").and_then(Value::as_str) == Some("orphan")
+        }));
+    }
+
+    #[tokio::test]
+    async fn lived_fold_retries_until_success() {
+        struct LivedWriteRetry {
+            inner: Scripted,
+            fold_attempts: Mutex<u32>,
+        }
+        impl Provider for LivedWriteRetry {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                let fold = req.input.iter().any(|i| {
+                    i.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(MEMORY_FOLD_MARK))
+                });
+                if fold {
+                    let n = {
+                        let mut g = self.fold_attempts.lock().unwrap();
+                        *g += 1;
+                        *g
+                    };
+                    self.inner.calls.lock().unwrap().push(req);
+                    if n == 1 {
+                        return Err(Error::Provider("lived write refused".into()));
+                    }
+                    return Ok(CompleteResponse {
+                        text: "## Original request\nship the kernel\n## Direction changes\nnone\n## Load-bearing facts\nkeep the ABI stable\n## Where you were\nporting the scheduler\n".into(),
+                        ..CompleteResponse::new("mem")
+                    });
+                }
+                self.inner.complete(req).await
+            }
+            async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+                self.inner.compact(req).await
+            }
+        }
+        let first = CompleteResponse {
+            function_calls: vec![FunctionCall {
+                call_id: "c1".into(),
+                name: "now".into(),
+                arguments: "{}".into(),
+            }],
+            usage: CacheUsage {
+                input_tokens: 60,
+                cached_tokens: 0,
+            },
+            output_items: vec![
+                json!({"role":"user","content":"pad-1"}),
+                json!({"role":"user","content":"pad-2"}),
+                json!({"role":"user","content":"pad-3"}),
+                json!({"role":"user","content":"pad-4"}),
+                json!({"role":"user","content":"pad-5"}),
+                json!({"type":"function_call","call_id":"c1","name":"now","arguments":"{}"}),
+            ],
+            ..CompleteResponse::new("1")
+        };
+        let provider = LivedWriteRetry {
+            inner: Scripted {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(pop_front(vec![
+                    first,
+                    CompleteResponse {
+                        text: "done".into(),
+                        ..CompleteResponse::new("2")
+                    },
+                ])),
+                compact_calls: Mutex::new(Vec::new()),
+                compact_ok: false,
+            },
+            fold_attempts: Mutex::new(0),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut config = cfg("ship the kernel", 4);
+        config.context_window = 100;
+        config.compact_keep_recent = 2;
+        let out = run(&provider, &tools, &rec, config).await.unwrap();
+        assert_eq!(out.text, "done");
+        assert_eq!(out.compacted, 1);
+        assert_eq!(*provider.fold_attempts.lock().unwrap(), 2);
+        let events = rec.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Notice { message, .. }
+                    if message.contains("壓縮重試") && message.contains("lived write refused")
+            )),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextCompacted { method, .. } if method == "lived"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice { message, .. }
+                if message.contains("略過") || message.contains("extractive")
+        )));
+        let calls = provider.inner.calls.lock().unwrap();
+        let work = calls.last().expect("working turn after compact");
+        assert!(
+            work.input.iter().any(|i| {
+                i.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(COMPACT_MARK))
+            }),
+            "must compact before the next working turn: {:?}",
+            work.input
+        );
     }
 
     #[tokio::test]
@@ -1702,10 +2358,14 @@ mod tests {
         assert_eq!(out.turns, 2);
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].previous_response_id.as_deref(), Some("resp_1"));
-        assert_eq!(calls[1].input.len(), 1);
-        assert_eq!(calls[1].input[0]["role"], "user");
-        assert_eq!(calls[1].input[0]["content"], "follow up");
+        assert_eq!(calls[1].previous_response_id, None);
+        assert!(calls[1].input.len() > 1);
+        assert_eq!(
+            calls[0].input[0], calls[1].input[0],
+            "follow-up user turn must keep the original prefix"
+        );
+        assert_eq!(calls[1].input.last().unwrap()["role"], "user");
+        assert_eq!(calls[1].input.last().unwrap()["content"], "follow up");
     }
 
     #[tokio::test]
@@ -1879,7 +2539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zdr_previous_response_retries_full_history_without_emitting_error() {
+    async fn working_turns_never_send_previous_response_id() {
         let provider = ChainThenZdr {
             calls: Mutex::new(Vec::new()),
         };
@@ -1890,23 +2550,80 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, "recovered");
         let calls = provider.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].previous_response_id, None);
-        assert_eq!(calls[0].store, true);
-        assert_eq!(calls[1].previous_response_id.as_deref(), Some("resp_1"));
-        assert_eq!(calls[2].previous_response_id, None);
+        assert!(!calls[0].store);
+        assert_eq!(calls[1].previous_response_id, None);
         assert!(
-            calls[2].input.len() > 1,
-            "retry must send full history, got {:?}",
-            calls[2].input
+            calls[1].input.len() > 1,
+            "working turns must resend full history, got {:?}",
+            calls[1].input
         );
+        assert_eq!(calls[0].input[0], calls[1].input[0]);
         assert!(
             !rec.0
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Error { .. })),
-            "recoverable ZDR 404 should not surface as a user error"
+            "working turns do not send previous_response_id, so ZDR 404 cannot fire"
         );
+    }
+
+    struct HangThenOk {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        calls: Mutex<u32>,
+    }
+
+    impl Provider for HangThenOk {
+        async fn complete(&self, _req: CompleteRequest) -> Result<CompleteResponse> {
+            let n = {
+                let mut g = self.calls.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            if n == 1 {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            Ok(CompleteResponse {
+                text: "after interrupt".into(),
+                ..CompleteResponse::new("2")
+            })
+        }
+
+        async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+            Err(Error::Provider("no compact".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_drops_in_flight_complete_and_pauses() {
+        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancelFlag::new();
+        let mut c = cfg("hang please", 4);
+        c.inbox = Some(rx);
+        c.cancel = Some(cancel.clone());
+        let provider = HangThenOk {
+            entered: Mutex::new(Some(entered_tx)),
+            calls: Mutex::new(0),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let run_h = tokio::spawn(async move { run(&provider, &tools, &rec, c).await });
+        entered_rx.await.expect("complete started");
+        cancel.trip();
+        tx.send(UserTurn::from("continue")).unwrap();
+        drop(tx);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), run_h)
+            .await
+            .expect("run must not hang after cancel")
+            .expect("join")
+            .expect("run ok");
+        assert_eq!(out.text, "after interrupt");
     }
 }

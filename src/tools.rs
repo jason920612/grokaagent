@@ -406,72 +406,73 @@ impl RunCommandTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Tool("command is required".into()))?;
-        let cwd = match args.get("cwd").and_then(Value::as_str) {
-            Some(p) if !p.is_empty() && p != "." => resolve_in_workspace(&self.workspace, p)?,
-            _ => self
-                .workspace
-                .canonicalize()
-                .map_err(|e| Error::Tool(format!("workspace not found: {e}")))?,
-        };
-        if !cwd.is_dir() {
-            return Err(Error::Tool("cwd is not a directory".into()));
-        }
-        shellguard::enforce(self.guard.as_ref(), command, &cwd.to_string_lossy()).await?;
-
-        let mut cmd = {
-            #[cfg(windows)]
-            {
-                let mut c = Command::new("cmd");
-                c.arg("/C").arg(command);
-                c
-            }
-            #[cfg(not(windows))]
-            {
-                let mut c = Command::new("sh");
-                c.arg("-c").arg(command);
-                c
-            }
-        };
-        cmd.current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        hide_window(&mut cmd);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| Error::Tool(format!("spawn failed: {e}")))?;
-        let timed = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await;
-        let (timed_out, output) = match timed {
-            Ok(Ok(o)) => (false, o),
-            Ok(Err(e)) => return Err(Error::Tool(format!("command failed: {e}"))),
-            Err(_) => {
-                return Ok(json!({
-                    "timed_out": true,
-                    "exit_code": null,
-                    "stdout": "",
-                    "stderr": "timed out after 60s",
-                    "files": []
-                })
-                .to_string());
-            }
-        };
-        let stdout = clip_text(&String::from_utf8_lossy(&output.stdout), 32 * 1024);
-        let stderr = clip_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024);
-        let git_cwd = cwd.clone();
-        let files = tokio::task::spawn_blocking(move || diff::git_file_changes(&git_cwd))
-            .await
-            .unwrap_or_else(|_| Vec::new());
-        Ok(json!({
-            "timed_out": timed_out,
-            "exit_code": output.status.code(),
-            "stdout": stdout,
-            "stderr": stderr,
-            "files": files
-        })
-        .to_string())
+        let cwd = args.get("cwd").and_then(Value::as_str);
+        run_workspace_command(&self.workspace, command, cwd, self.guard.as_ref()).await
     }
+}
+
+/// Workspace shell used by `run_command` and by `timer` when a command fires.
+pub(crate) async fn run_workspace_command(
+    workspace: &Path,
+    command: &str,
+    cwd: Option<&str>,
+    guard: Option<&Arc<dyn CommandReviewer>>,
+) -> Result<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(Error::Tool("command is required".into()));
+    }
+    let cwd = match cwd.map(str::trim).filter(|s| !s.is_empty() && *s != ".") {
+        Some(p) => resolve_in_workspace(workspace, p)?,
+        None => workspace
+            .canonicalize()
+            .map_err(|e| Error::Tool(format!("workspace not found: {e}")))?,
+    };
+    if !cwd.is_dir() {
+        return Err(Error::Tool("cwd is not a directory".into()));
+    }
+    shellguard::enforce(guard, command, &cwd.to_string_lossy()).await?;
+
+    let mut cmd = shell_command(command);
+    cmd.current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    hide_window(&mut cmd);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::Tool(format!("spawn failed: {e}")))?;
+    let timed = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await;
+    let (timed_out, output) = match timed {
+        Ok(Ok(o)) => (false, o),
+        Ok(Err(e)) => return Err(Error::Tool(format!("command failed: {e}"))),
+        Err(_) => {
+            return Ok(json!({
+                "timed_out": true,
+                "exit_code": null,
+                "stdout": "",
+                "stderr": "timed out after 60s",
+                "files": []
+            })
+            .to_string());
+        }
+    };
+    let stdout = clip_text(&String::from_utf8_lossy(&output.stdout), 32 * 1024);
+    let stderr = clip_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024);
+    let git_cwd = cwd.clone();
+    let files = tokio::task::spawn_blocking(move || diff::git_file_changes(&git_cwd))
+        .await
+        .unwrap_or_else(|_| Vec::new());
+    Ok(json!({
+        "timed_out": timed_out,
+        "exit_code": output.status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "files": files
+    })
+    .to_string())
 }
 
 impl ClientTool for RunCommandTool {

@@ -151,6 +151,24 @@ pub enum AgentEvent {
         name: String,
         detail: String,
     },
+    TimerStarted {
+        #[serde(flatten)]
+        meta: EventMeta,
+        name: String,
+        seconds: u64,
+        command: String,
+    },
+    TimerFired {
+        #[serde(flatten)]
+        meta: EventMeta,
+        name: String,
+        detail: String,
+    },
+    TimerCancelled {
+        #[serde(flatten)]
+        meta: EventMeta,
+        name: String,
+    },
     /// Kernel warning that must not go to stderr (TUI cursor sits in the composer).
     Notice {
         #[serde(flatten)]
@@ -204,6 +222,9 @@ impl AgentEvent {
             | Self::BackgroundStarted { meta, .. }
             | Self::BackgroundOutput { meta, .. }
             | Self::BackgroundExited { meta, .. }
+            | Self::TimerStarted { meta, .. }
+            | Self::TimerFired { meta, .. }
+            | Self::TimerCancelled { meta, .. }
             | Self::Notice { meta, .. }
             | Self::SessionNamed { meta, .. }
             | Self::AgentMessage { meta, .. }

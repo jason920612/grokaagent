@@ -214,6 +214,7 @@ async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
             inbox: None,
             images: Vec::new(),
             ask: None,
+            cancel: None,
         },
     )
     .await?;

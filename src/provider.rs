@@ -90,12 +90,14 @@ pub struct CompleteRequest {
     pub input: Vec<Value>,
     pub client_tools: Vec<ToolSpec>,
     pub server_tools: Vec<String>,
-    /// Sticky routing id. Must be stable across turns and across runs that
-    /// share the same instructions+tools+model, or cache hits stay near zero.
+    /// Sticky routing id. Must be stable for one conversation (run id), or
+    /// cache hits stay near zero. Do not share this across unrelated chats.
     pub cache_key: String,
-    /// Continue a stored Responses chain. When set, `input` is only the delta.
+    /// Continue a stored Responses chain. Working chat turns leave this unset
+    /// and resend the full append-only `input` so the prefix can cache.
     pub previous_response_id: Option<String>,
-    /// Inference turns store so `previous_response_id` can chain. Compact calls do not.
+    /// When true the server keeps the response for `previous_response_id`.
+    /// Working chat turns do not chain, so they send `store: false`.
     pub store: bool,
     pub reasoning_effort: ReasoningEffort,
     /// When false, omit `reasoning` — the selected model does not support it.
@@ -411,8 +413,9 @@ fn grok_client_version() -> String {
     std::env::var("GROKA_GROK_CLIENT_VERSION").unwrap_or_else(|_| GROK_CLIENT_VERSION_DEFAULT.into())
 }
 
-/// Grok Build defaults `store: false` for ZDR. This client does not: TUI/chat
-/// should chain with `previous_response_id`. Override with GROKA_CLIENT_MODE.
+/// Grok Build defaults `store: false` for ZDR. Chat turns also use `store:
+/// false` because they resend full history instead of chaining. Override with
+/// GROKA_CLIENT_MODE.
 fn grok_client_mode() -> String {
     std::env::var("GROKA_CLIENT_MODE").unwrap_or_else(|_| "interactive".into())
 }
@@ -846,15 +849,23 @@ pub fn parse_cache_usage(body: &Value) -> CacheUsage {
     }
 }
 
-/// Stable shard id so identical prefixes route to the same cache server.
+/// Sticky routing id for one conversation.
 ///
-/// Do not put run ids in this string. Changing tool order is normalized.
-pub fn prompt_cache_key(model: &str, client_tools: &[ToolSpec], server_tools: &[String]) -> String {
+/// `conversation` is the run/session id. Sharing one key across unrelated
+/// chats (omitting it) routes everyone to the same cache replica and evicts
+/// prefixes. Tool order is normalized. Changing the tool set or model still
+/// changes the key because those bytes sit in the request prefix.
+pub fn prompt_cache_key(
+    model: &str,
+    client_tools: &[ToolSpec],
+    server_tools: &[String],
+    conversation: &str,
+) -> String {
     let mut parts: Vec<String> = client_tools.iter().map(|t| t.name.clone()).collect();
     parts.extend(server_tools.iter().cloned());
     parts.sort();
     parts.dedup();
-    format!("grokaagent:v1:{model}:{}", parts.join(","))
+    format!("grokaagent:v1:{model}:{}:{conversation}", parts.join(","))
 }
 
 fn tools_json(client_tools: &[ToolSpec], server_tools: &[String]) -> Vec<Value> {
@@ -1058,14 +1069,17 @@ mod tests {
     fn cache_key_is_stable_and_order_independent() {
         use crate::tools::ClientTool;
         let a = vec![crate::tools::NowTool.spec()];
-        let k1 = prompt_cache_key("grok-4.6", &a, &[]);
-        let k2 = prompt_cache_key("grok-4.6", &a, &[]);
+        let k1 = prompt_cache_key("grok-4.6", &a, &[], "run_a");
+        let k2 = prompt_cache_key("grok-4.6", &a, &[], "run_a");
         assert_eq!(k1, k2);
-        assert!(k1.starts_with("grokaagent:v1:grok-4.6:now"));
-        assert_ne!(k1, prompt_cache_key("grok-4.5", &a, &[]));
-        let mixed = prompt_cache_key("grok-4.6", &a, &["web_search".into()]);
+        assert!(k1.starts_with("grokaagent:v1:grok-4.6:now:"));
+        assert!(k1.ends_with(":run_a"));
+        assert_ne!(k1, prompt_cache_key("grok-4.5", &a, &[], "run_a"));
+        assert_ne!(k1, prompt_cache_key("grok-4.6", &a, &[], "run_b"));
+        let mixed = prompt_cache_key("grok-4.6", &a, &["web_search".into()], "run_a");
         assert!(mixed.contains("now"));
         assert!(mixed.contains("web_search"));
+        assert!(mixed.ends_with(":run_a"));
     }
 
     #[test]
@@ -1140,7 +1154,7 @@ mod tests {
             input: vec![json!({"role":"user","content":"hi"})],
             client_tools: vec![],
             server_tools: vec![],
-            cache_key: prompt_cache_key("grok-4.6", &[], &[]),
+            cache_key: prompt_cache_key("grok-4.6", &[], &[], "run_a"),
             previous_response_id: None,
             store: true,
             reasoning_effort: ReasoningEffort::Xhigh,
@@ -1213,7 +1227,7 @@ mod tests {
         assert_eq!(payload["reasoning"]["effort"], "low");
         assert_ne!(
             payload["prompt_cache_key"],
-            prompt_cache_key("grok-4.6", &[], &[]),
+            prompt_cache_key("grok-4.6", &[], &[], "run_a"),
             "title calls must not share the chat cache key"
         );
         let input = payload["input"][0]["content"].as_str().unwrap();
@@ -1227,7 +1241,7 @@ mod tests {
             input: vec![json!({"role": "user", "content": "next"})],
             client_tools: vec![],
             server_tools: vec![],
-            cache_key: prompt_cache_key("grok-4.6", &[], &[]),
+            cache_key: prompt_cache_key("grok-4.6", &[], &[], "run_a"),
             previous_response_id: Some("resp_1".into()),
             store: true,
             reasoning_effort: ReasoningEffort::High,

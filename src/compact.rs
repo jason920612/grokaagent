@@ -5,8 +5,9 @@
 //! sparse on purpose: gaps are reconstructed with reasoning and common sense.
 //! Only the verbatim tail (short-term memory) stays complete.
 //!
-//! If that write fails, a local extractive gist is the fallback. The encrypted
-//! xAI `/responses/compact` blob is not used.
+//! There is no extractive fallback. The lived write is retried until it
+//! succeeds, or the user interrupts. The encrypted xAI
+//! `/responses/compact` blob is not used.
 
 use serde_json::{json, Value};
 
@@ -37,6 +38,7 @@ const MIN_LIVED_CHARS: usize = 40;
 const MAX_LATER: usize = 3;
 const MAX_ERRORS: usize = 2;
 const MAX_PATHS: usize = 5;
+const MAX_OPEN_TOOLS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactOutcome {
@@ -52,6 +54,7 @@ struct Harvest {
     direction: String,
     facts: String,
     where_were: String,
+    open_work: String,
 }
 
 pub fn context_window(model: &str) -> u32 {
@@ -99,6 +102,51 @@ pub fn split_head_tail(items: &[Value], keep_recent: usize) -> (&[Value], &[Valu
         }
     }
     items.split_at(cut)
+}
+
+/// Close unpaired `function_call` items so a new user message is legal.
+/// xAI rejects: "cannot follow a function_call with a new user message".
+pub fn close_fold_head(head: &[Value]) -> Vec<Value> {
+    let mut out = head.to_vec();
+    let mut open: Vec<String> = Vec::new();
+    for item in &out {
+        match item_type(item) {
+            "function_call" => {
+                if let Some(id) = call_id(item) {
+                    open.push(id.to_string());
+                }
+            }
+            "function_call_output" => {
+                if let Some(id) = call_id(item) {
+                    if let Some(pos) = open.iter().rposition(|x| x == id) {
+                        open.remove(pos);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for id in open {
+        out.push(json!({
+            "type": "function_call_output",
+            "call_id": id,
+            "output": "(folded into long-term memory)",
+        }));
+    }
+    while out.last().is_some_and(|i| item_type(i) == "function_call") {
+        out.pop();
+    }
+    out
+}
+
+/// Head plus the memory-ask user turn, legal as a Responses `input`.
+pub fn fold_input(head: &[Value], goal: &str) -> Vec<Value> {
+    let mut input = close_fold_head(head);
+    input.push(json!({
+        "role": "user",
+        "content": memory_ask(goal, previous_compact_text(head).as_deref()),
+    }));
+    input
 }
 
 fn tail_has_real_user(tail: &[Value]) -> bool {
@@ -186,6 +234,67 @@ fn item_text(item: &Value) -> String {
     String::new()
 }
 
+fn call_args(item: &Value) -> String {
+    item.get("arguments")
+        .map(|a| match a {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+fn call_label(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let mut paths = Vec::new();
+    collect_paths(&call_args(item), &mut paths);
+    match paths.first() {
+        Some(p) => format!("{name} {p}"),
+        None => name.to_string(),
+    }
+}
+
+/// Live thread sitting in `tail` (fallback: `head`). Last plan + last tools.
+/// A forgetful lived gist must not replace this with "shipped, add a new layer".
+fn open_work_from(head: &[Value], tail: &[Value]) -> String {
+    let from_tail = collect_open_work(tail);
+    if !section_empty(&from_tail) {
+        from_tail
+    } else {
+        collect_open_work(head)
+    }
+}
+
+fn collect_open_work(items: &[Value]) -> String {
+    let mut last_asst = String::new();
+    let mut tools: Vec<String> = Vec::new();
+    for item in items {
+        if is_assistant(item) {
+            let t = item_text(item);
+            if !t.is_empty() && !t.contains(COMPACT_MARK) && !t.contains(MEMORY_FOLD_MARK) {
+                last_asst = gist(&t, ASSISTANT_CHARS);
+            }
+        }
+        if item_type(item) == "function_call" {
+            tools.push(call_label(item));
+        }
+    }
+    let tools = take_last(&tools, MAX_OPEN_TOOLS);
+    let mut out = String::new();
+    if !section_empty(&last_asst) {
+        out = last_asst;
+    }
+    if !tools.is_empty() {
+        let line = format!("Last tools: {}", tools.join("; "));
+        if out.is_empty() {
+            out = line;
+        } else {
+            out.push('\n');
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -220,6 +329,7 @@ fn is_noise_user(text: &str) -> bool {
     t.starts_with(COMPACT_MARK)
         || t.starts_with(crate::background::EXIT_NOTICE_PREFIX)
         || t.starts_with(crate::background::CLOSED_NOTICE_PREFIX)
+        || t.starts_with(crate::timer::FIRED_NOTICE_PREFIX)
 }
 
 fn is_user(item: &Value) -> bool {
@@ -305,6 +415,7 @@ fn harvest_brief(text: &str, into: &mut Harvest) {
             "Where you were" | "Where you were before this fold" => {
                 set_if_present(&mut into.where_were, body)
             }
+            "Open work" => set_if_present(&mut into.open_work, body),
             "Errors to remember" | "Paths" => append_block(&mut into.facts, body),
             _ => {}
         }
@@ -350,6 +461,11 @@ fn merge_harvest(goal: &str, prev: &Harvest, new: &Harvest) -> Harvest {
         } else {
             prev.where_were.clone()
         },
+        open_work: if !section_empty(&new.open_work) {
+            new.open_work.clone()
+        } else {
+            prev.open_work.clone()
+        },
     }
 }
 
@@ -363,25 +479,27 @@ fn emit_section(title: &str, body: &str) -> String {
 
 fn emit_brief(h: &Harvest, lived: bool) -> String {
     let intro = if lived {
-        "This is sparse long-term memory written by you after living the older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n"
+        "This is sparse long-term memory written by you after living the older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense. Do not restart. Do not invent a different mission. Continue the open thread; do not start a new layer while Open work is unfinished.\n"
     } else {
-        "This is sparse long-term memory of older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense; pick the most plausible continuation, not a perfect replay. Do not restart. Do not invent a different mission.\n"
+        "This is sparse long-term memory of older turns — not a transcript and not a new user request.\nOnly key details are stored. Fill gaps with ordinary reasoning and common sense. Do not restart. Do not invent a different mission. Continue the open thread; do not start a new layer while Open work is unfinished.\n"
     };
-    let footer = "The items after this block are short-term memory. They are complete and authoritative for what you were doing just now. Continue from there.\n";
+    let footer = "Open work and the verbatim items after this block are the live thread. They outrank a polished status summary. Finish that thread before starting a new layer or system.\n";
     let orig = if section_empty(&h.original) {
         String::new()
     } else {
         h.original.trim().to_string()
     };
     let where_were = h.where_were.trim().to_string();
+    let mut open_work = h.open_work.trim().to_string();
     let mut direction = h.direction.clone();
     let mut facts = h.facts.clone();
     for _ in 0..8 {
         let out = format!(
-            "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}{}{}\n{footer}",
+            "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}{}{}{}\n{footer}",
             emit_section("Direction changes", &direction),
             emit_section("Load-bearing facts", &facts),
             emit_section("Where you were", &where_were),
+            emit_section("Open work", &open_work),
         );
         if out.chars().count() <= RENDER_CHARS {
             return out;
@@ -394,11 +512,16 @@ fn emit_brief(h: &Harvest, lived: bool) -> String {
             direction = gist(&direction, direction.chars().count().saturating_mul(2) / 3);
             continue;
         }
+        if open_work.chars().count() > 120 {
+            open_work = gist(&open_work, open_work.chars().count().saturating_mul(2) / 3);
+            continue;
+        }
         return out;
     }
     format!(
-        "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}\n{footer}",
+        "{COMPACT_MARK}\n{intro}\n## Original request\n{orig}\n{}{}\n{footer}",
         emit_section("Where you were", &where_were),
+        emit_section("Open work", &open_work),
     )
 }
 
@@ -504,6 +627,7 @@ pub fn extractive_brief(goal: &str, head: &[Value]) -> String {
         direction,
         facts,
         where_were,
+        open_work: collect_open_work(head),
     };
     emit_brief(&merge_harvest(&original, &prev, &new), false)
 }
@@ -540,7 +664,7 @@ fn splice_brief(brief: &str, tail: &[Value]) -> Vec<Value> {
 pub fn memory_ask(goal: &str, previous: Option<&str>) -> String {
     let original = clip_goal(goal);
     let mut ask = format!(
-        "{MEMORY_FOLD_MARK}\nThis is not a new user task. Do not call tools. Do not continue the work in this message.\n\nYou lived the older turns. Write sparse long-term memory for them. The most recent turns will stay verbatim as short-term memory — do not try to replace those.\n\nKeep only what YOU judge is:\n1. The original request (must remain): {original}\n2. Direction-changing or shocking events — a user constraint that rewrote the plan, a surprise, a failure that forced a new approach.\n3. Load-bearing facts that construct or support this task — decisions, invariants, paths, APIs you would need in order to reconstruct the work with reasoning. Not a transcript of every tool call.\n\nOmit routine reads, successful boilerplate, and anything the next you can guess from (1)–(3) plus common sense.\n\nWrite markdown with these headings only:\n## Original request\n## Direction changes\n## Load-bearing facts\n## Where you were\n\nIf a heading has nothing, write \"none\". Hard cap: 80 lines. No tool-call dump.\n"
+        "{MEMORY_FOLD_MARK}\nThis is not a new user task. Do not call tools. Do not continue the work in this message.\n\nYou lived the older turns. Write sparse long-term memory for them. The most recent turns will stay verbatim as short-term memory — do not try to replace those.\n\nKeep only what YOU judge is:\n1. The original request (must remain): {original}\n2. Direction-changing or shocking events — a user constraint that rewrote the plan, a surprise, a failure that forced a new approach.\n3. Load-bearing facts that construct or support this task — decisions, invariants, paths, APIs you would need in order to reconstruct the work with reasoning. Not a transcript of every tool call.\n4. Open work — the exact unfinished thread: last bug, last failed check, last screenshot finding, the next concrete action already in flight. If you were debugging, write the bug. Do not write that the work is ready so you can start a new layer.\n\nOmit routine reads, successful boilerplate, and anything the next you can guess from (1)–(4) plus common sense.\n\nWrite markdown with these headings only:\n## Original request\n## Direction changes\n## Load-bearing facts\n## Where you were\n## Open work\n\nIf a heading has nothing, write \"none\". Hard cap: 80 lines. No tool-call dump.\n"
     );
     if let Some(prev) = previous.map(str::trim).filter(|p| !p.is_empty()) {
         ask.push_str(
@@ -574,10 +698,10 @@ pub fn lived_brief_usable(text: &str) -> bool {
 /// Wrap the working model's own gist so later turns still see orientation rules.
 /// Previous compact sections are merged in so a forgetful rewrite cannot drop them.
 pub fn wrap_lived_brief(goal: &str, model_text: &str) -> String {
-    wrap_lived_brief_with(goal, model_text, &Harvest::default())
+    wrap_lived_brief_with(goal, model_text, &Harvest::default(), "")
 }
 
-fn wrap_lived_brief_with(goal: &str, model_text: &str, prev: &Harvest) -> String {
+fn wrap_lived_brief_with(goal: &str, model_text: &str, prev: &Harvest, open_work: &str) -> String {
     let body = strip_fences(model_text);
     let body = if let Some(rest) = body.split(COMPACT_MARK).last() {
         rest.trim().to_string()
@@ -600,7 +724,11 @@ fn wrap_lived_brief_with(goal: &str, model_text: &str, prev: &Harvest) -> String
     if section_empty(&incoming.where_were) && !body.contains("## ") {
         incoming.where_were.clear();
     }
-    emit_brief(&merge_harvest(goal, prev, &incoming), true)
+    let mut merged = merge_harvest(goal, prev, &incoming);
+    if !section_empty(open_work) {
+        merged.open_work = open_work.trim().to_string();
+    }
+    emit_brief(&merged, true)
 }
 
 /// Prefer `response.text`; if that is empty, scrape assistant/message output items.
@@ -633,25 +761,22 @@ pub fn compact_history(
     goal: &str,
     history: &[Value],
     keep_recent: usize,
-    lived: Option<&str>,
+    lived: &str,
 ) -> Result<CompactOutcome> {
     let (head, tail) = split_head_tail(history, keep_recent);
     if head.is_empty() {
         return Err(Error::Provider("nothing to compact".into()));
     }
+    if !lived_brief_usable(lived) {
+        return Err(Error::Provider("lived gist unusable".into()));
+    }
     let prev = harvest_from_head(head);
-    let (items, method) = match lived {
-        Some(text) if lived_brief_usable(text) => (
-            splice_brief(&wrap_lived_brief_with(goal, text, &prev), tail),
-            "lived",
-        ),
-        _ => (extractive_items(goal, head, tail), "local"),
-    };
+    let open = open_work_from(head, tail);
     Ok(CompactOutcome {
-        items,
+        items: splice_brief(&wrap_lived_brief_with(goal, lived, &prev, &open), tail),
         dropped: head.len(),
         kept: tail.len(),
-        method: method.into(),
+        method: "lived".into(),
     })
 }
 
@@ -722,7 +847,7 @@ mod tests {
         assert!(brief.contains(COMPACT_MARK));
         assert!(brief.contains("not a new user request"), "{brief}");
         assert!(brief.contains("not a transcript"), "{brief}");
-        assert!(brief.contains("most plausible"), "{brief}");
+        assert!(brief.contains("do not start a new layer"), "{brief}");
         assert!(!brief.contains("## Tools already used"), "{brief}");
         assert!(!brief.contains("\"type\":\"compaction\""), "{brief}");
     }
@@ -778,12 +903,14 @@ mod tests {
             user("real goal"),
             user("[background exited]\nname: dev"),
             user("[backgrounds closed]\nkilled"),
+            user("[timer fired]\nname: n1\nseconds: 5"),
             assistant("still on real goal"),
         ];
         let brief = extractive_brief("real goal", &head);
         assert!(brief.contains("real goal"), "{brief}");
         assert!(!brief.contains("[background exited]"), "{brief}");
         assert!(!brief.contains("[backgrounds closed]"), "{brief}");
+        assert!(!brief.contains("[timer fired]"), "{brief}");
         assert!(brief.contains("still on real goal"), "{brief}");
     }
 
@@ -811,8 +938,68 @@ mod tests {
         assert!(second.contains("Writing the sqlite tests now."), "{second}");
     }
 
+    fn fold_has_no_function_call_then_user(input: &[Value]) -> bool {
+        input.windows(2).all(|w| {
+            !(item_type(&w[0]) == "function_call"
+                && w[1].get("role").and_then(Value::as_str) == Some("user"))
+        })
+    }
+
     #[test]
-    fn compact_history_is_local_readable_brief_plus_raw_tail() {
+    fn fold_input_does_not_follow_function_call_with_user() {
+        let trailing = vec![user("goal"), tool("c1", "now", "{}")];
+        assert!(
+            !fold_has_no_function_call_then_user(&[
+                trailing[0].clone(),
+                trailing[1].clone(),
+                json!({"role":"user","content":"ask"}),
+            ]),
+            "sanity: raw head+ask is the illegal xAI shape"
+        );
+        let input = fold_input(&trailing, "goal");
+        assert!(
+            fold_has_no_function_call_then_user(&input),
+            "fold must not send function_call then user: {input:?}"
+        );
+        assert_eq!(input.last().unwrap()["role"], "user");
+        assert!(input.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains(MEMORY_FOLD_MARK));
+        assert!(input.iter().any(|i| {
+            item_type(i) == "function_call_output" && call_id(i) == Some("c1")
+        }));
+
+        let parallel = vec![
+            user("goal"),
+            tool("a", "now", "{}"),
+            tool("b", "now", "{}"),
+            tool_out("b", "ok"),
+        ];
+        let input = fold_input(&parallel, "goal");
+        assert!(
+            fold_has_no_function_call_then_user(&input),
+            "{input:?}"
+        );
+        assert!(input.iter().any(|i| {
+            item_type(i) == "function_call_output" && call_id(i) == Some("a")
+        }));
+    }
+
+    #[test]
+    fn fold_input_leaves_closed_head_alone() {
+        let head = vec![
+            user("goal"),
+            tool("c1", "now", "{}"),
+            tool_out("c1", "ok"),
+        ];
+        let input = fold_input(&head, "goal");
+        assert_eq!(input.len(), head.len() + 1);
+        assert_eq!(input[input.len() - 2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn extractive_is_readable_brief_plus_raw_tail() {
         let history = vec![
             user("build the kernel"),
             user("old-1"),
@@ -823,10 +1010,10 @@ mod tests {
             user("recent-a"),
             user("recent-b"),
         ];
-        let out = compact_history("build the kernel", &history, 2, None).unwrap();
-        assert_eq!(out.method, "local");
-        assert_ne!(out.items[0].get("type").and_then(Value::as_str), Some("compaction"));
-        let brief = out.items[0]["content"].as_str().unwrap();
+        let (head, tail) = split_head_tail(&history, 2);
+        let items = extractive_items("build the kernel", head, tail);
+        assert_ne!(items[0].get("type").and_then(Value::as_str), Some("compaction"));
+        let brief = items[0]["content"].as_str().unwrap();
         assert!(brief.contains("build the kernel"), "{brief}");
         assert!(brief.contains("porting the scheduler next"), "{brief}");
         assert!(
@@ -837,23 +1024,23 @@ mod tests {
             !brief.contains("old-1"),
             "older later turns should fade into reconstruction: {brief}"
         );
-        assert_eq!(out.items[out.items.len() - 1]["content"], "recent-b");
+        assert_eq!(items[items.len() - 1]["content"], "recent-b");
         assert!(
-            out.items
+            items
                 .iter()
                 .any(|i| i.get("content") == Some(&json!("recent-a"))),
             "{:?}",
-            out.items
+            items
         );
     }
 
     #[test]
     fn missing_goal_falls_back_to_first_real_user() {
         let history: Vec<Value> = (0..10).map(|i| user(&format!("m{i}"))).collect();
-        let out = compact_history("ship compact", &history, 3, None).unwrap();
-        assert_eq!(out.method, "local");
-        assert!(out.items[0]["content"].as_str().unwrap().contains("ship compact"));
-        assert_eq!(out.items.last().unwrap()["content"], "m9");
+        let (head, tail) = split_head_tail(&history, 3);
+        let items = extractive_items("ship compact", head, tail);
+        assert!(items[0]["content"].as_str().unwrap().contains("ship compact"));
+        assert_eq!(items.last().unwrap()["content"], "m9");
     }
 
     #[test]
@@ -865,6 +1052,8 @@ mod tests {
         assert!(ask.contains("ship the kernel"), "{ask}");
         assert!(ask.contains("Direction changes"), "{ask}");
         assert!(ask.contains("Load-bearing facts"), "{ask}");
+        assert!(ask.contains("Open work"), "{ask}");
+        assert!(ask.contains("unfinished thread"), "{ask}");
     }
 
     #[test]
@@ -877,7 +1066,7 @@ mod tests {
         assert!(brief.contains("build a cli"), "{brief}");
         assert!(brief.contains("use sqlite, not json"), "{brief}");
         assert!(brief.contains("not a new user request"), "{brief}");
-        assert!(brief.contains("short-term memory"), "{brief}");
+        assert!(brief.contains("live thread"), "{brief}");
     }
 
     #[test]
@@ -890,7 +1079,7 @@ mod tests {
             user("recent-b"),
         ];
         let lived = "## Original request\nbuild a cli\n## Direction changes\nuse sqlite, not json files\n## Load-bearing facts\nsrc/db.rs is the store\n## Where you were\nwriting the sqlite tests\n";
-        let out = compact_history("build a cli", &history, 2, Some(lived)).unwrap();
+        let out = compact_history("build a cli", &history, 2, lived).unwrap();
         assert_eq!(out.method, "lived");
         let brief = out.items[0]["content"].as_str().unwrap();
         assert!(brief.contains("use sqlite, not json files"), "{brief}");
@@ -903,11 +1092,38 @@ mod tests {
     }
 
     #[test]
-    fn unusable_lived_text_falls_back_to_extractive() {
+    fn compact_pins_open_work_when_lived_gist_declares_ready() {
+        let history = vec![
+            user("build a racing game"),
+            user("pad-a"),
+            user("pad-b"),
+            user("pad-c"),
+            assistant("Title screen is up, but it's still on LOADING — check the console."),
+            tool("c1", "screenshot", "{}"),
+            tool_out("c1", "ok"),
+        ];
+        let lived = "## Original request\nbuild a racing game\n## Direction changes\nnone\n## Load-bearing facts\nHarbor Ridge exists\n## Where you were\nGame booted. Add harbor water next.\n## Open work\nnone\n";
+        let out = compact_history("build a racing game", &history, 3, lived).unwrap();
+        let brief = out.items[0]["content"].as_str().unwrap();
+        assert!(brief.contains("## Open work"), "{brief}");
+        assert!(brief.contains("LOADING"), "{brief}");
+        assert!(brief.contains("screenshot"), "{brief}");
+        assert!(
+            brief.contains("do not start a new layer"),
+            "orientation must forbid abandoning the thread: {brief}"
+        );
+        assert!(
+            brief.contains("outrank a polished status summary"),
+            "{brief}"
+        );
+        assert!(brief.contains("Game booted"), "{brief}");
+    }
+
+    #[test]
+    fn unusable_lived_text_does_not_compact() {
         let history: Vec<Value> = (0..8).map(|i| user(&format!("m{i}"))).collect();
-        let out = compact_history("ship it", &history, 2, Some("ok")).unwrap();
-        assert_eq!(out.method, "local");
-        assert!(out.items[0]["content"].as_str().unwrap().contains("ship it"));
+        let err = compact_history("ship it", &history, 2, "ok").unwrap_err();
+        assert!(err.to_string().contains("unusable"), "{err}");
     }
 
     #[test]
@@ -935,7 +1151,7 @@ mod tests {
             user("recent"),
         ];
         let forgetful = "## Original request\nbuild a cli\n## Direction changes\nnone\n## Load-bearing facts\nnone\n## Where you were\nadding tests now\n";
-        let out = compact_history("build a cli", &history, 1, Some(forgetful)).unwrap();
+        let out = compact_history("build a cli", &history, 1, forgetful).unwrap();
         assert_eq!(out.method, "lived");
         let brief = out.items[0]["content"].as_str().unwrap();
         assert!(brief.contains("use sqlite, not json files"), "{brief}");
@@ -944,14 +1160,13 @@ mod tests {
     }
 
     #[test]
-    fn extractive_fallback_after_lived_keeps_lived_sections() {
+    fn extractive_reconsolidates_previous_lived_sections() {
         let mut history = vec![user(&lived_gist())];
         for i in 0..6 {
             history.push(user(&format!("pad-{i}")));
         }
-        let out = compact_history("build a cli", &history, 2, Some("ok")).unwrap();
-        assert_eq!(out.method, "local");
-        let brief = out.items[0]["content"].as_str().unwrap();
+        let (head, _) = split_head_tail(&history, 2);
+        let brief = extractive_brief("build a cli", head);
         assert!(brief.contains("use sqlite, not json files"), "{brief}");
         assert!(brief.contains("src/db.rs is the store"), "{brief}");
     }
