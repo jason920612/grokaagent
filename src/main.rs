@@ -21,6 +21,8 @@ struct Cli {
 enum Command {
     /// Copy this binary to ~/.cargo/bin so `grokaagent` works from any directory.
     Install,
+    /// Download the latest GitHub Release and replace this binary.
+    Update,
     /// Sign in to xAI with the device-code OAuth flow.
     Login,
     /// Delete the saved xAI OAuth tokens.
@@ -96,8 +98,23 @@ async fn main() {
     }
 }
 
+fn wants_auto_update(cmd: &Option<Command>) -> bool {
+    matches!(cmd, None | Some(Command::Tui { .. }))
+}
+
 async fn real_main() -> grokaagent::Result<()> {
+    grokaagent::install::cleanup_old_exe();
     let cli = Cli::parse();
+    if wants_auto_update(&cli.command) {
+        match grokaagent::update::auto_update().await {
+            grokaagent::update::Outcome::Updated { from, to } => {
+                eprintln!("updated grokaagent {from} -> {to}; relaunching");
+                grokaagent::update::reexec()?;
+            }
+            grokaagent::update::Outcome::UpToDate { .. }
+            | grokaagent::update::Outcome::Skipped { .. } => {}
+        }
+    }
     let auth_path = auth::default_auth_path()?;
     match cli.command {
         None => {
@@ -122,6 +139,19 @@ async fn real_main() -> grokaagent::Result<()> {
                     "add this directory to PATH, then open a new terminal:\n  {}",
                     bin_dir.display()
                 );
+            }
+        }
+        Some(Command::Update) => {
+            match grokaagent::update::update_now().await? {
+                grokaagent::update::Outcome::Updated { from, to } => {
+                    println!("updated {from} -> {to}");
+                }
+                grokaagent::update::Outcome::UpToDate { version } => {
+                    println!("already up to date ({version})");
+                }
+                grokaagent::update::Outcome::Skipped { reason } => {
+                    println!("update skipped: {reason}");
+                }
             }
         }
         Some(Command::Login) => {

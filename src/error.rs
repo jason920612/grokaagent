@@ -10,6 +10,8 @@ pub enum Error {
     Tool(String),
     #[error("{0}")]
     A2a(String),
+    #[error("{0}")]
+    Update(String),
     #[error("empty prompt")]
     EmptyPrompt,
     #[error("max turns ({0}) reached")]

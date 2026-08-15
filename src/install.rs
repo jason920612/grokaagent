@@ -33,31 +33,90 @@ pub fn dest_path(bin_dir: &Path) -> PathBuf {
     bin_dir.join(exe_name())
 }
 
+/// Release-installer location (`~/.grokaagent/bin`), not Cargo's bin dir.
+pub fn release_bin_dir() -> Result<PathBuf> {
+    release_bin_dir_from(dirs::home_dir())
+}
+
+pub fn release_bin_dir_from(home: Option<PathBuf>) -> Result<PathBuf> {
+    let home = home.ok_or_else(|| Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot resolve home directory",
+    )))?;
+    Ok(home.join(".grokaagent").join("bin"))
+}
+
 pub fn path_contains(dir: &Path) -> bool {
     let want = canonicalize_or_clone(dir);
     env::split_paths(&env::var_os("PATH").unwrap_or_default()).any(|p| canonicalize_or_clone(&p) == want)
 }
 
-pub fn install_exe(src: &Path, dest_dir: &Path) -> Result<PathBuf> {
+pub fn old_sidecar(path: &Path) -> PathBuf {
+    match path.file_name() {
+        Some(name) => path.with_file_name(format!("{}.old", name.to_string_lossy())),
+        None => path.with_extension("old"),
+    }
+}
+
+/// Drop the Windows leftover from a previous self-replace (`grokaagent.exe.old`).
+pub fn cleanup_old_exe() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let _ = fs::remove_file(old_sidecar(&exe));
+}
+
+/// Replace `dest` with `src`. On Windows, a running destination is renamed aside
+/// first so the new file can take its name.
+pub fn replace_exe(src: &Path, dest: &Path) -> Result<PathBuf> {
+    if same_file(src, dest) {
+        return Ok(dest.to_path_buf());
+    }
+    let dest_dir = dest.parent().ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        ))
+    })?;
     fs::create_dir_all(dest_dir)?;
-    let dest = dest_path(dest_dir);
-    if same_file(src, &dest) {
-        return Ok(dest);
-    }
     let tmp = dest_dir.join(format!(".grokaagent-{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&tmp);
     fs::copy(src, &tmp)?;
-    if let Err(e) = fs::rename(&tmp, &dest) {
-        if let Err(copy_err) = fs::copy(&tmp, &dest) {
-            let _ = fs::remove_file(&tmp);
-            return Err(copy_err.into());
-        }
-        let _ = fs::remove_file(&tmp);
-        if dest.exists() {
-            return Ok(dest);
-        }
-        return Err(e.into());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     }
-    Ok(dest)
+    let old = old_sidecar(dest);
+    let mut parked = false;
+    if dest.exists() {
+        let _ = fs::remove_file(&old);
+        if fs::rename(dest, &old).is_ok() {
+            parked = true;
+        }
+    }
+    let put = fs::rename(&tmp, dest).or_else(|_| {
+        fs::copy(&tmp, dest).map(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+    });
+    match put {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp);
+            Ok(dest.to_path_buf())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            if parked {
+                let _ = fs::rename(&old, dest);
+            }
+            Err(e.into())
+        }
+    }
+}
+
+pub fn install_exe(src: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    replace_exe(src, &dest_path(dest_dir))
 }
 
 pub fn install_current_exe() -> Result<PathBuf> {
@@ -101,6 +160,19 @@ mod tests {
     }
 
     #[test]
+    fn release_bin_is_under_home_grokaagent() {
+        let home = PathBuf::from("home").join("x");
+        let dir = release_bin_dir_from(Some(home.clone())).unwrap();
+        assert_eq!(dir, home.join(".grokaagent").join("bin"));
+    }
+
+    #[test]
+    fn old_sidecar_keeps_full_file_name() {
+        let dest = PathBuf::from("bin").join("grokaagent.exe");
+        assert_eq!(old_sidecar(&dest), PathBuf::from("bin").join("grokaagent.exe.old"));
+    }
+
+    #[test]
     fn install_exe_copies_into_bin_dir() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("built");
@@ -135,5 +207,20 @@ mod tests {
         let out = install_exe(&dest, &dest_dir).unwrap();
         assert_eq!(out, dest);
         assert_eq!(fs::read(&dest).unwrap(), b"same");
+    }
+
+    #[test]
+    fn replace_exe_overwrites_and_leaves_old_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("grokaagent-bin");
+        fs::write(&dest, b"v1").unwrap();
+        let src = dir.path().join("next");
+        fs::write(&src, b"v2").unwrap();
+        replace_exe(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"v2");
+        let old = old_sidecar(&dest);
+        if old.exists() {
+            assert_eq!(fs::read(&old).unwrap(), b"v1");
+        }
     }
 }

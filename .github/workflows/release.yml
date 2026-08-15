@@ -1,0 +1,117 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: grokaagent.exe
+            asset: grokaagent-x86_64-pc-windows-msvc.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: grokaagent
+            asset: grokaagent-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: grokaagent
+            asset: grokaagent-aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux screenshot/clipboard libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+      - name: Test
+        run: cargo test --lib --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/release/${{ matrix.bin }}"
+          if [ "${{ runner.os }}" != "Windows" ] && command -v strip >/dev/null; then
+            strip "$bin" || true
+          fi
+          cp "$bin" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Stage assets
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          cargo_ver=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          if [ "$ver" != "$cargo_ver" ]; then
+            echo "tag $tag does not match Cargo.toml version $cargo_ver" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          find artifacts -type f -print -exec cp {} dist/ \;
+          cp install.sh install.ps1 dist/
+          chmod +x dist/install.sh dist/grokaagent-x86_64-unknown-linux-gnu dist/grokaagent-aarch64-apple-darwin
+          (
+            cd dist
+            sha256sum grokaagent-* install.sh install.ps1 > SHA256SUMS
+            ls -la
+            cat SHA256SUMS
+          )
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: grokaagent ${{ github.ref_name }}
+          generate_release_notes: true
+          append_body: true
+          files: dist/*
+          body: |
+            ## Install
+
+            **Windows (amd64)** — PowerShell:
+
+            ```powershell
+            irm https://github.com/jason920612/grokaagent/releases/latest/download/install.ps1 | iex
+            ```
+
+            **Linux (amd64) / macOS (Apple Silicon)**:
+
+            ```sh
+            curl -fsSL https://github.com/jason920612/grokaagent/releases/latest/download/install.sh | sh
+            ```
+
+            Then open a project directory and run `grokaagent`. The TUI checks GitHub Releases on startup and self-updates; `grokaagent update` does the same on demand.
+
+            ## Assets
+
+            - `grokaagent-x86_64-pc-windows-msvc.exe`
+            - `grokaagent-x86_64-unknown-linux-gnu`
+            - `grokaagent-aarch64-apple-darwin`
+            - `SHA256SUMS`
