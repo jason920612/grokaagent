@@ -24,7 +24,7 @@ curl -fsSL https://github.com/jason920612/grokaagent/releases/latest/download/in
 grokaagent
 ```
 
-目前發佈的平台：Windows amd64、Linux amd64、macOS arm64。可用 `GROKA_INSTALL_DIR` 改安裝路徑。
+目前發佈的平台：Windows amd64、Linux amd64、macOS arm64。可用 `GROKA_INSTALL_DIR` 改安裝路徑。Linux 截圖功能需要系統上的 PipeWire（多數桌面發行版已有）。
 
 ## 自動更新
 

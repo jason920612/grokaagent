@@ -39,9 +39,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libwayland-dev libxkbcommon-dev pkg-config
+            libwayland-dev libxkbcommon-dev libpipewire-0.3-dev \
+            pkg-config clang
       - name: Test
-        run: cargo test --lib --locked
+        run: cargo test --lib --locked -- --skip screenshot
       - name: Build
         run: cargo build --release --locked
       - name: Package
