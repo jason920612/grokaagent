@@ -14,7 +14,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::{FutureExt, StreamExt};
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -1221,7 +1221,12 @@ struct App {
     area: Rect,
     streaming: bool,
     composer_inner: Rect,
+    composer_frame: Rect,
+    composer_snap: Option<Buffer>,
     header_bar: Rect,
+    /// On-screen think-header rows whose clocks can be patched without redrawing chat or composer.
+    think_clocks: Vec<(usize, Rect)>,
+    last_clock_cells: Vec<(u16, u16, Cell)>,
     last_caret: Position,
     chat_inner: Rect,
     chat_bar: Rect,
@@ -3025,11 +3030,11 @@ fn tool_started_line(name: &str, args: &Value) -> String {
         }
         "project_memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            if path.is_empty() {
+            let target = file_tool_target(name, args);
+            if target.is_empty() || target == "." {
                 format!("▸ project_memory  {action}")
             } else {
-                format!("▸ project_memory  {action}  {path}")
+                format!("▸ project_memory  {action}  {target}")
             }
         }
         "spawn_agent" => {
@@ -3157,11 +3162,11 @@ fn live_tool_activity(name: &str, args: &Value, phase: &str) -> String {
         }
         "project_memory" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            if path.is_empty() {
+            let target = file_tool_target(name, args);
+            if target.is_empty() || target == "." {
                 format!("{phase}  project_memory  {action}")
             } else {
-                format!("{phase}  project_memory  {action}  {path}")
+                format!("{phase}  project_memory  {action}  {target}")
             }
         }
         _ => format!("{phase}  {name}"),
@@ -3228,6 +3233,8 @@ struct ChatLine {
     graphic: Option<(String, u16, u16)>,
     /// Selectable text: transcript row + char offset of this logical line.
     select: Option<(usize, usize)>,
+    /// Live think-header row: clock ticks patch this line only.
+    clock: bool,
 }
 
 fn chat_line(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
@@ -3237,6 +3244,7 @@ fn chat_line(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
         wrap: true,
         graphic: None,
         select: None,
+        clock: false,
     }
 }
 
@@ -3247,6 +3255,7 @@ fn chat_line_sel(line: Line<'static>, hit: Option<Hit>, row: usize, start: usize
         wrap: true,
         graphic: None,
         select: Some((row, start)),
+        clock: false,
     }
 }
 
@@ -3257,6 +3266,7 @@ fn chat_line_raw(line: Line<'static>, hit: Option<Hit>) -> ChatLine {
         wrap: false,
         graphic: None,
         select: None,
+        clock: false,
     }
 }
 
@@ -3267,6 +3277,7 @@ fn chat_graphic(rel: String, width: u16, height: u16, hit: Option<Hit>) -> ChatL
         wrap: false,
         graphic: Some((rel, width.max(1), height.max(1))),
         select: None,
+        clock: false,
     }
 }
 
@@ -3356,7 +3367,9 @@ fn chat_logical_rows(app: &mut App, cols: u16) -> Vec<ChatLine> {
                 }
             }
             Row::Think(t) => {
-                out.push(chat_line(think_header_line(t), Some(Hit::Think(ri))));
+                let mut header = chat_line_raw(think_header_line(t), Some(Hit::Think(ri)));
+                header.clock = !t.done;
+                out.push(header);
                 if t.expanded {
                     for line in think_body_lines(t) {
                         out.push(chat_line(line, Some(Hit::Think(ri))));
@@ -3551,14 +3564,10 @@ fn think_header_line(t: &Think) -> Line<'static> {
             .map(|s| s.elapsed().as_millis() as u64)
             .unwrap_or(t.elapsed_ms)
     };
-    let clock = if ms > 0 || !t.done {
-        format!("  {}", md::fmt_duration(ms))
-    } else {
-        String::new()
-    };
+    let clock = md::fmt_duration_field(ms);
     let status = if t.done { "完成" } else { "進行中" };
     Line::from(Span::styled(
-        format!("{arrow} 思考{clock}    {status}"),
+        format!("{arrow} 思考  {clock}    {status}"),
         Style::default().fg(THINK),
     ))
 }
@@ -4193,7 +4202,6 @@ fn pulse_spinner(app: &mut App) {
 
 fn header_pulse_ok(app: &App) -> bool {
     app.running
-        && app.header_bar.width > 0
         && app.image_view.is_none()
         && app.inspector.is_none()
         && app.workspace_pick.is_none()
@@ -4202,19 +4210,16 @@ fn header_pulse_ok(app: &App) -> bool {
         && app.settings.as_ref().is_none_or(|s| s.minimized)
 }
 
-/// Hardware cursor on an empty running composer sits on the placeholder and
-/// blinks every redraw. Overlays and a typed draft still need it.
+/// IME composition is drawn at the hardware cursor, so it must stay inside
+/// the composer even while the model is working.
 fn want_hardware_cursor(app: &App) -> bool {
-    if app.workspace_pick.is_some()
+    app.workspace_pick.is_some()
         || app.ask.is_some()
         || app.skill_view.is_some()
         || app.focus == Focus::Rename
         || (app.focus == Focus::Settings && app.settings.as_ref().is_some_and(|s| !s.minimized))
         || app.queue_edit.is_some()
-    {
-        return true;
-    }
-    !(app.running && app.edit.is_empty())
+        || app.focus == Focus::Chat
 }
 
 fn begin_login(app: &mut App) {
@@ -4421,7 +4426,12 @@ fn win_rect(w: &Win, area: Rect) -> Rect {
     Rect::new(x, y, w.w.min(area.width.saturating_sub(x)), w.h.min(area.height.saturating_sub(y)))
 }
 
+#[cfg(test)]
 fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
+    draw_ui(f, app, opts, false)
+}
+
+fn draw_ui(f: &mut Frame, app: &mut App, opts: &TuiOptions, freeze_composer: bool) -> Position {
     app.hits.clear();
     app.chat_glyphs.clear();
     app.graphic_blits.clear();
@@ -4443,15 +4453,21 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
         rename_caret = draw_sidebar(f, app, cols[0]);
     }
     let rest = cols[1];
+    let rest_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(6)])
+        .split(rest);
+    let header = rest_rows[0];
+    let below = rest_rows[1];
     let rail_w = if app.has_side() && f.area().width >= RAIL_MIN_TERM {
-        RAIL_W.min(rest.width.saturating_sub(24))
+        RAIL_W.min(below.width.saturating_sub(24))
     } else {
         0
     };
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(rail_w)])
-        .split(rest);
+        .split(below);
     let main = body[0];
 
     let qn = app.queue.len().min(5);
@@ -4459,17 +4475,26 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(composer_height(qn, attach)),
         ])
         .split(main);
 
-    draw_header(f, app, opts, chunks[0]);
-    let tool_hits = draw_chat(f, app, chunks[1]);
-    draw_tool_panel(f, app, chunks[1], &tool_hits);
-    draw_jump_bottom(f, app, chunks[1]);
-    let composer_caret = draw_composer(f, app, opts, chunks[2]);
+    draw_header(f, app, opts, header);
+    let tool_hits = draw_chat(f, app, chunks[0]);
+    draw_tool_panel(f, app, chunks[0], &tool_hits);
+    draw_jump_bottom(f, app, chunks[0]);
+    app.composer_frame = chunks[1];
+    let composer_caret = if freeze_composer && composer_snap_matches(app) {
+        if let Some(snap) = &app.composer_snap {
+            copy_rect(snap, f.buffer_mut(), app.composer_frame);
+        }
+        app.last_caret
+    } else {
+        let caret = draw_composer(f, app, opts, chunks[1]);
+        app.composer_snap = Some(clone_rect(f.buffer_mut(), app.composer_frame));
+        caret
+    };
     let mut caret = composer_caret;
     if app.focus == Focus::Rename {
         if let Some(pos) = rename_caret {
@@ -4479,7 +4504,7 @@ fn draw(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Position {
     let settings_visible = app.settings.as_ref().is_some_and(|s| !s.minimized);
     let settings_min = app.settings.as_ref().is_some_and(|s| s.minimized);
     if settings_min {
-        let dock = Rect::new(chunks[0].x.saturating_add(18), chunks[0].y, 12, 1);
+        let dock = Rect::new(header.x.saturating_add(18), header.y, 12, 1);
         f.render_widget(
             Paragraph::new(Span::styled(" 設定 ", Style::default().bg(COMPOSER).fg(ACCENT))),
             dock,
@@ -5028,10 +5053,12 @@ fn header_copy(app: &App, opts: &TuiOptions) -> (String, String) {
         } else {
             app.activity.clone()
         };
-        let clock = app
-            .work_started
-            .map(|t| format!("  {}", md::fmt_duration(t.elapsed().as_millis() as u64)))
-            .unwrap_or_default();
+        let clock = format!(
+            "  {}",
+            app.work_started
+                .map(|t| md::fmt_duration_field(t.elapsed().as_millis() as u64))
+                .unwrap_or_else(|| " ".repeat(md::DURATION_FIELD))
+        );
         format!(
             " grokaagent  {} {}{}  · {}  Esc 中斷  {}{}",
             spinner(app.tick),
@@ -5094,29 +5121,179 @@ fn render_header_buffer(app: &App, opts: &TuiOptions, area: Rect) -> Buffer {
     buf
 }
 
-fn paint_header_pulse(
+fn copy_rect(src: &Buffer, dest: &mut Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let pos = Position { x, y };
+            let Some(cell) = src.cell(pos) else {
+                continue;
+            };
+            if let Some(out) = dest.cell_mut(pos) {
+                *out = cell.clone();
+            }
+        }
+    }
+}
+
+fn clone_rect(src: &Buffer, area: Rect) -> Buffer {
+    let mut dest = Buffer::empty(area);
+    copy_rect(src, &mut dest, area);
+    dest
+}
+
+fn composer_snap_matches(app: &App) -> bool {
+    app.composer_snap
+        .as_ref()
+        .is_some_and(|b| *b.area() == app.composer_frame)
+        && app.composer_frame.width > 0
+        && app.composer_frame.height > 0
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.width > 0
+        && a.height > 0
+        && b.width > 0
+        && b.height > 0
+        && a.left() < b.right()
+        && b.left() < a.right()
+        && a.top() < b.bottom()
+        && b.top() < a.bottom()
+}
+
+fn push_buf_cells(src: &Buffer, area: Rect, out: &mut Vec<(u16, u16, Cell)>) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let pos = Position { x, y };
+            if let Some(cell) = src.cell(pos) {
+                out.push((x, y, cell.clone()));
+            }
+        }
+    }
+}
+
+fn collect_clock_cells(app: &App, opts: &TuiOptions) -> Vec<(u16, u16, Cell)> {
+    let mut out = Vec::new();
+    if app.header_bar.width > 0 && app.header_bar.height > 0 {
+        let mut buf = render_header_buffer(app, opts, app.header_bar);
+        if app.settings.as_ref().is_some_and(|s| s.minimized) {
+            let dock = Rect::new(app.header_bar.x.saturating_add(18), app.header_bar.y, 12, 1);
+            Paragraph::new(Span::styled(
+                " 設定 ",
+                Style::default().bg(COMPOSER).fg(ACCENT),
+            ))
+            .render(dock, &mut buf);
+        }
+        push_buf_cells(&buf, app.header_bar, &mut out);
+    }
+    for &(ri, area) in &app.think_clocks {
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        if rects_overlap(area, app.composer_frame) {
+            continue;
+        }
+        let Some(Row::Think(t)) = app.rows.get(ri) else {
+            continue;
+        };
+        if t.done {
+            continue;
+        }
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(think_header_line(t))
+            .style(Style::default().bg(PANEL))
+            .render(area, &mut buf);
+        push_buf_cells(&buf, area, &mut out);
+    }
+    out.retain(|(x, y, _)| {
+        !app.composer_frame.contains(Position { x: *x, y: *y })
+    });
+    out
+}
+
+fn clock_cells_changed(prev: &[(u16, u16, Cell)], next: &[(u16, u16, Cell)]) -> Vec<(u16, u16, Cell)> {
+    next.iter()
+        .filter(|(x, y, cell)| {
+            !prev.iter().any(|(px, py, old)| {
+                *px == *x && *py == *y && old.symbol() == cell.symbol()
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn cell_char(cell: &Cell) -> Option<char> {
+    cell.symbol().chars().next().filter(|c| *c != '\0')
+}
+
+fn paint_clocks(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &App,
+    app: &mut App,
     opts: &TuiOptions,
 ) -> Result<()> {
-    let area = app.header_bar;
-    if area.width == 0 || area.height == 0 {
+    let next = collect_clock_cells(app, opts);
+    let changed = clock_cells_changed(&app.last_clock_cells, &next);
+    if changed.is_empty() {
+        app.last_clock_cells = next;
         return Ok(());
     }
-    let buf = render_header_buffer(app, opts, area);
-    let blank = Buffer::empty(area);
-    let updates = blank.diff(&buf);
-    let show = want_hardware_cursor(app);
-    let _ = terminal.hide_cursor();
-    terminal
-        .backend_mut()
-        .draw(updates.into_iter())
+    let chars: Vec<(u16, u16, char)> = changed
+        .iter()
+        .filter_map(|(x, y, cell)| cell_char(cell).map(|ch| (*x, *y, ch)))
+        .collect();
+    let patched = crate::hostio::patch_chars_keep_cursor(&chars).map_err(Error::Io)?;
+    if !patched {
+        terminal
+            .backend_mut()
+            .draw(changed.iter().map(|(x, y, c)| (*x, *y, c)))
+            .map_err(Error::Io)?;
+        execute!(
+            terminal.backend_mut(),
+            MoveTo(app.last_caret.x, app.last_caret.y)
+        )
         .map_err(Error::Io)?;
-    terminal.backend_mut().flush().map_err(Error::Io)?;
-    execute!(io::stdout(), MoveTo(app.last_caret.x, app.last_caret.y)).map_err(Error::Io)?;
-    if show {
-        let _ = terminal.show_cursor();
+        std::io::Write::flush(terminal.backend_mut()).map_err(Error::Io)?;
     }
+    app.last_clock_cells = next;
+    Ok(())
+}
+
+fn paint_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    opts: &TuiOptions,
+    freeze_composer: bool,
+) -> Result<Position> {
+    terminal.autoresize().map_err(Error::Io)?;
+    let caret = {
+        let mut frame = terminal.get_frame();
+        draw_ui(&mut frame, app, opts, freeze_composer)
+    };
+    terminal.flush().map_err(Error::Io)?;
+    std::io::Write::flush(terminal.backend_mut()).map_err(Error::Io)?;
+    terminal.swap_buffers();
+    Ok(caret)
+}
+
+fn sync_cursor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    caret: Position,
+    want: bool,
+    shown: &mut bool,
+    placed: &mut Option<Position>,
+) -> Result<()> {
+    if *placed != Some(caret) {
+        execute!(terminal.backend_mut(), MoveTo(caret.x, caret.y)).map_err(Error::Io)?;
+        *placed = Some(caret);
+    }
+    if want != *shown {
+        if want {
+            terminal.show_cursor().map_err(Error::Io)?;
+        } else {
+            terminal.hide_cursor().map_err(Error::Io)?;
+        }
+        *shown = want;
+    }
+    std::io::Write::flush(terminal.backend_mut()).map_err(Error::Io)?;
     Ok(())
 }
 
@@ -5146,6 +5323,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         .style(Style::default().bg(PANEL).fg(TEXT));
     f.render_widget(block, area);
     app.hits.push((area, Hit::Chat));
+    app.think_clocks.clear();
 
     let bar_w = if area.width >= 8 { 1 } else { 0 };
     let inner = Rect::new(
@@ -5175,6 +5353,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
             line: Line<'static>,
             hit: Option<Hit>,
             glyph: Option<(usize, usize, Vec<char>)>,
+            clock: bool,
         },
         Graphic {
             rel: String,
@@ -5210,6 +5389,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
                     line: p.line,
                     hit: item.hit,
                     glyph: Some((row, start.saturating_add(p.start), p.chars)),
+                    clock: false,
                 });
             }
         } else {
@@ -5218,12 +5398,15 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
             } else {
                 vec![item.line]
             };
+            let mut first = true;
             for wrapped in wrapped {
                 paints.push(Paint::Line {
                     line: wrapped,
                     hit: item.hit,
                     glyph: None,
+                    clock: item.clock && first,
                 });
+                first = false;
             }
         }
     }
@@ -5259,7 +5442,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
         let screen_y = inner.y + start.saturating_sub(scroll);
         let vis_h = end.min(vis_end).saturating_sub(start.max(scroll)).max(1);
         match paint {
-            Paint::Line { mut line, hit, glyph } => {
+            Paint::Line { mut line, hit, glyph, clock } => {
                 if let Some((row, gstart, chars)) = &glyph {
                     if let Some((lo, hi)) = piece_tint_range(&sel, *row, *gstart, chars.len()) {
                         line = tint_char_range(line, lo, hi);
@@ -5267,6 +5450,11 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) -> Vec<(Rect, Hit)> {
                 }
                 let r = Rect::new(inner.x, screen_y, inner.width, 1);
                 f.render_widget(Paragraph::new(line), r);
+                if clock {
+                    if let Some(Hit::Think(i)) = hit {
+                        app.think_clocks.push((i, r));
+                    }
+                }
                 if let Some((grow, gstart, chars)) = glyph {
                     let text_w: u16 = chars.iter().map(|c| ch_width(*c).max(1)).sum();
                     let text_w = text_w.min(inner.width);
@@ -6915,7 +7103,11 @@ async fn tui_loop(
         area: Rect::default(),
         streaming: false,
         composer_inner: Rect::default(),
+        composer_frame: Rect::default(),
+        composer_snap: None,
         header_bar: Rect::default(),
+        think_clocks: Vec::new(),
+        last_clock_cells: Vec::new(),
         last_caret: Position::ORIGIN,
         chat_inner: Rect::default(),
         chat_bar: Rect::default(),
@@ -6996,20 +7188,24 @@ async fn tui_loop(
     let (cat_tx, mut cat_rx) = mpsc::unbounded_channel();
     let (login_tx, mut login_rx) = mpsc::unbounded_channel();
     let mut last_size = terminal.size().map_err(Error::Io)?;
-    let mut dirty = true;
+    let mut content_dirty = true;
+    let mut composer_dirty = true;
+    let mut cursor_shown = true;
+    let mut cursor_placed = None;
 
     loop {
         while let Ok(ev) = ev_rx.try_recv() {
             app.route_event(ev);
-            dirty = true;
+            content_dirty = true;
         }
         while let Ok(result) = cat_rx.try_recv() {
             ingest_catalog(&mut app, &mut opts, result);
-            dirty = true;
+            content_dirty = true;
         }
         while let Ok(ev) = login_rx.try_recv() {
             apply_login_event(&mut app, ev);
-            dirty = true;
+            content_dirty = true;
+            composer_dirty = true;
         }
         if app.want_catalog
             && app.logged_in
@@ -7017,7 +7213,7 @@ async fn tui_loop(
         {
             app.want_catalog = false;
             app.catalog_status = CatalogStatus::Loading;
-            dirty = true;
+            content_dirty = true;
             let tx = cat_tx.clone();
             let auth = auth_path.clone();
             tokio::spawn(async move {
@@ -7030,7 +7226,8 @@ async fn tui_loop(
         }
         if app.want_login {
             app.want_login = false;
-            dirty = true;
+            content_dirty = true;
+            composer_dirty = true;
             let tx = login_tx.clone();
             let path = app.auth_path.clone();
             let gen = app.login_gen;
@@ -7041,55 +7238,66 @@ async fn tui_loop(
         flush_all(&mut app);
         while let Ok((sid, out)) = done_rx.try_recv() {
             app.finish_run(&sid, out);
-            dirty = true;
+            content_dirty = true;
+            composer_dirty = true;
         }
         kick_idle_queue(&mut app, &opts, &sink, &done_tx);
         pulse_spinner(&mut app);
         match terminal.size() {
             Ok(size) if size != last_size => {
                 last_size = size;
-                dirty = true;
+                content_dirty = true;
+                composer_dirty = true;
             }
             Ok(_) => {}
             Err(e) => return Err(Error::Io(e)),
         }
 
-        if dirty {
-            let mut caret = Position::ORIGIN;
-            let show_caret = want_hardware_cursor(&app);
-            let _ = terminal.hide_cursor();
-            terminal
-                .draw(|f| {
-                    caret = draw(f, &mut app, &opts);
-                    if show_caret {
-                        f.set_cursor_position(caret);
-                    }
-                })
-                .map_err(Error::Io)?;
+        if content_dirty || composer_dirty {
+            let freeze = !composer_dirty;
+            if freeze && cursor_shown {
+                terminal.hide_cursor().map_err(Error::Io)?;
+                cursor_shown = false;
+                cursor_placed = None;
+            }
+            let caret = paint_frame(terminal, &mut app, &opts, freeze)?;
             app.last_caret = caret;
+            app.last_clock_cells = collect_clock_cells(&app, &opts);
             flush_image_blits(&mut app, caret)?;
-            dirty = false;
+            sync_cursor(
+                terminal,
+                caret,
+                want_hardware_cursor(&app),
+                &mut cursor_shown,
+                &mut cursor_placed,
+            )?;
+            content_dirty = false;
+            composer_dirty = false;
         } else if header_pulse_ok(&app) {
-            paint_header_pulse(terminal, &app, &opts)?;
+            paint_clocks(terminal, &mut app, &opts)?;
         }
 
         tokio::select! {
             maybe = keys.next() => {
                 match maybe {
                     Some(Ok(ev)) => {
-                        dirty = true;
-                        if handle_input(&mut app, &mut opts, ev, &sink, &done_tx) {
-                            break;
-                        }
+                        let mut batch = vec![ev];
                         let mut quit = false;
                         while let Some(ready) = keys.next().now_or_never() {
                             match ready {
-                                Some(Ok(ev)) => {
-                                    quit = handle_input(&mut app, &mut opts, ev, &sink, &done_tx);
-                                }
+                                Some(Ok(ev)) => batch.push(ev),
                                 _ => break,
                             }
-                            if quit {
+                        }
+                        let batch = coalesce_ime_enter(batch);
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        content_dirty = true;
+                        composer_dirty = true;
+                        for ev in batch {
+                            if handle_input(&mut app, &mut opts, ev, &sink, &done_tx) {
+                                quit = true;
                                 break;
                             }
                         }
@@ -7297,6 +7505,37 @@ fn submit_current(
         Submit::Start | Submit::Insert => {
             start_or_send(app, opts, sink, done_tx, turn);
         }
+    }
+}
+
+fn is_plain_enter(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && k.code == KeyCode::Enter
+                && !k.modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
+fn is_ime_commit_char(ev: &Event) -> bool {
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            matches!(k.code, KeyCode::Char(c) if !c.is_ascii())
+                && !k.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        _ => false,
+    }
+}
+
+/// IME's first Enter commits CJK into the same event burst. That Enter must
+/// not send the message; a later Enter does.
+fn coalesce_ime_enter(events: Vec<Event>) -> Vec<Event> {
+    let drop_enter = events.iter().any(is_ime_commit_char) && events.iter().any(is_plain_enter);
+    if drop_enter {
+        events.into_iter().filter(|e| !is_plain_enter(e)).collect()
+    } else {
+        events
     }
 }
 
@@ -7586,7 +7825,9 @@ fn handle_key(
             }
         }
         (KeyCode::Enter, _) => {
-            if app.queue_edit.is_some() {
+            if crate::hostio::ime_composing() {
+                // First Enter confirms IME composition; it is not a send.
+            } else if app.queue_edit.is_some() {
                 app.commit_queue_edit();
             } else {
                 submit_current(app, opts, sink, done_tx, false);
@@ -8672,6 +8913,46 @@ mod tests {
     }
 
     #[test]
+    fn gear_stays_clickable_when_the_side_rail_is_open() {
+        let mut app = test_app();
+        app.current_id = "r".into();
+        app.session.id = "r".into();
+        app.route_event(AgentEvent::ChildSpawned {
+            meta: test_meta(),
+            name: "coder".into(),
+            agent_card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
+            prompt: "fix".into(),
+        });
+        assert!(app.has_side());
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, false);
+            })
+            .unwrap();
+        let gear = app
+            .hits
+            .iter()
+            .rev()
+            .find(|(_, h)| *h == Hit::Gear)
+            .map(|(r, _)| *r)
+            .expect("gear hit");
+        assert_eq!(gear.y, 0, "gear must stay on the top header row");
+        assert!(
+            gear.x + gear.width >= 110,
+            "gear must sit at the top-right, not left of the rail: {gear:?}"
+        );
+        assert_eq!(hit_at(&app.hits, gear.x, 0), Some(Hit::Gear));
+        assert_eq!(hit_at(&app.hits, gear.x + 1, 0), Some(Hit::Gear));
+        assert!(!matches!(
+            hit_at(&app.hits, gear.x, 0),
+            Some(Hit::RailChild(_)) | Some(Hit::RailMon(_)) | Some(Hit::RailBg(_))
+        ));
+    }
+
+    #[test]
     fn background_fills_the_side_rail_and_keeps_output_out_of_chat() {
         let mut app = test_app();
         app.current_id = "r".into();
@@ -9425,6 +9706,12 @@ mod tests {
         app.edit.insert_str("queue this while it works");
         assert!(header_pulse_ok(&app), "clock must keep ticking while typing");
         assert!(want_hardware_cursor(&app));
+        assert!(
+            collect_clock_cells(&app, &test_opts("grok-4.6", ReasoningEffort::High))
+                .iter()
+                .all(|(x, y, _)| !app.composer_frame.contains(Position { x: *x, y: *y })),
+            "pulse cells must not include the composer"
+        );
     }
 
     #[test]
@@ -9450,11 +9737,14 @@ mod tests {
     }
 
     #[test]
-    fn running_empty_composer_hides_hardware_cursor() {
+    fn running_empty_composer_keeps_hardware_cursor_for_ime() {
         let mut app = test_app();
         app.running = true;
         assert!(app.edit.is_empty());
-        assert!(!want_hardware_cursor(&app));
+        assert!(
+            want_hardware_cursor(&app),
+            "IME is drawn at the hardware cursor; it must stay in the composer"
+        );
         app.edit.insert_str("queue this");
         assert!(want_hardware_cursor(&app));
     }
@@ -10070,7 +10360,11 @@ mod tests {
             area: Rect::default(),
             streaming: false,
             composer_inner: Rect::default(),
+            composer_frame: Rect::default(),
+            composer_snap: None,
             header_bar: Rect::default(),
+            think_clocks: Vec::new(),
+            last_clock_cells: Vec::new(),
             last_caret: Position::ORIGIN,
             chat_inner: Rect::default(),
             chat_bar: Rect::default(),
@@ -11218,6 +11512,204 @@ mod tests {
         assert!(s.contains("思考"), "{s}");
         assert!(s.contains("3.4s"), "{s}");
         assert!(s.contains("完成"), "{s}");
+    }
+
+    #[test]
+    fn think_clock_width_does_not_jump_as_time_grows() {
+        let widths: Vec<usize> = [100, 3_400, 9_900, 18_400, 72_000]
+            .into_iter()
+            .map(|ms| {
+                think_header_line(&Think {
+                    text: String::new(),
+                    expanded: false,
+                    done: false,
+                    elapsed_ms: 0,
+                    started: Some(Instant::now() - Duration::from_millis(ms)),
+                })
+                .width()
+            })
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+    }
+
+    #[test]
+    fn freeze_composer_keeps_typed_text_while_clock_moves() {
+        let mut app = test_app();
+        app.edit.insert_str("hello");
+        app.running = true;
+        app.work_started = Some(Instant::now() - Duration::from_millis(100));
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, false);
+            })
+            .unwrap();
+        let inner = app.composer_inner;
+        app.work_started = Some(Instant::now() - Duration::from_millis(3_400));
+        app.tick = 7;
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(inner.x, inner.y)].symbol(), "h", "composer must not redraw for a clock tick");
+        assert_eq!(buf[(inner.x + 1, inner.y)].symbol(), "e");
+    }
+
+    #[test]
+    fn clock_cells_never_touch_composer() {
+        let mut app = test_app();
+        app.running = true;
+        app.work_started = Some(Instant::now() - Duration::from_millis(100));
+        app.push(Row::Think(Think {
+            text: String::new(),
+            expanded: false,
+            done: false,
+            elapsed_ms: 0,
+            started: Some(Instant::now() - Duration::from_millis(100)),
+        }));
+        app.edit.insert_str("hello");
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, false);
+            })
+            .unwrap();
+        assert!(
+            !app.think_clocks.is_empty(),
+            "live think header must be recorded for clock patches"
+        );
+        let frame = app.composer_frame;
+        assert!(frame.height > 0 && frame.y > 0, "{frame:?}");
+        if let Some(Row::Think(t)) = app.rows.get_mut(0) {
+            t.started = Some(Instant::now() - Duration::from_millis(3_400));
+        }
+        app.work_started = Some(Instant::now() - Duration::from_millis(3_400));
+        app.tick = 7;
+        let cells = collect_clock_cells(&app, &opts);
+        assert!(!cells.is_empty(), "header and think clocks must emit cells");
+        for (x, y, _) in &cells {
+            assert!(
+                !frame.contains(Position { x: *x, y: *y }),
+                "clock cell ({x},{y}) inside composer {frame:?}"
+            );
+            assert!(
+                *y < frame.y,
+                "clock row {y} must sit above composer y={}",
+                frame.y
+            );
+        }
+    }
+
+    #[test]
+    fn applying_clock_cells_leaves_composer_text() {
+        let mut app = test_app();
+        app.running = true;
+        app.work_started = Some(Instant::now() - Duration::from_millis(100));
+        app.push(Row::Think(Think {
+            text: String::new(),
+            expanded: false,
+            done: false,
+            elapsed_ms: 0,
+            started: Some(Instant::now() - Duration::from_millis(100)),
+        }));
+        app.edit.insert_str("hello");
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, false);
+            })
+            .unwrap();
+        let inner = app.composer_inner;
+        let frame = app.composer_frame;
+        let src = terminal.backend().buffer();
+        let before: Vec<String> = (0..5)
+            .map(|i| src[(inner.x + i, inner.y)].symbol().to_string())
+            .collect();
+        assert_eq!(before[0], "h");
+        if let Some(Row::Think(t)) = app.rows.get_mut(0) {
+            t.started = Some(Instant::now() - Duration::from_millis(3_400));
+        }
+        app.work_started = Some(Instant::now() - Duration::from_millis(3_400));
+        app.tick = 7;
+        let cells = collect_clock_cells(&app, &opts);
+        let mut buf = terminal.backend().buffer().clone();
+        for (x, y, cell) in cells {
+            if let Some(out) = buf.cell_mut(Position { x, y }) {
+                *out = cell;
+            }
+        }
+        for (i, ch) in before.iter().enumerate() {
+            assert_eq!(
+                buf[(inner.x + i as u16, inner.y)].symbol(),
+                ch.as_str(),
+                "composer col {i} changed by a clock patch"
+            );
+        }
+        let &( _ri, area) = app
+            .think_clocks
+            .first()
+            .expect("think clock row");
+        let mut think = String::new();
+        for x in area.left()..area.right() {
+            think.push_str(buf[(x, area.y)].symbol());
+        }
+        assert!(think.contains("3.4s"), "think={think:?} frame={frame:?}");
+    }
+
+    fn key_press(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn ime_first_enter_is_confirm_not_send() {
+        let batch = vec![
+            key_press(KeyCode::Char('你')),
+            key_press(KeyCode::Char('好')),
+            key_press(KeyCode::Enter),
+        ];
+        let out = coalesce_ime_enter(batch);
+        assert!(out.iter().any(is_ime_commit_char), "{out:?}");
+        assert!(
+            !out.iter().any(is_plain_enter),
+            "first Enter with IME chars must not send: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ascii_enter_still_sends() {
+        let batch = vec![
+            key_press(KeyCode::Char('h')),
+            key_press(KeyCode::Char('i')),
+            key_press(KeyCode::Enter),
+        ];
+        let out = coalesce_ime_enter(batch);
+        assert!(
+            out.iter().any(is_plain_enter),
+            "ASCII Enter must still send: {out:?}"
+        );
+    }
+
+    #[test]
+    fn clock_cells_changed_only_emits_new_glyphs() {
+        let mut a = Cell::default();
+        a.set_symbol("1");
+        let mut b = Cell::default();
+        b.set_symbol("2");
+        let prev = vec![(3, 4, a.clone())];
+        let next = vec![(3, 4, a.clone()), (5, 4, b.clone())];
+        let changed = clock_cells_changed(&prev, &next);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].0, 5);
+        assert_eq!(changed[0].2.symbol(), "2");
+        assert!(clock_cells_changed(&next, &next).is_empty());
     }
 
     #[test]

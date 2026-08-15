@@ -119,6 +119,151 @@ impl ClientTool for NowTool {
     }
 }
 
+pub(crate) fn read_text_at(root: &Path, args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Tool("path is required".into()))?;
+    let resolved = resolve_in_workspace(root, path)?;
+    let text = read_utf8_capped(&resolved)?;
+    let file = parse_text_file(&text);
+    let n = file.lines.len();
+    let start = optional_usize(args, "start_line")?.unwrap_or(1);
+    let end = optional_usize(args, "end_line")?.unwrap_or(n.max(1));
+    if start < 1 {
+        return Err(Error::Tool("start_line is 1-based".into()));
+    }
+    if end < start {
+        return Err(Error::Tool("end_line must be >= start_line".into()));
+    }
+    if n == 0 {
+        if start > 1 {
+            return Err(Error::Tool("file is empty".into()));
+        }
+    } else if start > n {
+        return Err(Error::Tool(format!(
+            "start_line {start} is past end of file ({n} lines)"
+        )));
+    }
+    let slice_end = if n == 0 { 0 } else { end.min(n) };
+    let rel = path.replace('\\', "/");
+    let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+    if pattern.is_empty() {
+        return Ok(numbered_block(&rel, &file, start, slice_end));
+    }
+    let re = compile_regex(pattern)?;
+    let context = optional_usize(args, "context")?.unwrap_or(0).min(MAX_CONTEXT_LINES);
+    let max_matches = optional_usize(args, "max_matches")?
+        .unwrap_or(MAX_READ_MATCHES)
+        .clamp(1, MAX_READ_MATCHES_CAP);
+    let from = start.saturating_sub(1);
+    let to = slice_end;
+    let mut matches = Vec::new();
+    let mut numbered = String::new();
+    let mut total = 0usize;
+    let width = n.max(1).to_string().len();
+    for i in from..to {
+        let line = &file.lines[i];
+        if !re.is_match(line) {
+            continue;
+        }
+        total += 1;
+        if matches.len() >= max_matches {
+            continue;
+        }
+        let mut item = json!({
+            "line": i + 1,
+            "text": line,
+        });
+        if context > 0 {
+            let ctx_from = i.saturating_sub(context);
+            let ctx_to = (i + 1).saturating_add(context).min(file.lines.len());
+            item["before"] = json!(file.lines[ctx_from..i]);
+            item["after"] = json!(file.lines[i + 1..ctx_to]);
+        }
+        matches.push(item);
+        let _ = writeln!(numbered, "{:>width$}|{line}", i + 1);
+    }
+    Ok(json!({
+        "path": rel,
+        "pattern": pattern,
+        "matches": matches,
+        "count": total,
+        "truncated": total > matches.len(),
+        "numbered": numbered
+    })
+    .to_string())
+}
+
+pub(crate) fn write_text_at(root: &Path, args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Tool("path is required".into()))?;
+    let contents = args
+        .get("contents")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Tool("contents is required".into()))?;
+    if contents.len() > MAX_FILE_BYTES {
+        return Err(Error::Tool("contents larger than 256KiB".into()));
+    }
+    let line = optional_usize(args, "line")?;
+    let end_line = optional_usize(args, "end_line")?;
+    let pattern = args
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if line.is_some() && pattern.is_some() {
+        return Err(Error::Tool("use either line or pattern, not both".into()));
+    }
+    if end_line.is_some() && line.is_none() {
+        return Err(Error::Tool("end_line requires line".into()));
+    }
+    let target = resolve_target_in_workspace(root, path)?;
+    let rel = path.replace('\\', "/");
+    if let Some(start) = line {
+        let before = read_utf8_capped(&target).map_err(|e| {
+            if target.exists() {
+                e
+            } else {
+                Error::Tool(format!("file not found: {path}"))
+            }
+        })?;
+        let mut file = parse_text_file(&before);
+        replace_line_range(
+            &mut file,
+            start,
+            end_line.unwrap_or(start),
+            contents,
+        )?;
+        let after = join_text_file(&file);
+        fs::write(&target, &after)?;
+        return Ok(diff::file_change_json(&rel, Some(&before), Some(&after)).to_string());
+    }
+    if let Some(pat) = pattern {
+        let before = read_utf8_capped(&target).map_err(|e| {
+            if target.exists() {
+                e
+            } else {
+                Error::Tool(format!("file not found: {path}"))
+            }
+        })?;
+        let re = compile_regex(pat)?;
+        let replacements = re.find_iter(&before).count();
+        let after = re.replace_all(&before, contents).into_owned();
+        fs::write(&target, &after)?;
+        let mut out = diff::file_change_json(&rel, Some(&before), Some(&after));
+        out["replacements"] = json!(replacements);
+        return Ok(out.to_string());
+    }
+    let before = fs::read_to_string(&target).ok();
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&target, contents)?;
+    Ok(diff::file_change_json(&rel, before.as_deref(), Some(contents)).to_string())
+}
+
 pub struct ReadFileTool {
     workspace: PathBuf,
 }
@@ -129,79 +274,7 @@ impl ReadFileTool {
     }
 
     pub fn call_sync(&self, args: &Value) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Tool("path is required".into()))?;
-        let resolved = resolve_in_workspace(&self.workspace, path)?;
-        let text = read_utf8_capped(&resolved)?;
-        let file = parse_text_file(&text);
-        let n = file.lines.len();
-        let start = optional_usize(args, "start_line")?.unwrap_or(1);
-        let end = optional_usize(args, "end_line")?.unwrap_or(n.max(1));
-        if start < 1 {
-            return Err(Error::Tool("start_line is 1-based".into()));
-        }
-        if end < start {
-            return Err(Error::Tool("end_line must be >= start_line".into()));
-        }
-        if n == 0 {
-            if start > 1 {
-                return Err(Error::Tool("file is empty".into()));
-            }
-        } else if start > n {
-            return Err(Error::Tool(format!(
-                "start_line {start} is past end of file ({n} lines)"
-            )));
-        }
-        let slice_end = if n == 0 { 0 } else { end.min(n) };
-        let rel = path.replace('\\', "/");
-        let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-        if pattern.is_empty() {
-            return Ok(numbered_block(&rel, &file, start, slice_end));
-        }
-        let re = compile_regex(pattern)?;
-        let context = optional_usize(args, "context")?.unwrap_or(0).min(MAX_CONTEXT_LINES);
-        let max_matches = optional_usize(args, "max_matches")?
-            .unwrap_or(MAX_READ_MATCHES)
-            .clamp(1, MAX_READ_MATCHES_CAP);
-        let from = start.saturating_sub(1);
-        let to = slice_end;
-        let mut matches = Vec::new();
-        let mut numbered = String::new();
-        let mut total = 0usize;
-        let width = n.max(1).to_string().len();
-        for i in from..to {
-            let line = &file.lines[i];
-            if !re.is_match(line) {
-                continue;
-            }
-            total += 1;
-            if matches.len() >= max_matches {
-                continue;
-            }
-            let mut item = json!({
-                "line": i + 1,
-                "text": line,
-            });
-            if context > 0 {
-                let ctx_from = i.saturating_sub(context);
-                let ctx_to = (i + 1).saturating_add(context).min(file.lines.len());
-                item["before"] = json!(file.lines[ctx_from..i]);
-                item["after"] = json!(file.lines[i + 1..ctx_to]);
-            }
-            matches.push(item);
-            let _ = writeln!(numbered, "{:>width$}|{line}", i + 1);
-        }
-        Ok(json!({
-            "path": rel,
-            "pattern": pattern,
-            "matches": matches,
-            "count": total,
-            "truncated": total > matches.len(),
-            "numbered": numbered
-        })
-        .to_string())
+        read_text_at(&self.workspace, args)
     }
 }
 
@@ -535,72 +608,7 @@ impl WriteFileTool {
     }
 
     pub fn call_sync(&self, args: &Value) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Tool("path is required".into()))?;
-        let contents = args
-            .get("contents")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Tool("contents is required".into()))?;
-        if contents.len() > MAX_FILE_BYTES {
-            return Err(Error::Tool("contents larger than 256KiB".into()));
-        }
-        let line = optional_usize(args, "line")?;
-        let end_line = optional_usize(args, "end_line")?;
-        let pattern = args
-            .get("pattern")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
-        if line.is_some() && pattern.is_some() {
-            return Err(Error::Tool("use either line or pattern, not both".into()));
-        }
-        if end_line.is_some() && line.is_none() {
-            return Err(Error::Tool("end_line requires line".into()));
-        }
-        let target = resolve_target_in_workspace(&self.workspace, path)?;
-        let rel = path.replace('\\', "/");
-        if let Some(start) = line {
-            let before = read_utf8_capped(&target).map_err(|e| {
-                if target.exists() {
-                    e
-                } else {
-                    Error::Tool(format!("file not found: {path}"))
-                }
-            })?;
-            let mut file = parse_text_file(&before);
-            replace_line_range(
-                &mut file,
-                start,
-                end_line.unwrap_or(start),
-                contents,
-            )?;
-            let after = join_text_file(&file);
-            fs::write(&target, &after)?;
-            return Ok(diff::file_change_json(&rel, Some(&before), Some(&after)).to_string());
-        }
-        if let Some(pat) = pattern {
-            let before = read_utf8_capped(&target).map_err(|e| {
-                if target.exists() {
-                    e
-                } else {
-                    Error::Tool(format!("file not found: {path}"))
-                }
-            })?;
-            let re = compile_regex(pat)?;
-            let replacements = re.find_iter(&before).count();
-            let after = re.replace_all(&before, contents).into_owned();
-            fs::write(&target, &after)?;
-            let mut out = diff::file_change_json(&rel, Some(&before), Some(&after));
-            out["replacements"] = json!(replacements);
-            return Ok(out.to_string());
-        }
-        let before = fs::read_to_string(&target).ok();
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, contents)?;
-        Ok(diff::file_change_json(&rel, before.as_deref(), Some(contents)).to_string())
+        write_text_at(&self.workspace, args)
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "grokaagent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Minimal agent kernel: event loop, tools, xAI Grok OAuth, JSONL event pipe"
 license = "MIT"
@@ -35,11 +35,14 @@ ratatui-image = { version = "8.0.2", default-features = false, features = ["cros
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]

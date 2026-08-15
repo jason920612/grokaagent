@@ -286,6 +286,13 @@ pub fn fmt_duration(ms: u64) -> String {
     }
 }
 
+/// Fixed-width clock so a live timer cannot shift the rest of the line.
+pub const DURATION_FIELD: usize = 7;
+
+pub fn fmt_duration_field(ms: u64) -> String {
+    format!("{:>width$}", fmt_duration(ms), width = DURATION_FIELD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +344,14 @@ mod tests {
         assert_eq!(fmt_duration(3400), "3.4s");
         assert_eq!(fmt_duration(18_400), "19s");
         assert_eq!(fmt_duration(72_000), "1m 12s");
+    }
+
+    #[test]
+    fn duration_field_keeps_a_stable_width() {
+        for ms in [0, 3400, 9_900, 10_000, 18_400, 72_000] {
+            let field = fmt_duration_field(ms);
+            assert_eq!(field.chars().count(), DURATION_FIELD, "{ms} {field:?}");
+            assert!(field.contains(fmt_duration(ms).trim()), "{field}");
+        }
     }
 }

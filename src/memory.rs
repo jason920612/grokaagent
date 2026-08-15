@@ -172,17 +172,40 @@ impl ProjectMemoryTool {
             }
             "read" => {
                 let path = req_path(args)?;
-                let body = slot.read(path)?;
-                Ok(json!({ "path": normalize_rel(path)?, "body": body }).to_string())
+                let rel = normalize_rel(path)?;
+                let files = slot.files_dir();
+                if !files.is_dir() {
+                    return Err(Error::Tool(format!("memory file not found: {rel}")));
+                }
+                crate::tools::read_text_at(&files, args)
             }
             "write" => {
-                let path = req_path(args)?;
-                let body = args
-                    .get("body")
+                let mut args = args.clone();
+                if args.get("contents").and_then(Value::as_str).is_none() {
+                    if let Some(body) = args.get("body").cloned() {
+                        if let Some(obj) = args.as_object_mut() {
+                            obj.insert("contents".into(), body);
+                        }
+                    }
+                }
+                let path = req_path(&args)?;
+                let rel = normalize_rel(path)?;
+                let contents = args
+                    .get("contents")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| Error::Tool("body is required for write".into()))?;
-                let path = slot.write(path, body)?;
-                Ok(json!({ "ok": true, "path": path, "bytes": body.len() }).to_string())
+                    .ok_or_else(|| Error::Tool("contents is required for write".into()))?;
+                if contents.len() > MAX_FILE_BYTES {
+                    return Err(Error::Tool(format!(
+                        "memory file larger than {MAX_FILE_BYTES} bytes; condense it"
+                    )));
+                }
+                slot.ensure()?;
+                let files = slot.files_dir();
+                let target = resolve_target_in_workspace(&files, &rel)?;
+                if slot.list()?.len() >= MAX_FILES && !target.exists() {
+                    return Err(Error::Tool(format!("at most {MAX_FILES} memory files")));
+                }
+                crate::tools::write_text_at(&files, &args)
             }
             "delete" => {
                 let path = req_path(args)?;
@@ -200,22 +223,46 @@ impl ClientTool for ProjectMemoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "project_memory".into(),
-            description: "Persistent notes for THIS workspace, stored outside the project (not in git). Multiple files allowed (goal.md, done.md, constraints.md, …). Notes are not in context until you list/read them. Record overall requirements, constraints, and what was done. Never put secrets here and never write these notes into the workspace.".into(),
+            description: "Persistent notes for THIS workspace, stored outside the project (not in git). Multiple files allowed (goal.md, done.md, constraints.md, …). Notes are not in context until you list/read them. Read and write use the same line numbers, slices, regex, and unified diff as read_file/write_file. Record overall requirements, constraints, and what was done. Never put secrets here and never write these notes into the workspace.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["list", "read", "write", "delete"],
-                        "description": "list files, read one file, replace one file, or delete one file"
+                        "description": "list files, read one file (numbered like read_file), write/edit one file (like write_file), or delete one file"
                     },
                     "path": {
                         "type": "string",
                         "description": "Relative path inside the memory store (required except list)"
                     },
-                    "body": {
+                    "contents": {
                         "type": "string",
-                        "description": "Full file contents (write only)"
+                        "description": "Write: full file, replacement lines, or regex replacement. Newlines write multiple lines."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Write: 1-based start line to replace (from read). Omit with pattern for regex; omit both to overwrite the whole file."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Write: 1-based inclusive end line. Default is line. Read: last line to return."
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Read: keep matching lines. Write: regex replace-all ($1 captures). Do not combine write pattern with line."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Read: 1-based first line to return. Default 1."
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": "Read with pattern: extra lines before/after each match. Default 0."
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Read with pattern: cap returned matches. Default 80."
                     }
                 },
                 "required": ["action"],
@@ -417,12 +464,67 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(out["ok"], true);
         assert_eq!(out["path"], "goal.md");
+        assert!(
+            out["diff"].as_str().is_some_and(|d| d.contains("overall")),
+            "{out}"
+        );
         let listed: Value =
             serde_json::from_str(&tool.call_sync(&json!({"action": "list"})).unwrap()).unwrap();
         assert_eq!(listed["files"][0], "goal.md");
         assert!(!ws.path().join("goal.md").exists());
         assert!(mem.path().exists());
+    }
+
+    #[test]
+    fn tool_read_is_numbered_like_read_file() {
+        let mem = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let tool = ProjectMemoryTool::new(mem.path().to_path_buf(), ws.path().to_path_buf());
+        tool.call_sync(&json!({
+            "action": "write",
+            "path": "goal.md",
+            "contents": "alpha\nbeta\ngamma\n"
+        }))
+        .unwrap();
+        let out = tool
+            .call_sync(&json!({"action": "read", "path": "goal.md"}))
+            .unwrap();
+        assert!(out.contains("1|alpha"), "{out}");
+        assert!(out.contains("2|beta"), "{out}");
+        assert!(out.contains("3|gamma"), "{out}");
+        assert!(!out.contains("\"body\""), "{out}");
+    }
+
+    #[test]
+    fn tool_write_replaces_a_line_and_returns_diff() {
+        let mem = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let tool = ProjectMemoryTool::new(mem.path().to_path_buf(), ws.path().to_path_buf());
+        tool.call_sync(&json!({
+            "action": "write",
+            "path": "goal.md",
+            "contents": "one\ntwo\nthree\n"
+        }))
+        .unwrap();
+        let out: Value = serde_json::from_str(
+            &tool
+                .call_sync(&json!({
+                    "action": "write",
+                    "path": "goal.md",
+                    "line": 2,
+                    "contents": "TWO\n"
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["path"], "goal.md");
+        let diff = out["diff"].as_str().unwrap_or("");
+        assert!(diff.contains("-two"), "{diff}");
+        assert!(diff.contains("+TWO"), "{diff}");
+        let slot = MemoryStore::open_at(mem.path().to_path_buf())
+            .slot(ws.path())
+            .unwrap();
+        assert_eq!(slot.read("goal.md").unwrap(), "one\nTWO\nthree\n");
     }
 }
