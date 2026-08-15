@@ -327,8 +327,10 @@ mod tests {
 
     #[test]
     fn folder_label_uses_last_component() {
-        let m = SessionMeta::new(PathBuf::from(r"C:\Users\jason\Desktop\grokaagent"));
+        let m = SessionMeta::new(PathBuf::from("C:/Users/jason/Desktop/grokaagent"));
         assert_eq!(m.folder_label(), "grokaagent");
+        let unix = SessionMeta::new(PathBuf::from("/Users/jason/Desktop/grokaagent"));
+        assert_eq!(unix.folder_label(), "grokaagent");
     }
 
     #[test]
