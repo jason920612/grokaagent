@@ -293,6 +293,113 @@ pub fn fmt_duration_field(ms: u64) -> String {
     format!("{:>width$}", fmt_duration(ms), width = DURATION_FIELD)
 }
 
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Markdown → HTML using only tags we emit. Raw HTML in the source is escaped.
+pub fn markdown_html(src: &str) -> String {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    let mut out = String::new();
+    let mut in_code = false;
+    for ev in Parser::new_ext(src, opts) {
+        match ev {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => out.push_str("<p>"),
+                Tag::Heading { level, .. } => {
+                    out.push_str(&format!("<h{level}>"));
+                }
+                Tag::BlockQuote(_) => out.push_str("<blockquote>"),
+                Tag::CodeBlock(_) => {
+                    in_code = true;
+                    out.push_str("<pre><code>");
+                }
+                Tag::List(None) => out.push_str("<ul>"),
+                Tag::List(Some(_)) => out.push_str("<ol>"),
+                Tag::Item => out.push_str("<li>"),
+                Tag::Emphasis => out.push_str("<em>"),
+                Tag::Strong => out.push_str("<strong>"),
+                Tag::Strikethrough => out.push_str("<del>"),
+                Tag::Link { dest_url, .. } => {
+                    let href = dest_url.trim();
+                    let safe = if href.starts_with("https://") || href.starts_with("http://") {
+                        html_escape(href)
+                    } else {
+                        String::new()
+                    };
+                    if safe.is_empty() {
+                        out.push_str("<span>");
+                    } else {
+                        out.push_str("<a href=\"");
+                        out.push_str(&safe);
+                        out.push_str("\" rel=\"noreferrer\" target=\"_blank\">");
+                    }
+                }
+                Tag::Table(_) => out.push_str("<table>"),
+                Tag::TableHead => out.push_str("<thead>"),
+                Tag::TableRow => out.push_str("<tr>"),
+                Tag::TableCell => out.push_str("<td>"),
+                Tag::HtmlBlock | Tag::MetadataBlock(_) => {}
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => out.push_str("</p>"),
+                TagEnd::Heading(level) => out.push_str(&format!("</h{level}>")),
+                TagEnd::BlockQuote(_) => out.push_str("</blockquote>"),
+                TagEnd::CodeBlock => {
+                    in_code = false;
+                    out.push_str("</code></pre>");
+                }
+                TagEnd::List(false) => out.push_str("</ul>"),
+                TagEnd::List(true) => out.push_str("</ol>"),
+                TagEnd::Item => out.push_str("</li>"),
+                TagEnd::Emphasis => out.push_str("</em>"),
+                TagEnd::Strong => out.push_str("</strong>"),
+                TagEnd::Strikethrough => out.push_str("</del>"),
+                TagEnd::Link => out.push_str("</a>"),
+                TagEnd::Table => out.push_str("</table>"),
+                TagEnd::TableHead => out.push_str("</thead>"),
+                TagEnd::TableRow => out.push_str("</tr>"),
+                TagEnd::TableCell => out.push_str("</td>"),
+                _ => {}
+            },
+            Event::Text(t) => out.push_str(&html_escape(&t)),
+            Event::Code(t) => {
+                if in_code {
+                    out.push_str(&html_escape(&t));
+                } else {
+                    out.push_str("<code>");
+                    out.push_str(&html_escape(&t));
+                    out.push_str("</code>");
+                }
+            }
+            Event::SoftBreak => out.push(' '),
+            Event::HardBreak => out.push_str("<br>"),
+            Event::Rule => out.push_str("<hr>"),
+            Event::Html(t) | Event::InlineHtml(t) => out.push_str(&html_escape(&t)),
+            Event::FootnoteReference(_) | Event::TaskListMarker(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {}
+        }
+    }
+    if out.is_empty() {
+        html_escape(src)
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +460,13 @@ mod tests {
             assert_eq!(field.chars().count(), DURATION_FIELD, "{ms} {field:?}");
             assert!(field.contains(fmt_duration(ms).trim()), "{field}");
         }
+    }
+
+    #[test]
+    fn markdown_html_escapes_raw_tags() {
+        let html = markdown_html("hi <script>alert(1)</script> **b**");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(html.contains("<strong>b</strong>"), "{html}");
     }
 }

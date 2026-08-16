@@ -70,19 +70,57 @@ pub fn trigger_tokens(window: u32) -> u32 {
     ((window as f32) * TRIGGER_RATIO) as u32
 }
 
+/// Vision tiles are ~1k tokens, not the base64 byte length / 4.
+const VISION_ESTIMATE_TOKENS: u32 = 1024;
+
 /// Cheap local estimate when the provider has not yet reported `input_tokens`.
+/// Image data URIs are counted as vision tiles, not as text.
 pub fn estimate_tokens(instructions: &str, items: &[Value]) -> u32 {
-    let body = serde_json::to_string(items).unwrap_or_default();
-    let n = instructions.len().saturating_add(body.len()) as u32;
-    (n / 4).max(1)
+    let mut text = instructions.len() as u32;
+    let mut images = 0u32;
+    for item in items {
+        count_estimate(item, &mut text, &mut images);
+    }
+    (text / 4)
+        .saturating_add(images.saturating_mul(VISION_ESTIMATE_TOKENS))
+        .max(1)
 }
 
-pub fn should_compact(used_tokens: u32, window: u32, item_count: usize, keep_recent: usize) -> bool {
+fn count_estimate(v: &Value, text: &mut u32, images: &mut u32) {
+    match v {
+        Value::String(s) => {
+            if s.starts_with("data:image/") {
+                *images = images.saturating_add(1);
+            } else {
+                *text = text.saturating_add(s.len() as u32);
+            }
+        }
+        Value::Array(arr) => {
+            for x in arr {
+                count_estimate(x, text, images);
+            }
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("input_image") {
+                *images = images.saturating_add(1);
+                return;
+            }
+            for (k, x) in map {
+                *text = text.saturating_add(k.len() as u32);
+                count_estimate(x, text, images);
+            }
+        }
+        Value::Number(n) => *text = text.saturating_add(n.to_string().len() as u32),
+        Value::Bool(_) | Value::Null => *text = text.saturating_add(4),
+    }
+}
+
+pub fn should_compact(used_tokens: u32, window: u32, items: &[Value], keep_recent: usize) -> bool {
     if window == 0 {
         return false;
     }
-    let keep = keep_recent.max(1);
-    used_tokens >= trigger_tokens(window) && item_count >= keep.saturating_add(MIN_HEAD_ITEMS)
+    used_tokens >= trigger_tokens(window)
+        && split_head_tail(items, keep_recent).0.len() >= MIN_HEAD_ITEMS
 }
 
 pub fn split_head_tail(items: &[Value], keep_recent: usize) -> (&[Value], &[Value]) {
@@ -800,13 +838,59 @@ mod tests {
         json!({"type":"function_call_output","call_id":id,"output":output})
     }
 
+    fn n_users(n: usize) -> Vec<Value> {
+        (0..n).map(|i| user(&format!("u{i}"))).collect()
+    }
+
     #[test]
     fn grok46_window_is_500k_trigger_is_half() {
         assert_eq!(context_window("grok-4.6"), 500_000);
         assert_eq!(trigger_tokens(500_000), 250_000);
-        assert!(should_compact(250_000, 500_000, 20, 6));
-        assert!(!should_compact(249_999, 500_000, 20, 6));
-        assert!(!should_compact(400_000, 500_000, 5, 6));
+        assert!(should_compact(250_000, 500_000, &n_users(20), 6));
+        assert!(!should_compact(249_999, 500_000, &n_users(20), 6));
+        assert!(!should_compact(400_000, 500_000, &n_users(5), 6));
+    }
+
+    #[test]
+    fn estimate_does_not_treat_image_payload_as_text() {
+        let huge = "A".repeat(1_000_000);
+        let items = vec![json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": [
+                {"type": "input_text", "text": "ok"},
+                {
+                    "type": "input_image",
+                    "image_url": format!("data:image/jpeg;base64,{huge}"),
+                    "detail": "high"
+                }
+            ]
+        })];
+        let n = estimate_tokens("hi", &items);
+        assert!(
+            n < 5_000,
+            "data URI must not count as chars/4, got {n}"
+        );
+    }
+
+    #[test]
+    fn should_not_compact_when_split_head_is_below_min() {
+        let mut items = vec![user("[grokaagent compact v1]\nlived gist")];
+        for i in 0..20 {
+            items.push(tool(&format!("c{i}"), "now", "{}"));
+            items.push(tool_out(&format!("c{i}"), "ok"));
+        }
+        assert!(
+            split_head_tail(&items, DEFAULT_KEEP_RECENT).0.len() < MIN_HEAD_ITEMS,
+            "post-fold tail walk must leave a tiny head, got {}",
+            split_head_tail(&items, DEFAULT_KEEP_RECENT).0.len()
+        );
+        assert!(!should_compact(
+            400_000,
+            500_000,
+            &items,
+            DEFAULT_KEEP_RECENT
+        ));
     }
 
     #[test]

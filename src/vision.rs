@@ -81,31 +81,67 @@ pub fn function_call_output(call_id: &str, output: &str, image_uri: Option<&str>
 
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_USER_IMAGES: usize = 4;
+/// Newest image-bearing items stay on the wire; older ones drop to text.
+/// Token pressure is the 50% context compact, not this cap.
+pub const KEEP_RECENT_IMAGES: usize = 10;
+/// Completes that include pixels before they expire. First look + five working turns.
+pub const IMAGE_KEEP_TURNS: u32 = 6;
 
-/// Drop pixels after the model has seen them so later turns can store/chain again.
+pub fn image_item_count(items: &[Value]) -> usize {
+    items.iter().filter(|item| value_has_image(item)).count()
+}
+
+/// Drop every attached image. Used on provider errors and when the keep window ends.
 pub fn strip_attached_images(items: &mut [Value]) {
-    for item in items {
-        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
-            let Some(arr) = item.get("output").and_then(Value::as_array).cloned() else {
-                continue;
-            };
-            if !arr
-                .iter()
-                .any(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
-            {
-                continue;
-            }
-            let text = arr
-                .iter()
-                .find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
-                .and_then(|p| p.get("text").and_then(Value::as_str))
-                .unwrap_or("");
-            item["output"] = Value::String(text.to_string());
-            continue;
+    retain_recent_images(items, 0);
+}
+
+/// Keep the newest `keep` image items; strip the rest to text.
+pub fn retain_recent_images(items: &mut [Value], keep: usize) {
+    let idxs: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| value_has_image(item))
+        .map(|(i, _)| i)
+        .collect();
+    if idxs.len() <= keep {
+        return;
+    }
+    for i in idxs.iter().take(idxs.len() - keep).copied() {
+        strip_one_item_images(&mut items[i]);
+    }
+}
+
+/// After a complete that included images, expire or cap them.
+pub fn prune_attached_images(items: &mut [Value], turns_seen: u32) {
+    if turns_seen >= IMAGE_KEEP_TURNS {
+        strip_attached_images(items);
+    } else {
+        retain_recent_images(items, KEEP_RECENT_IMAGES);
+    }
+}
+
+fn strip_one_item_images(item: &mut Value) {
+    if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+        let Some(arr) = item.get("output").and_then(Value::as_array).cloned() else {
+            return;
+        };
+        if !arr
+            .iter()
+            .any(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
+        {
+            return;
         }
-        if item.get("role").and_then(Value::as_str) == Some("user") {
-            strip_user_content_images(item);
-        }
+        let text = arr
+            .iter()
+            .find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
+            .and_then(|p| p.get("text").and_then(Value::as_str))
+            .unwrap_or("");
+        item["output"] = Value::String(text.to_string());
+        return;
+    }
+    if item.get("role").and_then(Value::as_str) == Some("user") {
+        strip_user_content_images(item);
     }
 }
 
@@ -447,6 +483,40 @@ mod tests {
         strip_attached_images(&mut items);
         assert!(!input_has_image(&items));
         assert_eq!(items[0]["output"], "{\"path\":\"a.jpg\"}");
+    }
+
+    #[test]
+    fn retain_recent_keeps_newest_image_items() {
+        let mut items: Vec<_> = (1..=KEEP_RECENT_IMAGES + 1)
+            .map(|i| {
+                function_call_output(
+                    &format!("c{i}"),
+                    &format!("img-{i}"),
+                    Some("data:image/jpeg;base64,abc"),
+                )
+            })
+            .collect();
+        retain_recent_images(&mut items, KEEP_RECENT_IMAGES);
+        assert_eq!(image_item_count(&items), KEEP_RECENT_IMAGES);
+        assert!(!value_has_image(&items[0]));
+        assert_eq!(items[0]["output"], "img-1");
+        for item in &items[1..] {
+            assert!(value_has_image(item));
+        }
+    }
+
+    #[test]
+    fn prune_expires_after_keep_turns() {
+        let mut items = vec![function_call_output(
+            "c1",
+            "shot",
+            Some("data:image/jpeg;base64,abc"),
+        )];
+        prune_attached_images(&mut items, 1);
+        assert!(input_has_image(&items));
+        prune_attached_images(&mut items, IMAGE_KEEP_TURNS);
+        assert!(!input_has_image(&items));
+        assert_eq!(items[0]["output"], "shot");
     }
 
     #[test]

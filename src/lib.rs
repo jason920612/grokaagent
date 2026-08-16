@@ -10,6 +10,7 @@ pub mod error;
 pub mod events;
 pub mod folderpick;
 pub mod hostio;
+pub mod hub;
 pub mod install;
 pub mod instructions;
 pub mod kit;

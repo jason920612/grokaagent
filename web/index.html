@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grokaagent</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <button type="button" id="new-chat" class="primary">新對話</button>
+      <div id="sessions"></div>
+    </aside>
+    <main>
+      <header id="header">
+        <div id="header-left"></div>
+        <div id="header-right">
+          <button type="button" id="gear" title="設定">設定</button>
+        </div>
+      </header>
+      <section id="chat"></section>
+      <div id="queue"></div>
+      <div id="pending"></div>
+      <footer id="composer-wrap">
+        <div id="composer-bar">
+          <button type="button" id="mode-queue" class="chip on">佇列</button>
+          <button type="button" id="mode-insert" class="chip">插入</button>
+          <button type="button" id="paste-image" class="chip">貼上圖片</button>
+          <button type="button" id="interrupt" class="chip warn hidden">中斷</button>
+        </div>
+        <textarea id="composer" rows="3" placeholder="傳給 grok… Enter 送出，Shift+Enter 換行"></textarea>
+      </footer>
+    </main>
+    <aside id="rail" class="hidden">
+      <h2>代理 / 監控 / 後台</h2>
+      <div id="rail-body"></div>
+    </aside>
+  </div>
+  <div id="overlay" class="hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -652,6 +652,8 @@ pub async fn run<P: Provider>(
     let mut total_turns: u32 = 0;
     let mut seen_model = false;
     let mut consecutive_provider_errors: u32 = 0;
+    let mut image_turns: u32 = 0;
+    let mut images_known: usize = 0;
 
     'run: loop {
         if seen_model {
@@ -659,6 +661,12 @@ pub async fn run<P: Provider>(
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
                 turn = 0;
             }
+        }
+        let n_images = crate::vision::image_item_count(&history);
+        if n_images > images_known {
+            image_turns = 0;
+            crate::vision::retain_recent_images(&mut history, crate::vision::KEEP_RECENT_IMAGES);
+            images_known = crate::vision::image_item_count(&history);
         }
 
         if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
@@ -739,7 +747,7 @@ pub async fn run<P: Provider>(
         let used = last_usage
             .input_tokens
             .max(compact::estimate_tokens(&live_instructions(&cfg), &history));
-        if compact::should_compact(used, window, history.len(), keep_recent) {
+        if compact::should_compact(used, window, &history, keep_recent) {
             let head = compact::split_head_tail(&history, keep_recent).0.to_vec();
             loop {
                 match race_cancel(
@@ -942,6 +950,8 @@ pub async fn run<P: Provider>(
                     e,
                 )
                 .await?;
+                image_turns = 0;
+                images_known = crate::vision::image_item_count(&history);
                 continue;
             }
         };
@@ -992,6 +1002,14 @@ pub async fn run<P: Provider>(
         append_missing_function_calls(&mut history, &response.function_calls);
         pending.clear();
         seen_model = true;
+        if has_image {
+            image_turns = image_turns.saturating_add(1);
+            crate::vision::prune_attached_images(&mut history, image_turns);
+            if image_turns >= crate::vision::IMAGE_KEEP_TURNS {
+                image_turns = 0;
+            }
+            images_known = crate::vision::image_item_count(&history);
+        }
 
         if !response.function_calls.is_empty() {
             emit_model_finished(
@@ -1004,6 +1022,7 @@ pub async fn run<P: Provider>(
                 &last_usage,
             );
             let mut interrupted = false;
+            let mut attached_new = false;
             for call in response.function_calls {
                 let args: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
                 if interrupted || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
@@ -1070,8 +1089,16 @@ pub async fn run<P: Provider>(
                 };
                 let item =
                     crate::vision::function_call_output(&call.call_id, &output, image_uri.as_deref());
+                if image_uri.is_some() {
+                    attached_new = true;
+                }
                 history.push(item.clone());
                 pending.push(item);
+            }
+            if attached_new {
+                image_turns = 0;
+                crate::vision::retain_recent_images(&mut history, crate::vision::KEEP_RECENT_IMAGES);
+                images_known = crate::vision::image_item_count(&history);
             }
             if interrupted {
                 if !take_interrupt(
@@ -1095,10 +1122,6 @@ pub async fn run<P: Provider>(
                 turn = 0;
             }
             continue;
-        }
-
-        if has_image {
-            crate::vision::strip_attached_images(&mut history);
         }
 
         last_text = response.text;
@@ -1711,6 +1734,197 @@ mod tests {
         assert_eq!(parts[1]["detail"], "high");
         let uri = parts[1]["image_url"].as_str().unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,"), "{uri}");
+    }
+
+    #[tokio::test]
+    async fn attached_image_stays_for_a_few_turns_then_strips() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = crate::vision::from_rgba(32, 32, vec![255, 0, 0, 255].repeat(32 * 32)).unwrap();
+        crate::vision::save_jpeg(&dir.path().join("p.jpg"), &img).unwrap();
+        let now = |id: &str| CompleteResponse {
+            function_calls: vec![FunctionCall {
+                call_id: id.into(),
+                name: "now".into(),
+                arguments: "{}".into(),
+            }],
+            ..CompleteResponse::new(id)
+        };
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse {
+                    function_calls: vec![FunctionCall {
+                        call_id: "c1".into(),
+                        name: "read_image".into(),
+                        arguments: r#"{"path":"p.jpg"}"#.into(),
+                    }],
+                    ..CompleteResponse::new("1")
+                },
+                now("c2"),
+                now("c3"),
+                now("c4"),
+                now("c5"),
+                now("c6"),
+                now("c7"),
+                CompleteResponse {
+                    text: "done".into(),
+                    ..CompleteResponse::new("8")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("look at p.jpg", 10);
+        c.workspace = dir.path().to_path_buf();
+        let tools = ToolRegistry::new(vec![
+            Box::new(ReadImageTool::new(c.workspace.clone())),
+            Box::new(NowTool),
+        ]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "done");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 8);
+        assert!(
+            !crate::vision::input_has_image(&calls[0].input),
+            "pixels attach after the tool returns"
+        );
+        for i in 1..=6 {
+            assert!(
+                crate::vision::input_has_image(&calls[i].input),
+                "look {i} must still include pixels"
+            );
+        }
+        assert!(
+            !crate::vision::input_has_image(&calls[7].input),
+            "pixels expire after {} completes: {:?}",
+            crate::vision::IMAGE_KEEP_TURNS,
+            calls[7].input
+        );
+    }
+
+    #[tokio::test]
+    async fn image_payload_does_not_retrigger_compact_every_tool_turn() {
+        struct FoldAware {
+            inner: Scripted,
+            folds: Mutex<u32>,
+        }
+        impl Provider for FoldAware {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                let fold = req.input.iter().any(|i| {
+                    i.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(MEMORY_FOLD_MARK))
+                });
+                if fold {
+                    *self.folds.lock().unwrap() += 1;
+                    self.inner.calls.lock().unwrap().push(req);
+                    return Ok(CompleteResponse {
+                        text: "## Original request\nlook\n## Direction changes\nnone\n## Load-bearing facts\nnone\n## Where you were\nlooking\n".into(),
+                        ..CompleteResponse::new("mem")
+                    });
+                }
+                self.inner.complete(req).await
+            }
+            async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+                self.inner.compact(req).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut px = Vec::with_capacity(320 * 320 * 4);
+        for i in 0..(320 * 320) {
+            px.extend_from_slice(&[
+                (i * 17) as u8,
+                (i * 31) as u8,
+                (i * 13) as u8,
+                255,
+            ]);
+        }
+        let img = crate::vision::from_rgba(320, 320, px).unwrap();
+        crate::vision::save_jpeg(&dir.path().join("p.jpg"), &img).unwrap();
+        let pad = vec![
+            json!({"role":"user","content":"pad-1"}),
+            json!({"role":"user","content":"pad-2"}),
+            json!({"role":"user","content":"pad-3"}),
+            json!({"role":"user","content":"pad-4"}),
+            json!({"role":"user","content":"pad-5"}),
+        ];
+        let provider = FoldAware {
+            inner: Scripted {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(pop_front(vec![
+                    CompleteResponse {
+                        function_calls: vec![FunctionCall {
+                            call_id: "c1".into(),
+                            name: "read_image".into(),
+                            arguments: r#"{"path":"p.jpg"}"#.into(),
+                        }],
+                        usage: CacheUsage {
+                            input_tokens: 80,
+                            cached_tokens: 0,
+                        },
+                        output_items: {
+                            let mut v = pad.clone();
+                            v.push(json!({"type":"function_call","call_id":"c1","name":"read_image","arguments":r#"{"path":"p.jpg"}"#}));
+                            v
+                        },
+                        ..CompleteResponse::new("1")
+                    },
+                    CompleteResponse {
+                        function_calls: vec![FunctionCall {
+                            call_id: "c2".into(),
+                            name: "now".into(),
+                            arguments: "{}".into(),
+                        }],
+                        usage: CacheUsage {
+                            input_tokens: 90,
+                            cached_tokens: 0,
+                        },
+                        ..CompleteResponse::new("2")
+                    },
+                    CompleteResponse {
+                        function_calls: vec![FunctionCall {
+                            call_id: "c3".into(),
+                            name: "now".into(),
+                            arguments: "{}".into(),
+                        }],
+                        usage: CacheUsage {
+                            input_tokens: 90,
+                            cached_tokens: 0,
+                        },
+                        ..CompleteResponse::new("3")
+                    },
+                    CompleteResponse {
+                        text: "done".into(),
+                        usage: CacheUsage {
+                            input_tokens: 90,
+                            cached_tokens: 0,
+                        },
+                        ..CompleteResponse::new("4")
+                    },
+                ])),
+                compact_calls: Mutex::new(Vec::new()),
+                compact_ok: true,
+            },
+            folds: Mutex::new(0),
+        };
+        let mut c = cfg("look at p.jpg", 8);
+        c.workspace = dir.path().to_path_buf();
+        c.context_window = 4_000;
+        c.compact_keep_recent = 2;
+        let tools = ToolRegistry::new(vec![
+            Box::new(ReadImageTool::new(c.workspace.clone())),
+            Box::new(NowTool),
+        ]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "done");
+        assert_eq!(
+            *provider.folds.lock().unwrap(),
+            0,
+            "image bytes must not trip the 50% trigger when provider usage stays low"
+        );
+        assert_eq!(out.compacted, 0);
     }
 
     #[tokio::test]

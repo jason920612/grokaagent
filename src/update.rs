@@ -53,10 +53,13 @@ impl Release {
     }
 
     pub fn is_newer_than(&self, current: &str) -> Result<bool> {
-        let cur = parse_version(current).ok_or_else(|| {
+        let cur = version_key(current).ok_or_else(|| {
             Error::Update(format!("unrecognized current version `{current}`"))
         })?;
-        Ok(self.version()? > cur)
+        let rel = version_key(&self.tag_name).ok_or_else(|| {
+            Error::Update(format!("unrecognized release tag `{}`", self.tag_name))
+        })?;
+        Ok(rel > cur)
     }
 
     pub fn asset(&self, name: &str) -> Option<&Asset> {
@@ -93,15 +96,25 @@ pub fn binary_asset_name(target: &str) -> String {
 }
 
 pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    version_key(s).map(|(major, minor, patch, _)| (major, minor, patch))
+}
+
+/// `(major, minor, patch, stable)`. A release sorts above the same numbers with a
+/// `-rc` / `-beta` suffix, so `0.1.2` is newer than `0.1.2-rc.1`.
+fn version_key(s: &str) -> Option<(u64, u64, u64, bool)> {
     let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
+    let (core, stable) = match s.split_once('-') {
+        Some((core, _)) => (core, false),
+        None => (s, true),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch))
+    Some((major, minor, patch, stable))
 }
 
 pub fn parse_release_json(json: &str) -> Result<Release> {
@@ -432,7 +445,8 @@ mod tests {
     fn parse_version_strips_v_prefix() {
         assert_eq!(parse_version("v0.1.0"), Some((0, 1, 0)));
         assert_eq!(parse_version("0.1.1"), Some((0, 1, 1)));
-        assert_eq!(parse_version("1.0.0-beta"), None);
+        assert_eq!(parse_version("v0.1.2-rc.1"), Some((0, 1, 2)));
+        assert_eq!(parse_version("0.1.1-rc1"), Some((0, 1, 1)));
         assert_eq!(parse_version("nope"), None);
     }
 
@@ -442,6 +456,7 @@ mod tests {
         assert!(rel.is_newer_than("0.1.0").unwrap());
         assert!(!rel.is_newer_than("0.1.1").unwrap());
         assert!(!rel.is_newer_than("v0.2.0").unwrap());
+        assert!(rel.is_newer_than("0.1.1-rc.1").unwrap());
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::error::{Error, Result};
 use crate::events::{AgentEvent, ChannelSink, EventMeta, EventSink, FanoutSink, JsonlSink};
 use crate::catalog::{clamp_effort_for_model, cycle_effort, EffortOpt, ModelCatalog};
 use crate::folderpick::{self, FolderView};
+use crate::hub::{self, UiCommand, UiSnapshot};
 use crate::kit;
 use crate::md;
 use crate::provider::{ReasoningEffort, XaiOauthProvider};
@@ -1287,6 +1288,9 @@ struct App {
     skill_cursor: usize,
     skill_scroll: u16,
     skill_view: Option<SkillView>,
+    web_url: Option<String>,
+    composer_seq: u64,
+    web_composer_seq: u64,
 }
 
 impl App {
@@ -5069,9 +5073,14 @@ fn header_copy(app: &App, opts: &TuiOptions) -> (String, String) {
             kids
         )
     } else {
+        let web = app
+            .web_url
+            .as_ref()
+            .map(|u| format!("  {u}"))
+            .unwrap_or_default();
         format!(
-            " grokaagent  {}  {}  {}{}",
-            app.status, auth, app.cache, kids
+            " grokaagent  {}  {}  {}{}{}",
+            app.status, auth, app.cache, kids, web
         )
     };
     let effort_bit = if app
@@ -7016,6 +7025,496 @@ fn draw_drop_list(
     }
 }
 
+fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
+    let elapsed_ms = app
+        .work_started
+        .map(|t| t.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let (login, login_url, login_code) = match &app.login_ui {
+        LoginUi::Idle => ("idle".into(), None, None),
+        LoginUi::Starting => ("starting".into(), None, None),
+        LoginUi::Waiting { url, user_code } => {
+            ("waiting".into(), Some(url.clone()), Some(user_code.clone()))
+        }
+        LoginUi::Failed(m) => (format!("failed:{m}"), None, None),
+    };
+    let prefs = app
+        .skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let import_claude = prefs.prefs().import_claude;
+    let import_codex = prefs.prefs().import_codex;
+    drop(prefs);
+    let settings = app.settings.as_ref().filter(|w| !w.minimized).map(|_| {
+        hub::UiSettings {
+            field: format!("{:?}", app.setting_field),
+            login,
+            login_url,
+            login_code,
+            models: model_choices(app, opts),
+            efforts: effort_choices(app, opts)
+                .into_iter()
+                .map(|e| (e.id, e.label))
+                .collect(),
+            web_search: opts.web_search,
+            import_claude,
+            import_codex,
+            skills: app
+                .skill_list
+                .iter()
+                .map(|s| hub::UiSkill {
+                    name: s.name.clone(),
+                    origin: s.origin.label().to_string(),
+                    enabled: s.enabled,
+                    description: s.description.clone(),
+                })
+                .collect(),
+        }
+    });
+    UiSnapshot {
+        session_id: app.current_id.clone(),
+        header: hub::UiHeader {
+            model: opts.model.clone(),
+            effort: opts.reasoning_effort.as_str().to_string(),
+            status: app.status.clone(),
+            activity: app.activity.clone(),
+            cache: app.cache.clone(),
+            running: app.running,
+            awaiting: app.awaiting,
+            logged_in: app.logged_in,
+            elapsed_ms,
+            tick: app.tick,
+            workspace: folderpick::display_path(&app.session.workspace),
+        },
+        composer: hub::UiComposer {
+            text: app.edit.text.clone(),
+            caret: app.edit.caret,
+            seq: app.composer_seq,
+            echo_seq: app.web_composer_seq,
+            queue_edit: app.queue_edit,
+        },
+        rows: app.rows.iter().map(ui_row).collect(),
+        sessions: app
+            .sessions
+            .iter()
+            .map(|s| hub::UiSession {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                short_id: s.short_id(),
+                folder: s.folder_label(),
+                current: s.id == app.current_id,
+            })
+            .collect(),
+        queue: app
+            .queue
+            .iter()
+            .map(|q| hub::UiQueued {
+                text: q.label(),
+                images: q.images.len(),
+            })
+            .collect(),
+        pending: app.pending.clone(),
+        send_mode: match app.send_mode {
+            SendMode::Queue => "queue".into(),
+            SendMode::Insert => "insert".into(),
+        },
+        rail: hub::UiRail {
+            children: app
+                .children
+                .iter()
+                .map(|c| hub::UiChild {
+                    name: c.name.clone(),
+                    prompt: c.prompt.clone(),
+                    status: c.status.clone(),
+                    activity: c.activity.clone(),
+                    alive: c.alive,
+                    card_url: c.card_url.clone(),
+                    log: c.log.clone(),
+                    messages: c
+                        .messages
+                        .iter()
+                        .map(|m| hub::UiSideMsg {
+                            from: m.from.clone(),
+                            to: m.to.clone(),
+                            text: m.text.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            monitors: app
+                .monitors
+                .iter()
+                .map(|m| hub::UiMon {
+                    name: m.name.clone(),
+                    command: m.command.clone(),
+                    pid: m.pid,
+                    status: m.status.clone(),
+                    alive: m.alive,
+                    detail: m.detail.clone(),
+                })
+                .collect(),
+            backgrounds: app
+                .backgrounds
+                .iter()
+                .map(|b| hub::UiBg {
+                    name: b.name.clone(),
+                    command: b.command.clone(),
+                    pid: b.pid,
+                    status: b.status.clone(),
+                    alive: b.alive,
+                    detail: b.detail.clone(),
+                    log: b.log.clone(),
+                })
+                .collect(),
+        },
+        settings,
+        ask: app.ask.as_ref().map(|a| hub::UiAsk {
+            prompt: a.question.prompt.clone(),
+            allow_multiple: a.question.allow_multiple,
+            options: a
+                .question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| hub::UiAskOpt {
+                    id: o.id.clone(),
+                    label: o.label.clone(),
+                    input: o.input,
+                    chosen: a.chosen.get(i).copied().unwrap_or(false),
+                    value: a.values.get(i).cloned().unwrap_or_default(),
+                })
+                .collect(),
+        }),
+        picker: app.workspace_pick.as_ref().map(|p| hub::UiPicker {
+            path: p.edit.text.clone(),
+            notice: p.notice.clone(),
+            cursor: p.cursor,
+            entries: p
+                .view
+                .entries
+                .iter()
+                .map(|e| hub::UiPickEntry {
+                    name: e.name.clone(),
+                    is_dir: e.is_dir,
+                    is_parent: e.is_parent,
+                })
+                .collect(),
+        }),
+        inspector: app.inspector.as_ref().map(|i| match i {
+            Inspector::Child(n) => hub::UiInspector {
+                kind: "child".into(),
+                name: n.clone(),
+            },
+            Inspector::Monitor(n) => hub::UiInspector {
+                kind: "monitor".into(),
+                name: n.clone(),
+            },
+            Inspector::Background(n) => hub::UiInspector {
+                kind: "background".into(),
+                name: n.clone(),
+            },
+        }),
+        image_view: app.image_view.clone(),
+        tool_panel: app.open_tool.map(|(group, item)| hub::UiToolPanel { group, item }),
+        skill_view: app.skill_view.as_ref().map(|v| hub::UiSkillView {
+            title: v.title.clone(),
+            origin: v.origin.clone(),
+            body: v.edit.text.clone(),
+        }),
+        rename: app.rename.as_ref().map(|(id, e)| hub::UiRename {
+            id: id.clone(),
+            text: e.text.clone(),
+        }),
+        web_url: app.web_url.clone().unwrap_or_default(),
+    }
+}
+
+fn ui_row(row: &Row) -> hub::UiRow {
+    match row {
+        Row::User(u) => hub::UiRow {
+            kind: "user".into(),
+            html: hub::text_html(&u.text),
+            text: u.text.clone(),
+            expanded: None,
+            done: None,
+            elapsed_ms: None,
+            images: u.images.clone(),
+            calls: Vec::new(),
+            path: None,
+            label: None,
+        },
+        Row::Agent(a) => hub::UiRow {
+            kind: "agent".into(),
+            html: md::markdown_html(&a.text),
+            text: a.text.clone(),
+            expanded: None,
+            done: None,
+            elapsed_ms: Some(a.work_ms),
+            images: Vec::new(),
+            calls: Vec::new(),
+            path: None,
+            label: None,
+        },
+        Row::Think(t) => {
+            let elapsed = t
+                .started
+                .map(|s| s.elapsed().as_millis() as u64)
+                .unwrap_or(t.elapsed_ms);
+            hub::UiRow {
+                kind: "think".into(),
+                html: hub::pre_html(&t.text),
+                text: t.text.clone(),
+                expanded: Some(t.expanded),
+                done: Some(t.done),
+                elapsed_ms: Some(elapsed),
+                images: Vec::new(),
+                calls: Vec::new(),
+                path: None,
+                label: None,
+            }
+        }
+        Row::Tools(g) => hub::UiRow {
+            kind: "tools".into(),
+            html: String::new(),
+            text: format!("{} tools", g.calls.len()),
+            expanded: Some(g.expanded),
+            done: Some(g.calls.iter().all(|c| c.done)),
+            elapsed_ms: None,
+            images: Vec::new(),
+            calls: g
+                .calls
+                .iter()
+                .map(|c| hub::UiToolCall {
+                    name: c.name.clone(),
+                    phase: c.phase.clone(),
+                    done: c.done,
+                    args: c.args.to_string(),
+                    output: c.output.clone(),
+                    files: c
+                        .files
+                        .iter()
+                        .map(|f| hub::UiFileChange {
+                            path: f.path.clone(),
+                            kind: f.kind.clone(),
+                            diff_html: hub::diff_html(&f.diff),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            path: None,
+            label: None,
+        },
+        Row::Meta(s) => hub::UiRow {
+            kind: "meta".into(),
+            html: hub::text_html(s),
+            text: s.clone(),
+            expanded: None,
+            done: None,
+            elapsed_ms: None,
+            images: Vec::new(),
+            calls: Vec::new(),
+            path: None,
+            label: None,
+        },
+        Row::Err(s) => hub::UiRow {
+            kind: "err".into(),
+            html: hub::text_html(s),
+            text: s.clone(),
+            expanded: None,
+            done: None,
+            elapsed_ms: None,
+            images: Vec::new(),
+            calls: Vec::new(),
+            path: None,
+            label: None,
+        },
+        Row::Picture { path, label } => hub::UiRow {
+            kind: "picture".into(),
+            html: hub::text_html(label),
+            text: label.clone(),
+            expanded: None,
+            done: None,
+            elapsed_ms: None,
+            images: Vec::new(),
+            calls: Vec::new(),
+            path: Some(path.clone()),
+            label: Some(label.clone()),
+        },
+    }
+}
+
+fn apply_ui_command(
+    app: &mut App,
+    opts: &mut TuiOptions,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+    cmd: UiCommand,
+) {
+    match cmd {
+        UiCommand::SetComposer { text, caret, seq } => {
+            app.edit.text = text.chars().take(100_000).collect();
+            app.edit.caret = caret;
+            app.edit.anchor = None;
+            app.edit.clamp();
+            app.web_composer_seq = seq;
+            app.composer_seq = app.composer_seq.max(seq);
+        }
+        UiCommand::Submit { insert } => {
+            app.web_composer_seq = 0;
+            app.composer_seq = app.composer_seq.saturating_add(1);
+            submit_current(app, opts, sink, done_tx, insert);
+        }
+        UiCommand::Interrupt => {
+            let _ = app.interrupt_work();
+        }
+        UiCommand::SetSendMode { mode } => {
+            app.send_mode = if mode == "insert" {
+                SendMode::Insert
+            } else {
+                SendMode::Queue
+            };
+        }
+        UiCommand::PasteImage => app.paste_image(),
+        UiCommand::PasteText { text } => app.paste_text_or_images(&text),
+        UiCommand::RemovePending { index } => {
+            if index < app.pending.len() {
+                app.pending.remove(index);
+            }
+        }
+        UiCommand::ToggleExpand { index } => {
+            if let Some(row) = app.rows.get_mut(index) {
+                match row {
+                    Row::Think(t) => t.expanded = !t.expanded,
+                    Row::Tools(g) => g.expanded = !g.expanded,
+                    _ => {}
+                }
+            }
+        }
+        UiCommand::OpenTool { group, item } => {
+            app.open_tool = Some((group, item));
+        }
+        UiCommand::CloseTool => app.open_tool = None,
+        UiCommand::OpenSettings => {
+            app.refresh_skills();
+            open_settings(app);
+        }
+        UiCommand::CloseSettings => {
+            app.settings = None;
+            app.drop = None;
+            if app.focus == Focus::Settings {
+                app.focus = Focus::Chat;
+            }
+        }
+        UiCommand::Login => activate_account(app),
+        UiCommand::Logout => logout_account(app),
+        UiCommand::SetModel { id } => apply_selected_model(app, opts, id),
+        UiCommand::SetEffort { id } => {
+            if let Some(e) = ReasoningEffort::parse(&id) {
+                apply_selected_effort(app, opts, e);
+            }
+        }
+        UiCommand::ToggleSearch => {
+            opts.web_search = !opts.web_search;
+            sync_knobs(&app.knobs, opts, &app.catalog);
+        }
+        UiCommand::ToggleImportClaude => app.toggle_import_claude(),
+        UiCommand::ToggleImportCodex => app.toggle_import_codex(),
+        UiCommand::ToggleSkill { index } => app.toggle_skill(index),
+        UiCommand::OpenSkill { index } => app.open_skill_view(index),
+        UiCommand::CloseSkill => app.close_skill_view(),
+        UiCommand::NewChat => app.new_chat(),
+        UiCommand::Switch { id } => app.switch_to(&id),
+        UiCommand::BeginRename { id } => app.begin_rename(&id),
+        UiCommand::CommitRename { text } => {
+            if let Some((_, edit)) = app.rename.as_mut() {
+                *edit = Edit::at_end(text);
+            }
+            app.commit_rename();
+        }
+        UiCommand::CancelRename => app.cancel_rename(),
+        UiCommand::DeleteSession { id } => app.delete_session(&id),
+        UiCommand::AskToggle { index } => app.activate_ask_option(index, false),
+        UiCommand::AskFill { index, text } => {
+            if let Some(ask) = app.ask.as_mut() {
+                if index < ask.values.len() {
+                    ask.cursor = index;
+                    let clipped: String = text.chars().take(ask::MAX_INPUT).collect();
+                    ask.values[index] = clipped.clone();
+                    if ask.question.options.get(index).is_some_and(|o| o.input) {
+                        if !ask.question.allow_multiple {
+                            ask.chosen.fill(false);
+                        }
+                        if let Some(c) = ask.chosen.get_mut(index) {
+                            *c = true;
+                        }
+                        ask.fill_edit = Edit::at_end(clipped);
+                    }
+                }
+            }
+        }
+        UiCommand::AskConfirm => app.submit_ask(),
+        UiCommand::AskCancel => app.cancel_ask(),
+        UiCommand::WsSetPath { text } => {
+            if let Some(p) = app.workspace_pick.as_mut() {
+                p.edit = Edit::at_end(text.chars().take(1000).collect());
+            }
+            app.sync_workspace_pick();
+        }
+        UiCommand::WsSelect { index } => {
+            if let Some(p) = app.workspace_pick.as_mut() {
+                if index < p.view.entries.len() {
+                    p.cursor = index;
+                }
+            }
+        }
+        UiCommand::WsConfirm => app.confirm_workspace_pick(),
+        UiCommand::WsCancel => app.cancel_workspace_pick(),
+        UiCommand::WsCreate => app.create_workspace_dir(),
+        UiCommand::WsEnter => {
+            let idx = app.workspace_pick.as_ref().map(|p| p.cursor).unwrap_or(0);
+            app.activate_ws_entry(idx);
+        }
+        UiCommand::OpenChild { name } => {
+            app.inspector = Some(Inspector::Child(name));
+            app.focus = Focus::Inspector;
+        }
+        UiCommand::OpenMonitor { name } => {
+            app.inspector = Some(Inspector::Monitor(name));
+            app.focus = Focus::Inspector;
+        }
+        UiCommand::OpenBackground { name } => {
+            app.inspector = Some(Inspector::Background(name));
+            app.focus = Focus::Inspector;
+        }
+        UiCommand::CloseInspector => app.close_inspector(),
+        UiCommand::OpenImage { path } => app.open_image_view(path),
+        UiCommand::CloseImage => app.close_image_view(),
+        UiCommand::EditQueue { index } => app.begin_queue_edit(index),
+        UiCommand::CancelQueueEdit => app.cancel_queue_edit(),
+        UiCommand::CommitQueueEdit => {
+            let _ = app.commit_queue_edit();
+        }
+    }
+}
+
+fn publish_ui(hub: Option<&hub::Hub>, app: &mut App, opts: &TuiOptions) {
+    let Some(hub) = hub else {
+        return;
+    };
+    app.refresh_session_list();
+    hub.set_workspace(app.session.workspace.clone());
+    hub.publish(&hub::ServerMsg::Snapshot {
+        snapshot: ui_snapshot(app, opts),
+    });
+}
+
+async fn recv_hub_cmd(hub: &mut Option<hub::Hub>) -> Option<UiCommand> {
+    match hub {
+        Some(h) => h.cmd_rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     let auth_path = auth::default_auth_path()?;
     enable_raw_mode().map_err(Error::Io)?;
@@ -7172,6 +7671,9 @@ async fn tui_loop(
             skill_cursor: 0,
             skill_scroll: 0,
             skill_view: None,
+            web_url: None,
+            composer_seq: 0,
+            web_composer_seq: 0,
     };
     app.catalog.ensure_current(&opts.model, opts.reasoning_effort);
     app.want_catalog = app.logged_in;
@@ -7181,6 +7683,18 @@ async fn tui_loop(
         } else {
             app.push(Row::Meta("尚未登入 — 在設定中登入 Grok 帳號".into()));
         }
+    }
+
+    let mut hub = match hub::start(app.session.workspace.clone()).await {
+        Ok(h) => h,
+        Err(e) => {
+            app.push(Row::Err(format!("網頁界面無法啟動: {e}")));
+            None
+        }
+    };
+    if let Some(h) = &hub {
+        app.web_url = Some(h.url.clone());
+        app.push(Row::Meta(format!("網頁界面  {}", h.url)));
     }
 
     let mut keys = EventStream::new();
@@ -7206,6 +7720,13 @@ async fn tui_loop(
             apply_login_event(&mut app, ev);
             content_dirty = true;
             composer_dirty = true;
+        }
+        if let Some(h) = hub.as_mut() {
+            while let Ok(cmd) = h.cmd_rx.try_recv() {
+                apply_ui_command(&mut app, &mut opts, &sink, &done_tx, cmd);
+                content_dirty = true;
+                composer_dirty = true;
+            }
         }
         if app.want_catalog
             && app.logged_in
@@ -7243,6 +7764,9 @@ async fn tui_loop(
         }
         kick_idle_queue(&mut app, &opts, &sink, &done_tx);
         pulse_spinner(&mut app);
+        if content_dirty || composer_dirty || app.running {
+            publish_ui(hub.as_ref(), &mut app, &opts);
+        }
         match terminal.size() {
             Ok(size) if size != last_size => {
                 last_size = size;
@@ -7295,6 +7819,7 @@ async fn tui_loop(
                         }
                         content_dirty = true;
                         composer_dirty = true;
+                        app.composer_seq = app.composer_seq.saturating_add(1);
                         for ev in batch {
                             if handle_input(&mut app, &mut opts, ev, &sink, &done_tx) {
                                 quit = true;
@@ -7306,6 +7831,13 @@ async fn tui_loop(
                         }
                     }
                     _ => continue,
+                }
+            }
+            cmd = recv_hub_cmd(&mut hub) => {
+                if let Some(cmd) = cmd {
+                    apply_ui_command(&mut app, &mut opts, &sink, &done_tx, cmd);
+                    content_dirty = true;
+                    composer_dirty = true;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {}
@@ -10425,6 +10957,9 @@ mod tests {
             skill_cursor: 0,
             skill_scroll: 0,
             skill_view: None,
+            web_url: None,
+            composer_seq: 0,
+            web_composer_seq: 0,
         }
     }
 
@@ -11710,6 +12245,115 @@ mod tests {
         assert_eq!(changed[0].0, 5);
         assert_eq!(changed[0].2.symbol(), "2");
         assert!(clock_cells_changed(&next, &next).is_empty());
+    }
+
+    #[test]
+    fn web_snapshot_renders_user_and_composer() {
+        let mut app = test_app();
+        app.edit = Edit::at_end("typed".into());
+        app.composer_seq = 4;
+        app.push(Row::User("hello <b>".into()));
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let snap = ui_snapshot(&app, &opts);
+        assert_eq!(snap.composer.text, "typed");
+        assert_eq!(snap.composer.seq, 4);
+        let user = snap.rows.iter().find(|r| r.kind == "user").unwrap();
+        assert!(user.html.contains("&lt;b&gt;"), "{}", user.html);
+        assert!(!user.html.contains("<b>"), "{}", user.html);
+    }
+
+    #[test]
+    fn web_set_composer_then_submit_queues_while_running() {
+        let mut app = test_app();
+        app.running = true;
+        app.send_mode = SendMode::Queue;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.inbox_tx = Some(tx);
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let sink = Arc::new(FanoutSink { sinks: vec![] });
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        apply_ui_command(
+            &mut app,
+            &mut { opts.clone() },
+            &sink,
+            &done_tx,
+            UiCommand::SetComposer {
+                text: "from web".into(),
+                caret: 8,
+                seq: 9,
+            },
+        );
+        assert_eq!(app.edit.text, "from web");
+        assert_eq!(app.web_composer_seq, 9);
+        apply_ui_command(
+            &mut app,
+            &mut { opts.clone() },
+            &sink,
+            &done_tx,
+            UiCommand::Submit { insert: false },
+        );
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].text, "from web");
+        assert!(app.edit.is_empty());
+    }
+
+    #[test]
+    fn web_commands_cover_sessions_ask_settings_and_rail() {
+        let mut app = test_app();
+        app.current_id = "s".into();
+        app.session.id = "s".into();
+        app.parked.insert("other".into(), parked_stub("other"));
+        let mut opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let sink = Arc::new(FanoutSink { sinks: vec![] });
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::Switch { id: "other".into() });
+        assert_eq!(app.current_id, "other");
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::NewChat);
+        assert!(app.workspace_pick.is_some());
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::WsCancel);
+        assert!(app.workspace_pick.is_none());
+
+        app.apply_event(sample_ask(false));
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::AskToggle { index: 0 });
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::AskConfirm);
+        assert!(app.ask.is_none());
+
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::OpenSettings);
+        assert!(app.settings.is_some());
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::ToggleSearch);
+        assert!(opts.web_search);
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::CloseSettings);
+        assert!(app.settings.is_none());
+
+        app.children.push(SideChild {
+            name: "coder".into(),
+            prompt: "fix".into(),
+            card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
+            status: "工作中".into(),
+            alive: true,
+            activity: "思考".into(),
+            log: vec!["hi".into()],
+            messages: vec![],
+        });
+
+        apply_ui_command(
+            &mut app,
+            &mut opts,
+            &sink,
+            &done_tx,
+            UiCommand::OpenChild { name: "coder".into() },
+        );
+        assert!(matches!(app.inspector, Some(Inspector::Child(ref n)) if n == "coder"));
+        let snap = ui_snapshot(&app, &opts);
+        assert_eq!(snap.rail.children.len(), 1);
+        assert_eq!(snap.inspector.as_ref().unwrap().name, "coder");
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::CloseInspector);
+        assert!(app.inspector.is_none());
+
+        app.running = true;
+        app.cancel = Some(CancelFlag::new());
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::Interrupt);
+        assert_eq!(app.status, "中斷中");
     }
 
     #[test]
