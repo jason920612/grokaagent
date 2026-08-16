@@ -228,6 +228,28 @@ impl SessionStore {
         };
         serde_json::from_slice(&raw).unwrap_or_default()
     }
+
+    pub fn save_task<T: Serialize>(&self, id: &str, state: &T) -> Result<()> {
+        let dir = self.dir(id);
+        if !dir.join("meta.json").exists() {
+            return Ok(());
+        }
+        atomic_write(&dir.join("task.json"), &serde_json::to_vec_pretty(state)?)?;
+        Ok(())
+    }
+
+    pub fn load_task<T: DeserializeOwned>(&self, id: &str) -> Option<T> {
+        let path = self.dir(id).join("task.json");
+        let raw = fs::read(path).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    pub fn clear_task(&self, id: &str) {
+        let path = self.dir(id).join("task.json");
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub fn default_sessions_dir() -> Result<PathBuf> {
@@ -542,5 +564,24 @@ mod tests {
             .save_context("missing-id", &[serde_json::json!({"role":"user","content":"x"})])
             .unwrap();
         assert!(store.load_context("missing-id").is_empty());
+    }
+
+    #[test]
+    fn task_save_load_clear_and_skips_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().to_path_buf()).unwrap();
+        store
+            .save_task("missing-id", &serde_json::json!({"goal": "x"}))
+            .unwrap();
+        assert!(store.load_task::<serde_json::Value>("missing-id").is_none());
+
+        let a = store.create(PathBuf::from("/tmp/a")).unwrap();
+        store
+            .save_task(&a.id, &serde_json::json!({"goal": "登入", "phase": "active"}))
+            .unwrap();
+        let loaded: serde_json::Value = store.load_task(&a.id).unwrap();
+        assert_eq!(loaded["goal"], "登入");
+        store.clear_task(&a.id);
+        assert!(store.load_task::<serde_json::Value>(&a.id).is_none());
     }
 }

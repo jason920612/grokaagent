@@ -44,6 +44,8 @@
     const clock = h.running ? `  ${(h.elapsed_ms / 1000).toFixed(1)}s` : "";
     $("header-left").textContent = `grokaagent  ${h.activity || h.status}${clock}  · ${h.status}  ${h.logged_in ? "已登入" : "未登入"}  ${h.cache}`;
     $("gear").textContent = `${h.model}${h.effort ? " " + h.effort : ""}  設定`;
+    $("task").classList.toggle("on", !!h.task_live);
+    $("task").textContent = h.task_live ? "任務●" : "任務";
   }
 
   function renderSessions() {
@@ -255,7 +257,7 @@
 
   function renderOverlay() {
     overlay.replaceChildren();
-    const show = !!(snap.settings || snap.ask || snap.picker || snap.inspector || snap.image_view || snap.skill_view || snap.rename || snap.tool_panel);
+    const show = !!(snap.settings || snap.ask || snap.task || snap.picker || snap.inspector || snap.image_view || snap.skill_view || snap.rename || snap.tool_panel);
     overlay.classList.toggle("hidden", !show);
     if (!show) return;
     const modal = document.createElement("div");
@@ -276,6 +278,34 @@
         ["取消", () => send({ type: "cancel_rename" })],
         ["確定", () => send({ type: "commit_rename", text: inp.value })],
       ]);
+    } else if (snap.task) {
+      if (snap.task.mode === "form") {
+        modal.append(h2("任務目標"));
+        const ta = document.createElement("textarea");
+        ta.rows = 6;
+        ta.value = snap.task.draft || "";
+        ta.placeholder = "這則對話要達成什麼？";
+        ta.addEventListener("input", () => send({ type: "set_task_draft", text: ta.value }));
+        modal.append(ta);
+        addBtns(modal, [
+          ["取消", () => send({ type: "close_task" })],
+          ["確定", () => send({ type: "submit_task" })],
+        ]);
+      } else {
+        modal.append(h2("任務模式  ·  " + (snap.task.phase || "")));
+        const goal = document.createElement("p");
+        goal.textContent = "目標  " + (snap.task.goal || "");
+        modal.append(goal);
+        const list = document.createElement("pre");
+        list.textContent = (snap.task.checklist || [])
+          .map((i) => (i.done ? "[x] " : "[ ] ") + i.text)
+          .join("\n") || "（尚無檢查表）";
+        modal.append(list);
+        addBtns(modal, [
+          ["關閉", () => send({ type: "close_task" })],
+          ["結束任務", () => send({ type: "end_task" })],
+        ]);
+      }
     } else if (snap.ask) {
       modal.append(h2(snap.ask.prompt));
       snap.ask.options.forEach((o, i) => {
@@ -478,6 +508,7 @@
   }
 
   $("new-chat").addEventListener("click", () => send({ type: "new_chat" }));
+  $("task").addEventListener("click", () => send({ type: "open_task" }));
   $("gear").addEventListener("click", () => send({ type: "open_settings" }));
   $("mode-queue").addEventListener("click", () => send({ type: "set_send_mode", mode: "queue" }));
   $("mode-insert").addEventListener("click", () => send({ type: "set_send_mode", mode: "insert" }));
@@ -486,6 +517,7 @@
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) {
       if (snap && snap.image_view) send({ type: "close_image" });
+      else if (snap && snap.task) send({ type: "close_task" });
       else if (snap && snap.settings) send({ type: "close_settings" });
       else if (snap && snap.inspector) send({ type: "close_inspector" });
       else if (snap && snap.skill_view) send({ type: "close_skill" });

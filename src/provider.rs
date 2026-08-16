@@ -648,16 +648,17 @@ fn complete_payload(model: &str, req: &CompleteRequest) -> Value {
     }
     if !tools.is_empty() {
         payload["tools"] = Value::Array(tools);
+        // xAI 400 if tool_choice is set with no tools (task supervisor has none).
+        if let Some(name) = &req.tool_choice {
+            if name == "none" {
+                payload["tool_choice"] = json!("none");
+            } else {
+                payload["tool_choice"] = json!({"type": "function", "name": name});
+            }
+        }
     }
     if let Some(prev) = &req.previous_response_id {
         payload["previous_response_id"] = json!(prev);
-    }
-    if let Some(name) = &req.tool_choice {
-        if name == "none" {
-            payload["tool_choice"] = json!("none");
-        } else {
-            payload["tool_choice"] = json!({"type": "function", "name": name});
-        }
     }
     payload
 }
@@ -1181,19 +1182,27 @@ mod tests {
         assert_eq!(low["reasoning"]["effort"], "low");
         assert_eq!(low["prompt_cache_key"], payload["prompt_cache_key"]);
         assert!(payload.get("tool_choice").is_none());
+        let dummy = ToolSpec {
+            name: "shell_verdict".into(),
+            description: "verdict".into(),
+            parameters: json!({"type": "object"}),
+        };
         let forced = complete_payload(
             "grok-4.6",
             &CompleteRequest {
                 tool_choice: Some("shell_verdict".into()),
+                client_tools: vec![dummy.clone()],
                 store: false,
                 cache_key: "grokaagent:shellguard:v1:cmd".into(),
                 ..req.clone()
             },
         );
         assert_eq!(forced["tool_choice"]["name"], "shell_verdict");
+        assert_eq!(forced["tools"][0]["name"], "shell_verdict");
         assert_eq!(forced["store"], false);
         assert_eq!(forced["prompt_cache_key"], "grokaagent:shellguard:v1:cmd");
-        let none = complete_payload(
+        // xAI 400: "A tool_choice was set on the request but no tools were specified."
+        let none_without_tools = complete_payload(
             "grok-4.6",
             &CompleteRequest {
                 tool_choice: Some("none".into()),
@@ -1203,8 +1212,22 @@ mod tests {
                 ..req.clone()
             },
         );
-        assert_eq!(none["tool_choice"], "none");
-        assert!(none.get("tools").is_none(), "{none}");
+        assert!(
+            none_without_tools.get("tool_choice").is_none(),
+            "{none_without_tools}"
+        );
+        assert!(none_without_tools.get("tools").is_none(), "{none_without_tools}");
+        let none_with_tools = complete_payload(
+            "grok-4.6",
+            &CompleteRequest {
+                tool_choice: Some("none".into()),
+                client_tools: vec![dummy],
+                store: false,
+                ..req.clone()
+            },
+        );
+        assert_eq!(none_with_tools["tool_choice"], "none");
+        assert_eq!(none_with_tools["tools"][0]["name"], "shell_verdict");
         let omitted = complete_payload(
             "no-think",
             &CompleteRequest {

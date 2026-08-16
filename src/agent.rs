@@ -56,6 +56,8 @@ pub struct RunConfig {
     /// TUI Esc trips this so an in-flight stream or tool is dropped, then the session pauses.
     pub cancel: Option<CancelFlag>,
     pub skills: Option<Arc<Mutex<crate::skills::SkillStore>>>,
+    /// Root TUI task mode. `None` for workers and headless one-shots.
+    pub task: Option<Arc<crate::task::TaskHub>>,
 }
 
 /// Shared flag so the TUI can abort the current model turn without ending the session.
@@ -289,6 +291,17 @@ async fn wait_if_cancel(cancel: &Option<CancelFlag>) {
     }
 }
 
+fn take_task_kick(task: &Option<Arc<crate::task::TaskHub>>) -> bool {
+    task.as_ref().is_some_and(|h| h.take_kick())
+}
+
+async fn wait_task_kick(task: &Option<Arc<crate::task::TaskHub>>) {
+    match task {
+        Some(h) => h.wait_kick().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn race_cancel<T>(
     cancel: &Option<CancelFlag>,
     fut: impl Future<Output = T>,
@@ -320,8 +333,12 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
             c.take();
         }
         let mut msgs = drain_session(cfg);
+        let kicked = take_task_kick(&cfg.task);
         if !msgs.is_empty() {
             return Some(msgs);
+        }
+        if kicked {
+            return Some(Vec::new());
         }
         tokio::select! {
             user = recv_pending(&mut cfg.inbox) => {
@@ -345,6 +362,10 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
                 msgs.extend(drain_session(cfg));
                 return Some(msgs);
             }
+            _ = wait_task_kick(&cfg.task) => {
+                msgs.extend(drain_session(cfg));
+                return Some(msgs);
+            }
             _ = wait_if_cancel(&cfg.cancel) => {
                 if let Some(c) = &cfg.cancel {
                     c.take();
@@ -363,6 +384,9 @@ async fn after_interrupt(
 ) -> Option<Vec<UserTurn>> {
     if let Some(c) = &cfg.cancel {
         c.take();
+    }
+    if let Some(t) = &cfg.task {
+        t.set_skip_steer(true);
     }
     notice(
         sink,
@@ -680,11 +704,50 @@ pub async fn run<P: Provider>(
             ));
         }
     }
-    history.push(crate::vision::user_message(
-        &cfg.prompt,
-        &cfg.images,
-        &cfg.workspace,
-    ));
+    let skip_prompt = crate::task::is_kick(&cfg.prompt);
+    if !skip_prompt {
+        history.push(crate::vision::user_message(
+            &cfg.prompt,
+            &cfg.images,
+            &cfg.workspace,
+        ));
+    }
+    if let Some(hub) = cfg.task.clone() {
+        let (model, effort, send_reasoning, _) = live_knobs(&cfg);
+        if let Some(instr) = crate::task::prepare_first_turn(
+            hub.as_ref(),
+            provider,
+            &model,
+            effort,
+            send_reasoning,
+            &run_id,
+            &history,
+            sink,
+        )
+        .await
+        {
+            history.push(crate::vision::user_message(
+                &instr,
+                &[],
+                &cfg.workspace,
+            ));
+        } else if skip_prompt {
+            let goal = hub.snapshot().goal;
+            if !goal.is_empty() {
+                history.push(crate::vision::user_message(
+                    &format!("Task mode is on. Goal:\n{goal}\nWork toward it."),
+                    &[],
+                    &cfg.workspace,
+                ));
+            }
+        }
+    } else if skip_prompt {
+        history.push(crate::vision::user_message(
+            &cfg.prompt,
+            &cfg.images,
+            &cfg.workspace,
+        ));
+    }
     let mut pending: Vec<Value> = history.clone();
     let mut last_text = String::new();
     let mut last_usage = CacheUsage::default();
@@ -1220,36 +1283,126 @@ pub async fn run<P: Provider>(
         }
 
         checkpoint(&cfg, &history);
+        if let Some(instr) = task_inject(
+            &cfg,
+            provider,
+            sink,
+            &run_id,
+            &history,
+            &last_text,
+            true,
+            false,
+        )
+        .await
+        {
+            append_user(
+                &mut history,
+                &mut pending,
+                &UserTurn::from(instr),
+                &cfg.workspace,
+            );
+            turn = 0;
+            continue;
+        }
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
-        match wait_session(&mut cfg).await {
-            Some(msgs) if !msgs.is_empty() => {
-                for msg in msgs {
-                    append_user(&mut history, &mut pending, &msg, &cfg.workspace);
+        loop {
+            match wait_session(&mut cfg).await {
+                Some(msgs) => {
+                    let had_user = msgs
+                        .iter()
+                        .any(|m| !m.is_empty() && !crate::task::is_kick(&m.text));
+                    for msg in msgs {
+                        if crate::task::is_kick(&msg.text) {
+                            continue;
+                        }
+                        append_user(&mut history, &mut pending, &msg, &cfg.workspace);
+                    }
+                    if let Some(instr) = task_inject(
+                        &cfg,
+                        provider,
+                        sink,
+                        &run_id,
+                        &history,
+                        &last_text,
+                        false,
+                        had_user,
+                    )
+                    .await
+                    {
+                        append_user(
+                            &mut history,
+                            &mut pending,
+                            &UserTurn::from(instr),
+                            &cfg.workspace,
+                        );
+                        break;
+                    }
+                    if had_user {
+                        break;
+                    }
                 }
-                turn = 0;
-            }
-            Some(_) => {
-                turn = 0;
-            }
-            None => {
-                sink.emit(&AgentEvent::RunFinished {
-                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                    reason: "stop".into(),
-                    text: last_text.clone(),
-                });
-                return Ok(outcome(
-                    &cfg,
-                    &history,
-                    run_id,
-                    last_text,
-                    total_turns,
-                    cache_turns,
-                    compacted,
-                ));
+                None => {
+                    sink.emit(&AgentEvent::RunFinished {
+                        meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                        reason: "stop".into(),
+                        text: last_text.clone(),
+                    });
+                    return Ok(outcome(
+                        &cfg,
+                        &history,
+                        run_id,
+                        last_text,
+                        total_turns,
+                        cache_turns,
+                        compacted,
+                    ));
+                }
             }
         }
+        turn = 0;
+    }
+}
+
+async fn task_inject<P: Provider>(
+    cfg: &RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &[Value],
+    last_text: &str,
+    after_stop: bool,
+    had_user: bool,
+) -> Option<String> {
+    let hub = cfg.task.as_ref()?;
+    let (model, effort, send_reasoning, _) = live_knobs(cfg);
+    if after_stop {
+        crate::task::after_natural_stop(
+            hub,
+            provider,
+            &model,
+            effort,
+            send_reasoning,
+            run_id,
+            history,
+            last_text,
+            sink,
+        )
+        .await
+    } else {
+        crate::task::after_wait(
+            hub,
+            provider,
+            &model,
+            effort,
+            send_reasoning,
+            run_id,
+            history,
+            had_user,
+            sink,
+        )
+        .await
     }
 }
 
@@ -1327,6 +1480,7 @@ mod tests {
             persist_history: None,
             cancel: None,
             skills: None,
+            task: None,
         }
     }
 
@@ -3010,5 +3164,126 @@ mod tests {
             .expect("join")
             .expect("run ok");
         assert_eq!(out.text, "after interrupt");
+    }
+
+    fn supervisor_reply(status: &str, item: &str, done: bool, next: &str, reason: &str) -> CompleteResponse {
+        let done = if done { "true" } else { "false" };
+        CompleteResponse {
+            text: format!(
+                r#"{{"status":"{status}","checklist":[{{"text":"{item}","done":{done}}}],"next":"{next}","reason":"{reason}"}}"#
+            ),
+            ..CompleteResponse::new("sup")
+        }
+    }
+
+    #[tokio::test]
+    async fn task_mode_keeps_the_worker_going_until_the_supervisor_completes() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("ship login");
+        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        let mut c = cfg(crate::task::KICK, 0);
+        c.inbox = Some(rx);
+        c.task = Some(hub.clone());
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                supervisor_reply("continue", "write test", false, "write the test", ""),
+                CompleteResponse {
+                    text: "wrote test".into(),
+                    ..CompleteResponse::new("w1")
+                },
+                supervisor_reply("complete", "write test", true, "", "done"),
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            drop(tx);
+        });
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run(&provider, &tools, &rec, c),
+        )
+        .await
+        .expect("task loop must finish")
+        .unwrap();
+        assert_eq!(out.text, "wrote test");
+        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Done);
+        let events = rec.0.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChildSpawned { name, .. } if name == crate::task::AGENT_NAME)),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("已完成"))),
+            "{events:?}"
+        );
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "plan + worker + check");
+        assert!(
+            calls[0].cache_key.starts_with("grokaagent-task:"),
+            "{}",
+            calls[0].cache_key
+        );
+        assert!(
+            !calls[1].cache_key.starts_with("grokaagent-task:"),
+            "worker must not use the supervisor cache key"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_mode_impossible_lets_the_worker_explain_then_stops() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("hack production");
+        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        let mut c = cfg(crate::task::KICK, 0);
+        c.inbox = Some(rx);
+        c.task = Some(hub.clone());
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                supervisor_reply("continue", "get creds", false, "try", ""),
+                CompleteResponse {
+                    text: "cannot without creds".into(),
+                    ..CompleteResponse::new("w1")
+                },
+                supervisor_reply("impossible", "get creds", false, "", "no credentials exist"),
+                CompleteResponse {
+                    text: "沒做完，因為沒有憑證。".into(),
+                    ..CompleteResponse::new("w2")
+                },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            drop(tx);
+        });
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run(&provider, &tools, &rec, c),
+        )
+        .await
+        .expect("impossible path must finish")
+        .unwrap();
+        assert_eq!(out.text, "沒做完，因為沒有憑證。");
+        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Failed);
+        let events = rec.0.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("未完成"))),
+            "{events:?}"
+        );
     }
 }

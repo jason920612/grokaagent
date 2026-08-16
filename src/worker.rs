@@ -216,6 +216,7 @@ async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
             ask: None,
             cancel: None,
             skills: None,
+            task: None,
         },
     )
     .await?;

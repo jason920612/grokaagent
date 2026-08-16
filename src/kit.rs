@@ -54,6 +54,7 @@ pub struct KernelSpec {
     pub cancel: Option<crate::agent::CancelFlag>,
     /// Shared with the TUI so Settings toggles apply on the next turn.
     pub skills: Option<std::sync::Arc<std::sync::Mutex<SkillStore>>>,
+    pub task: Option<std::sync::Arc<crate::task::TaskHub>>,
 }
 
 pub async fn run_with_nursery<P: Provider + Clone + 'static>(
@@ -167,6 +168,9 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             spec.parent_run_id.clone(),
         )));
     }
+    if let Some(task) = spec.task.clone() {
+        tools.push(Box::new(crate::task::TaskReportTool::new(task)));
+    }
     let nursery = if spec.depth < DEFAULT_MAX_DEPTH {
         let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grokaagent"));
         let n = Nursery::new(
@@ -241,6 +245,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             persist_history,
             cancel: spec.cancel,
             skills: Some(skills),
+            task: spec.task,
         },
     )
     .await;

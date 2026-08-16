@@ -90,6 +90,7 @@ pub struct UiSnapshot {
     pub tool_panel: Option<UiToolPanel>,
     pub skill_view: Option<UiSkillView>,
     pub rename: Option<UiRename>,
+    pub task: Option<UiTask>,
     pub web_url: String,
 }
 
@@ -106,6 +107,8 @@ pub struct UiHeader {
     pub elapsed_ms: u64,
     pub tick: u8,
     pub workspace: String,
+    #[serde(default)]
+    pub task_live: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -296,6 +299,21 @@ pub struct UiRename {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiTaskItem {
+    pub text: String,
+    pub done: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiTask {
+    pub mode: String,
+    pub goal: String,
+    pub draft: String,
+    pub phase: String,
+    pub checklist: Vec<UiTaskItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiCommand {
     SetComposer { text: String, caret: usize, seq: u64 },
@@ -310,6 +328,11 @@ pub enum UiCommand {
     CloseTool,
     OpenSettings,
     CloseSettings,
+    OpenTask,
+    CloseTask,
+    SetTaskDraft { text: String },
+    SubmitTask,
+    EndTask,
     Login,
     Logout,
     SetModel { id: String },
@@ -632,6 +655,19 @@ mod tests {
                 assert_eq!(caret, 2);
                 assert_eq!(seq, 3);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn task_command_roundtrip() {
+        let raw = json!({"type":"open_task"});
+        let cmd: UiCommand = serde_json::from_value(raw).unwrap();
+        assert!(matches!(cmd, UiCommand::OpenTask));
+        let raw = json!({"type":"set_task_draft","text":"goal"});
+        let cmd: UiCommand = serde_json::from_value(raw).unwrap();
+        match cmd {
+            UiCommand::SetTaskDraft { text } => assert_eq!(text, "goal"),
             _ => panic!("wrong variant"),
         }
     }

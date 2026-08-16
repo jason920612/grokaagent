@@ -36,6 +36,7 @@ button { font: inherit; cursor: pointer; border: 1px solid var(--border); backgr
 button.primary { background: var(--accent); color: #111; border-color: var(--accent); font-weight: 600; width: 100%; margin-bottom: 12px; }
 button.chip { background: transparent; }
 button.chip.on { border-color: var(--accent); color: var(--accent); }
+#task.on { border-color: var(--accent); color: var(--accent); }
 button.warn { color: var(--warn); border-color: var(--warn); }
 .hidden { display: none !important; }
 .session { padding: 8px; border-radius: 6px; margin-bottom: 4px; cursor: pointer; }
@@ -70,6 +71,7 @@ details.fold summary { cursor: pointer; color: var(--dim); }
 #overlay.hidden { display: none !important; }
 .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; width: min(640px, 92vw); max-height: 86vh; overflow: auto; padding: 16px 18px; }
 .modal h2 { margin: 0 0 12px; font-size: 16px; }
+.modal textarea { width: 100%; min-height: 120px; resize: vertical; background: #1c1c1c; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: inherit; }
 .modal .row-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 .opt { display: flex; gap: 8px; align-items: flex-start; padding: 8px; border-radius: 6px; cursor: pointer; }
 .opt.on { background: #2c3a4a; }

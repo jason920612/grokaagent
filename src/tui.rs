@@ -38,6 +38,7 @@ use crate::md;
 use crate::provider::{ReasoningEffort, XaiOauthProvider};
 use crate::session::{self, SessionMeta, SessionStore};
 use crate::skills::{Skill, SkillStore};
+use crate::task::{self, TaskHub, TaskPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -243,6 +244,7 @@ enum Focus {
     Inspector,
     Ask,
     Workspace,
+    Task,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -297,6 +299,12 @@ enum LoginEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
     Gear,
+    TaskChip,
+    TaskConfirm,
+    TaskCancel,
+    TaskEnd,
+    TaskPanel,
+    TaskDraft,
     ModelChip,
     QueueChip,
     InsertChip,
@@ -1035,6 +1043,7 @@ struct ParkedChat {
     backgrounds: Vec<SideBg>,
     inspector: Option<Inspector>,
     inspector_scroll: u16,
+    task: Arc<TaskHub>,
 }
 
 struct AskState {
@@ -1145,6 +1154,18 @@ impl AskState {
 enum WsFocus {
     Path,
     List,
+}
+
+enum TaskUi {
+    Form { edit: Edit },
+    Status,
+}
+
+#[derive(Clone, Copy)]
+enum TaskAction {
+    Submit,
+    Close,
+    End,
 }
 
 struct WorkspacePick {
@@ -1283,6 +1304,10 @@ struct App {
     /// When routing an event into a parked session, do not open the overlay.
     ask_passive: bool,
     workspace_pick: Option<WorkspacePick>,
+    task: Arc<TaskHub>,
+    task_ui: Option<TaskUi>,
+    task_draft_inner: Rect,
+    task_action: Option<TaskAction>,
     skills: Arc<Mutex<SkillStore>>,
     skill_list: Vec<Skill>,
     skill_cursor: usize,
@@ -2279,6 +2304,7 @@ impl App {
             backgrounds: std::mem::take(&mut self.backgrounds),
             inspector: self.inspector.take(),
             inspector_scroll: self.inspector_scroll,
+            task: self.task.clone(),
         }
     }
 
@@ -2316,6 +2342,8 @@ impl App {
         self.backgrounds = p.backgrounds;
         self.inspector = p.inspector;
         self.inspector_scroll = p.inspector_scroll;
+        self.task = p.task;
+        self.task_ui = None;
         self.composer_vscroll = 0;
         self.scroll_grab = None;
         self.image_view = None;
@@ -2324,6 +2352,9 @@ impl App {
             self.focus = Focus::Chat;
         }
         if self.focus == Focus::Workspace {
+            self.focus = Focus::Chat;
+        }
+        if self.focus == Focus::Task {
             self.focus = Focus::Chat;
         }
     }
@@ -2639,6 +2670,13 @@ impl App {
             backgrounds: Vec::new(),
             inspector: None,
             inspector_scroll: 0,
+            task: TaskHub::from_state(
+                id,
+                self.store
+                    .as_ref()
+                    .and_then(|s| s.load_task::<crate::task::TaskState>(id))
+                    .unwrap_or_default(),
+            ),
         }
     }
 
@@ -2930,6 +2968,7 @@ fn boot_session(
 }
 
 fn fresh_chat(session: SessionMeta) -> ParkedChat {
+    let task = TaskHub::new(session.id.clone());
     ParkedChat {
         session,
         rows: intro_rows(),
@@ -2957,6 +2996,7 @@ fn fresh_chat(session: SessionMeta) -> ParkedChat {
             backgrounds: Vec::new(),
             inspector: None,
             inspector_scroll: 0,
+            task,
     }
 }
 
@@ -4211,6 +4251,7 @@ fn header_pulse_ok(app: &App) -> bool {
         && app.workspace_pick.is_none()
         && app.skill_view.is_none()
         && app.ask.is_none()
+        && app.task_ui.is_none()
         && app.settings.as_ref().is_none_or(|s| s.minimized)
 }
 
@@ -4219,6 +4260,7 @@ fn header_pulse_ok(app: &App) -> bool {
 fn want_hardware_cursor(app: &App) -> bool {
     app.workspace_pick.is_some()
         || app.ask.is_some()
+        || app.task_ui.is_some()
         || app.skill_view.is_some()
         || app.focus == Focus::Rename
         || (app.focus == Focus::Settings && app.settings.as_ref().is_some_and(|s| !s.minimized))
@@ -4381,6 +4423,7 @@ async fn run_settings_login(
 }
 
 fn open_settings(app: &mut App) {
+    app.task_ui = None;
     app.drop = None;
     if app.logged_in
         && !matches!(
@@ -4414,6 +4457,93 @@ fn open_settings(app: &mut App) {
     } else {
         SettingField::Account
     };
+}
+
+fn open_task(app: &mut App) {
+    app.settings = None;
+    app.drop = None;
+    let phase = app.task.snapshot().phase;
+    app.task_ui = Some(if phase.is_live() || matches!(phase, TaskPhase::Done | TaskPhase::Failed) {
+        TaskUi::Status
+    } else {
+        TaskUi::Form {
+            edit: Edit::default(),
+        }
+    });
+    app.focus = Focus::Task;
+}
+
+fn close_task(app: &mut App) {
+    app.task_ui = None;
+    if app.focus == Focus::Task {
+        app.focus = Focus::Chat;
+    }
+}
+
+fn submit_task_goal(
+    app: &mut App,
+    opts: &TuiOptions,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+) {
+    let Some(TaskUi::Form { edit }) = &app.task_ui else {
+        return;
+    };
+    let goal = edit.text.trim().to_string();
+    if goal.is_empty() {
+        app.status = "請填寫任務目標".into();
+        return;
+    }
+    app.task.start_goal(goal.clone());
+    app.push(Row::Meta(format!("已啟動任務模式：{goal}")));
+    app.upsert_child(task::AGENT_NAME.into(), goal, String::new());
+    app.child_count = app.children.iter().filter(|c| c.alive).count() as u32;
+    app.task_ui = Some(TaskUi::Status);
+    app.focus = Focus::Task;
+    ensure_task_run(app, opts, sink, done_tx);
+}
+
+fn end_task_mode(app: &mut App) {
+    if !app.task.snapshot().phase.is_live()
+        && app.task.snapshot().phase != TaskPhase::Done
+        && app.task.snapshot().phase != TaskPhase::Failed
+    {
+        close_task(app);
+        return;
+    }
+    app.task.end();
+    if let Some(c) = app.child_named_mut(task::AGENT_NAME) {
+        c.upsert_status("結束（使用者結束）".into(), false);
+    }
+    app.child_count = app.children.iter().filter(|c| c.alive).count() as u32;
+    app.push(Row::Meta("已結束任務模式".into()));
+    close_task(app);
+}
+
+fn ensure_task_run(
+    app: &mut App,
+    opts: &TuiOptions,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+) {
+    if app.inbox_tx.is_some() {
+        return;
+    }
+    start_or_send(app, opts, sink, done_tx, UserTurn::from(task::KICK), false);
+}
+
+fn flush_task_action(
+    app: &mut App,
+    opts: &TuiOptions,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+) {
+    match app.task_action.take() {
+        Some(TaskAction::Submit) => submit_task_goal(app, opts, sink, done_tx),
+        Some(TaskAction::Close) => close_task(app),
+        Some(TaskAction::End) => end_task_mode(app),
+        None => {}
+    }
 }
 
 fn win_rect(w: &Win, area: Rect) -> Rect {
@@ -4538,6 +4668,11 @@ fn draw_ui(f: &mut Frame, app: &mut App, opts: &TuiOptions, freeze_composer: boo
     }
     if app.ask.is_some() {
         if let Some(pos) = draw_ask(f, app) {
+            caret = pos;
+        }
+    }
+    if app.task_ui.is_some() {
+        if let Some(pos) = draw_task(f, app) {
             caret = pos;
         }
     }
@@ -5092,8 +5227,16 @@ fn header_copy(app: &App, opts: &TuiOptions) -> (String, String) {
     } else {
         format!(" · {}", opts.reasoning_effort.as_str())
     };
-    let right = format!("{}{}  * ", opts.model, effort_bit);
+    let right = format!("{}{}{}  * ", task_chip_label(app), opts.model, effort_bit);
     (left, right)
+}
+
+fn task_chip_label(app: &App) -> &'static str {
+    if app.task.snapshot().phase.is_live() {
+        "任務●  "
+    } else {
+        "任務  "
+    }
 }
 
 fn header_styles(running: bool) -> (Style, Style) {
@@ -5316,6 +5459,11 @@ fn draw_header(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) {
         .constraints([Constraint::Min(10), Constraint::Length(right_w.max(12))])
         .split(area);
     app.hits.push((split[1], Hit::ModelChip));
+    let tw = display_cols(task_chip_label(app)).min(split[1].width);
+    app.hits.push((
+        Rect::new(split[1].x, split[1].y, tw, 1),
+        Hit::TaskChip,
+    ));
     let gear = Rect::new(
         split[1].x + split[1].width.saturating_sub(3),
         split[1].y,
@@ -6357,6 +6505,136 @@ fn draw_ask(f: &mut Frame, app: &mut App) -> Option<Position> {
     caret
 }
 
+fn draw_task(f: &mut Frame, app: &mut App) -> Option<Position> {
+    let area = f.area();
+    let w = area.width.saturating_sub(8).min(72).max(40);
+    let form = matches!(app.task_ui, Some(TaskUi::Form { .. }));
+    let h = if form { 14 } else { 16 }
+        .min(area.height.saturating_sub(2))
+        .max(10);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let r = Rect::new(x, y, w, h);
+    f.render_widget(Clear, r);
+    let title = if form { " 任務目標 " } else { " 任務模式 " };
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(COMPOSER).fg(TEXT));
+    f.render_widget(block, r);
+    app.hits.push((r, Hit::TaskPanel));
+
+    let body = Rect::new(
+        r.x.saturating_add(2),
+        r.y.saturating_add(1),
+        r.width.saturating_sub(4),
+        r.height.saturating_sub(2),
+    );
+    if form {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "寫下這則對話要達成的目標。Esc 取消。",
+                Style::default().fg(DIM),
+            )),
+            Rect::new(body.x, body.y, body.width, 1),
+        );
+        let box_h = body.height.saturating_sub(4).max(3);
+        let box_r = Rect::new(body.x, body.y.saturating_add(2), body.width, box_h);
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(PANEL)),
+            box_r,
+        );
+        let inner = Rect::new(
+            box_r.x.saturating_add(1),
+            box_r.y.saturating_add(1),
+            box_r.width.saturating_sub(2),
+            box_r.height.saturating_sub(2),
+        );
+        app.task_draft_inner = inner;
+        app.hits.push((inner, Hit::TaskDraft));
+        let text = match &app.task_ui {
+            Some(TaskUi::Form { edit }) => edit.text.clone(),
+            _ => String::new(),
+        };
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().fg(TEXT).bg(PANEL)),
+            inner,
+        );
+        let btn_y = body.y + body.height.saturating_sub(1);
+        let cancel = Rect::new(body.x, btn_y, 8, 1);
+        let ok = Rect::new(body.x.saturating_add(10), btn_y, 8, 1);
+        f.render_widget(
+            Paragraph::new(Span::styled(" 取消 ", Style::default().fg(DIM).bg(PANEL))),
+            cancel,
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " 確定 ",
+                Style::default().fg(Color::Black).bg(ACCENT),
+            )),
+            ok,
+        );
+        app.hits.push((cancel, Hit::TaskCancel));
+        app.hits.push((ok, Hit::TaskConfirm));
+        if let Some(TaskUi::Form { edit }) = &app.task_ui {
+            let ranges = wrap_lines(&edit.text, inner.width.max(1));
+            let (row, col) = caret_row_col(&edit.text, &ranges, edit.caret);
+            return Some(Position::new(
+                inner.x.saturating_add(col.min(inner.width.saturating_sub(1))),
+                inner.y.saturating_add(row.min(inner.height.saturating_sub(1))),
+            ));
+        }
+        return None;
+    }
+
+    let snap = app.task.snapshot();
+    let mut y = body.y;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("狀態  {}", snap.phase.label()),
+            Style::default().fg(ACCENT),
+        )),
+        Rect::new(body.x, y, body.width, 1),
+    );
+    y = y.saturating_add(1);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_width(&format!("目標  {}", snap.goal), body.width),
+            Style::default().fg(TEXT),
+        )),
+        Rect::new(body.x, y, body.width, 1),
+    );
+    y = y.saturating_add(2);
+    let list_h = body.height.saturating_sub(5).max(3);
+    f.render_widget(
+        Paragraph::new(snap.checklist_text()).style(Style::default().fg(TEXT)),
+        Rect::new(body.x, y, body.width, list_h),
+    );
+    let btn_y = body.y + body.height.saturating_sub(1);
+    let close = Rect::new(body.x, btn_y, 8, 1);
+    let end = Rect::new(body.x.saturating_add(10), btn_y, 12, 1);
+    f.render_widget(
+        Paragraph::new(Span::styled(" 關閉 ", Style::default().fg(DIM).bg(PANEL))),
+        close,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " 結束任務 ",
+            Style::default().fg(WARN).bg(PANEL),
+        )),
+        end,
+    );
+    app.hits.push((close, Hit::TaskCancel));
+    app.hits.push((end, Hit::TaskEnd));
+    None
+}
+
 fn draw_workspace_pick(f: &mut Frame, app: &mut App) -> Option<Position> {
     let area = f.area();
     let w = area.width.saturating_sub(6).min(92).max(42);
@@ -7085,6 +7363,7 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
             elapsed_ms,
             tick: app.tick,
             workspace: folderpick::display_path(&app.session.workspace),
+            task_live: app.task.snapshot().phase.is_live(),
         },
         composer: hub::UiComposer {
             text: app.edit.text.clone(),
@@ -7224,6 +7503,29 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
         rename: app.rename.as_ref().map(|(id, e)| hub::UiRename {
             id: id.clone(),
             text: e.text.clone(),
+        }),
+        task: app.task_ui.as_ref().map(|ui| {
+            let snap = app.task.snapshot();
+            hub::UiTask {
+                mode: match ui {
+                    TaskUi::Form { .. } => "form".into(),
+                    TaskUi::Status => "status".into(),
+                },
+                goal: snap.goal,
+                draft: match ui {
+                    TaskUi::Form { edit } => edit.text.clone(),
+                    TaskUi::Status => String::new(),
+                },
+                phase: snap.phase.label().to_string(),
+                checklist: snap
+                    .checklist
+                    .into_iter()
+                    .map(|i| hub::UiTaskItem {
+                        text: i.text,
+                        done: i.done,
+                    })
+                    .collect(),
+            }
         }),
         web_url: app.web_url.clone().unwrap_or_default(),
     }
@@ -7405,6 +7707,15 @@ fn apply_ui_command(
                 app.focus = Focus::Chat;
             }
         }
+        UiCommand::OpenTask => open_task(app),
+        UiCommand::CloseTask => close_task(app),
+        UiCommand::SetTaskDraft { text } => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                *edit = Edit::at_end(text.chars().take(task::MAX_GOAL).collect());
+            }
+        }
+        UiCommand::SubmitTask => submit_task_goal(app, opts, sink, done_tx),
+        UiCommand::EndTask => end_task_mode(app),
         UiCommand::Login => activate_account(app),
         UiCommand::Logout => logout_account(app),
         UiCommand::SetModel { id } => apply_selected_model(app, opts, id),
@@ -7568,6 +7879,11 @@ async fn tui_loop(
     let boot = boot_session(store.as_ref(), &listed, launch_workspace.clone());
     let session = boot.session;
     let created = boot.created;
+    let session_id = session.id.clone();
+    let task_state = store
+        .as_ref()
+        .and_then(|s| s.load_task::<crate::task::TaskState>(&session_id))
+        .unwrap_or_default();
     if !listed.iter().any(|m| m.id == session.id) {
         listed.insert(0, session.clone());
     }
@@ -7659,6 +7975,10 @@ async fn tui_loop(
             ask_fill_inner: Rect::default(),
             ask_passive: false,
             workspace_pick: None,
+            task: TaskHub::from_state(session_id, task_state),
+            task_ui: None,
+            task_draft_inner: Rect::default(),
+            task_action: None,
             skills: Arc::new(Mutex::new(
                 SkillStore::open().unwrap_or_else(|_| {
                     SkillStore::open_at(
@@ -7825,6 +8145,7 @@ async fn tui_loop(
                                 quit = true;
                                 break;
                             }
+                            flush_task_action(&mut app, &opts, &sink, &done_tx);
                         }
                         if quit {
                             break;
@@ -7917,7 +8238,7 @@ fn kick_idle_queue(
     let Some(msg) = app.queue.pop_front() else {
         return;
     };
-    start_or_send(app, opts, sink, done_tx, queued_to_turn(msg));
+    start_or_send(app, opts, sink, done_tx, queued_to_turn(msg), true);
 }
 
 fn start_or_send(
@@ -7926,8 +8247,11 @@ fn start_or_send(
     sink: &Arc<FanoutSink>,
     done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
     turn: UserTurn,
+    echo: bool,
 ) {
-    app.push(Row::User(user_row_from_turn(&turn)));
+    if echo {
+        app.push(Row::User(user_row_from_turn(&turn)));
+    }
     if !app.logged_in {
         app.push(Row::Err("尚未登入 — 請在設定中登入 Grok 帳號".into()));
         return;
@@ -7942,7 +8266,11 @@ fn start_or_send(
         return;
     }
     if !app.session.named {
-        let fallback = session::title_fallback_from_user_text(&turn.text);
+        let fallback = if task::is_kick(&turn.text) {
+            "任務模式".into()
+        } else {
+            session::title_fallback_from_user_text(&turn.text)
+        };
         if let Some(store) = &app.store {
             let _ = store.touch_name(&mut app.session, fallback, false);
         } else {
@@ -7971,9 +8299,13 @@ fn start_or_send(
     let run_id = app.session.id.clone();
     let done_tx = done_tx.clone();
     let ask = Some(app.attach_ask_hub(&run_id));
+    let task = app.task.clone();
     tokio::spawn(async move {
         let sid = run_id.clone();
-        let out = run_one(opts, turn, sink, knobs, skills, inbox_rx, run_id, ask, cancel).await;
+        let out = run_one(
+            opts, turn, sink, knobs, skills, inbox_rx, run_id, ask, cancel, task,
+        )
+        .await;
         let _ = done_tx.send((
             sid,
             out.unwrap_or_else(|e| crate::agent::RunOutcome {
@@ -8035,7 +8367,7 @@ fn submit_current(
             });
         }
         Submit::Start | Submit::Insert => {
-            start_or_send(app, opts, sink, done_tx, turn);
+            start_or_send(app, opts, sink, done_tx, turn, true);
         }
     }
 }
@@ -8237,6 +8569,9 @@ fn handle_key(
     if app.ask.is_some() {
         return handle_ask_key(app, code, mods);
     }
+    if app.task_ui.is_some() {
+        return handle_task_key(app, opts, code, mods, sink, done_tx);
+    }
     if app.rename.is_some() {
         return handle_rename_key(app, code, mods);
     }
@@ -8377,6 +8712,62 @@ fn handle_key(
         }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
             app.edit.insert_char(c);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_task_key(
+    app: &mut App,
+    opts: &TuiOptions,
+    code: KeyCode,
+    mods: KeyModifiers,
+    sink: &Arc<FanoutSink>,
+    done_tx: &mpsc::UnboundedSender<(String, crate::agent::RunOutcome)>,
+) -> bool {
+    let form = matches!(app.task_ui, Some(TaskUi::Form { .. }));
+    match code {
+        KeyCode::Esc => close_task(app),
+        KeyCode::Enter if form && !mods.contains(KeyModifiers::SHIFT) => {
+            submit_task_goal(app, opts, sink, done_tx);
+        }
+        KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) && form => {
+            submit_task_goal(app, opts, sink, done_tx);
+        }
+        KeyCode::Enter if form => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                if edit.len() < task::MAX_GOAL {
+                    edit.insert_char('\n');
+                }
+            }
+        }
+        KeyCode::Backspace if form => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                edit.backspace();
+            }
+        }
+        KeyCode::Delete if form => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                edit.delete_forward();
+            }
+        }
+        KeyCode::Left if form => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                edit.move_left(mods.contains(KeyModifiers::SHIFT));
+            }
+        }
+        KeyCode::Right if form => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                edit.move_right(mods.contains(KeyModifiers::SHIFT));
+            }
+        }
+        KeyCode::Char(c) if form && !mods.contains(KeyModifiers::CONTROL) => {
+            if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                if edit.len() < task::MAX_GOAL {
+                    edit.insert_char(c);
+                }
+            }
         }
         _ => {}
     }
@@ -8770,6 +9161,23 @@ fn handle_mouse(
                 }
                 return;
             }
+            if app.task_ui.is_some() {
+                match hit {
+                    Some(Hit::TaskConfirm) => app.task_action = Some(TaskAction::Submit),
+                    Some(Hit::TaskCancel) => app.task_action = Some(TaskAction::Close),
+                    Some(Hit::TaskEnd) => app.task_action = Some(TaskAction::End),
+                    Some(Hit::TaskDraft) => {
+                        let inner = app.task_draft_inner;
+                        if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                            let idx = click_to_index(&edit.text, inner, 0, col, row);
+                            edit.click(idx, shift);
+                        }
+                    }
+                    Some(Hit::TaskPanel) | Some(Hit::TaskChip) => {}
+                    _ => {}
+                }
+                return;
+            }
             if app.image_view.is_some() {
                 match hit {
                     Some(Hit::ImageViewClose) | Some(Hit::ImageViewDismiss) => {
@@ -8797,6 +9205,7 @@ fn handle_mouse(
                 return;
             }
             match hit {
+                Some(Hit::TaskChip) => open_task(app),
                 Some(Hit::Gear) | Some(Hit::ModelChip) => open_settings(app),
                 Some(Hit::QueueChip) => {
                     app.send_mode = SendMode::Queue;
@@ -9074,7 +9483,12 @@ fn handle_mouse(
                 | Some(Hit::ImageViewDismiss)
                 | Some(Hit::SkillView)
                 | Some(Hit::SkillViewClose)
-                | Some(Hit::SkillViewDismiss) => {}
+                | Some(Hit::SkillViewDismiss)
+                | Some(Hit::TaskConfirm)
+                | Some(Hit::TaskCancel)
+                | Some(Hit::TaskEnd)
+                | Some(Hit::TaskPanel)
+                | Some(Hit::TaskDraft) => {}
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -9210,6 +9624,10 @@ fn handle_input(
                     let clipped: String = s.chars().take(remain).collect();
                     ask.fill_edit.insert_str(&clipped);
                 }
+            } else if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
+                let remain = task::MAX_GOAL.saturating_sub(edit.len());
+                let clipped: String = s.chars().take(remain).collect();
+                edit.insert_str(&clipped);
             } else {
                 app.paste_from_terminal(&s);
             }
@@ -9230,6 +9648,7 @@ async fn run_one(
     run_id: String,
     ask: Option<AskUserHub>,
     cancel: crate::agent::CancelFlag,
+    task: Arc<TaskHub>,
 ) -> Result<crate::agent::RunOutcome> {
     let auth_path = auth::default_auth_path()?;
     let model = if opts.model.trim().is_empty() {
@@ -9269,6 +9688,7 @@ async fn run_one(
             ask,
             cancel: Some(cancel),
             skills: Some(skills),
+            task: Some(task),
         },
     )
     .await
@@ -10949,6 +11369,10 @@ mod tests {
             ask_fill_inner: Rect::default(),
             ask_passive: false,
             workspace_pick: None,
+            task: TaskHub::new("s".to_string()),
+            task_ui: None,
+            task_draft_inner: Rect::default(),
+            task_action: None,
             skills: Arc::new(Mutex::new(SkillStore::open_at(
                 PathBuf::from("missing-groka-skills"),
                 PathBuf::from("missing-home"),
@@ -10993,6 +11417,7 @@ mod tests {
             backgrounds: Vec::new(),
             inspector: None,
             inspector_scroll: 0,
+            task: TaskHub::new(id.to_string()),
         }
     }
 
@@ -11679,6 +12104,7 @@ mod tests {
             backgrounds: Vec::new(),
             inspector: None,
             inspector_scroll: 0,
+            task: TaskHub::new("parked"),
             },
         );
         let meta = crate::events::EventMeta {
@@ -11753,6 +12179,7 @@ mod tests {
             backgrounds: Vec::new(),
             inspector: None,
             inspector_scroll: 0,
+            task: TaskHub::new("b"),
             },
         );
         app.switch_to("b");
@@ -12325,6 +12752,20 @@ mod tests {
         apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::CloseSettings);
         assert!(app.settings.is_none());
 
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::OpenTask);
+        assert!(matches!(app.task_ui, Some(TaskUi::Form { .. })));
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::SetTaskDraft { text: "把登入做完".into() });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.inbox_tx = Some(tx);
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::SubmitTask);
+        assert_eq!(app.task.snapshot().goal, "把登入做完");
+        assert_eq!(app.task.snapshot().phase, TaskPhase::NeedPlan);
+        assert!(matches!(app.task_ui, Some(TaskUi::Status)));
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::EndTask);
+        assert_eq!(app.task.snapshot().phase, TaskPhase::Inactive);
+        assert!(app.task_ui.is_none());
+
+        app.children.clear();
         app.children.push(SideChild {
             name: "coder".into(),
             prompt: "fix".into(),
@@ -12354,6 +12795,28 @@ mod tests {
         app.cancel = Some(CancelFlag::new());
         apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::Interrupt);
         assert_eq!(app.status, "中斷中");
+    }
+
+    #[test]
+    fn task_chip_is_clickable_on_the_header() {
+        let mut app = test_app();
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_ui(f, &mut app, &opts, false);
+            })
+            .unwrap();
+        let chip = app
+            .hits
+            .iter()
+            .rev()
+            .find(|(_, h)| *h == Hit::TaskChip)
+            .map(|(r, _)| *r)
+            .expect("task chip");
+        assert_eq!(chip.y, 0, "task chip must stay on the header");
+        assert_eq!(hit_at(&app.hits, chip.x, 0), Some(Hit::TaskChip));
     }
 
     #[test]
@@ -12657,7 +13120,7 @@ mod tests {
         let opts = test_opts("grok-4.6", ReasoningEffort::High);
         let sink = Arc::new(FanoutSink { sinks: vec![] });
         let (done_tx, _done_rx) = mpsc::unbounded_channel();
-        start_or_send(&mut app, &opts, &sink, &done_tx, "hi".into());
+        start_or_send(&mut app, &opts, &sink, &done_tx, "hi".into(), true);
         let err = app
             .rows
             .iter()

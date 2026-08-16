@@ -234,6 +234,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     ask: None,
                     cancel: None,
                     skills: None,
+                    task: None,
                 },
             )
             .await?;
