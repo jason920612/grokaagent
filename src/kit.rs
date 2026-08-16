@@ -196,6 +196,24 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     } else {
         None
     };
+    let prior_history = if is_root {
+        crate::session::SessionStore::open()
+            .ok()
+            .map(|s| s.load_context(&persist_id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let persist_history = if is_root {
+        let id = persist_id.clone();
+        Some(std::sync::Arc::new(move |items: &[serde_json::Value]| {
+            if let Ok(store) = crate::session::SessionStore::open() {
+                let _ = store.save_context(&id, items);
+            }
+        }) as std::sync::Arc<dyn Fn(&[serde_json::Value]) + Send + Sync>)
+    } else {
+        None
+    };
     let tools = ToolRegistry::new(tools);
     let out = agent::run(
         provider,
@@ -219,6 +237,8 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             workspace: spec.workspace,
             images: spec.images,
             closed_backgrounds,
+            prior_history,
+            persist_history,
             cancel: spec.cancel,
             skills: Some(skills),
         },

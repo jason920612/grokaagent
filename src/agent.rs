@@ -49,6 +49,10 @@ pub struct RunConfig {
     pub images: Vec<PathBuf>,
     /// Notice from the previous run: backgrounds that were killed because this conversation closed.
     pub closed_backgrounds: Option<String>,
+    /// API history from the last run of this session (compact brief + recent tail).
+    pub prior_history: Vec<Value>,
+    /// Persist a resume snapshot (images stripped). Root TUI sessions only.
+    pub persist_history: Option<Arc<dyn Fn(&[Value]) + Send + Sync>>,
     /// TUI Esc trips this so an in-flight stream or tool is dropped, then the session pauses.
     pub cancel: Option<CancelFlag>,
     pub skills: Option<Arc<Mutex<crate::skills::SkillStore>>>,
@@ -136,6 +140,37 @@ pub struct RunOutcome {
     pub turns: u32,
     pub cache_turns: Vec<CacheUsage>,
     pub compacted: u32,
+}
+
+fn snapshot_for_resume(items: &[Value]) -> Vec<Value> {
+    let mut out = compact::close_fold_head(items);
+    crate::vision::strip_attached_images(&mut out);
+    out
+}
+
+fn checkpoint(cfg: &RunConfig, history: &[Value]) {
+    if let Some(cb) = &cfg.persist_history {
+        cb(&snapshot_for_resume(history));
+    }
+}
+
+fn outcome(
+    cfg: &RunConfig,
+    history: &[Value],
+    run_id: String,
+    text: String,
+    turns: u32,
+    cache_turns: Vec<CacheUsage>,
+    compacted: u32,
+) -> RunOutcome {
+    checkpoint(cfg, history);
+    RunOutcome {
+        run_id,
+        text,
+        turns,
+        cache_turns,
+        compacted,
+    }
 }
 
 fn meta(agent_name: &str, run_id: &str, parent_run_id: Option<&str>) -> EventMeta {
@@ -376,6 +411,7 @@ async fn take_interrupt(
     history: &mut Vec<Value>,
     pending: &mut Vec<Value>,
 ) -> bool {
+    checkpoint(cfg, history);
     match after_interrupt(cfg, sink, run_id, last_text).await {
         None => false,
         Some(msgs) => {
@@ -460,6 +496,7 @@ async fn recover_from_provider_error(
         return Err(err);
     }
     *consecutive = 0;
+    checkpoint(cfg, history);
     sink.emit(&AgentEvent::AwaitingInput {
         meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
     });
@@ -617,7 +654,16 @@ pub async fn run<P: Provider>(
         cfg.compact_keep_recent
     };
 
-    let mut history = Vec::new();
+    let mut history = snapshot_for_resume(&cfg.prior_history);
+    if !history.is_empty() {
+        notice(
+            sink,
+            &cfg.agent_name,
+            &run_id,
+            cfg.parent_run_id.as_deref(),
+            format!("已載入上次上下文（{} 項，含長期記憶）", history.len()),
+        );
+    }
     if let Some(closed) = cfg.closed_backgrounds.take() {
         if !closed.trim().is_empty() {
             notice(
@@ -680,13 +726,15 @@ pub async fn run<P: Provider>(
             )
             .await
             {
-                return Ok(RunOutcome {
+                return Ok(outcome(
+                    &cfg,
+                    &history,
                     run_id,
-                    text: last_text,
-                    turns: total_turns,
+                    last_text,
+                    total_turns,
                     cache_turns,
                     compacted,
-                });
+                ));
             }
             turn = 0;
             continue;
@@ -702,6 +750,7 @@ pub async fn run<P: Provider>(
             });
             if cfg.inbox.is_some() {
                 turn = 0;
+                checkpoint(&cfg, &history);
                 sink.emit(&AgentEvent::AwaitingInput {
                     meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
                 });
@@ -785,6 +834,7 @@ pub async fn run<P: Provider>(
                                 });
                                 history = c.items;
                                 pending = history.clone();
+                                checkpoint(&cfg, &history);
                                 break;
                             }
                             Err(e) => {
@@ -818,13 +868,15 @@ pub async fn run<P: Provider>(
                         )
                         .await
                         {
-                            return Ok(RunOutcome {
+                            return Ok(outcome(
+                                &cfg,
+                                &history,
                                 run_id,
-                                text: last_text,
-                                turns: total_turns,
+                                last_text,
+                                total_turns,
                                 cache_turns,
                                 compacted,
-                            });
+                            ));
                         }
                         turn = 0;
                         continue 'run;
@@ -843,13 +895,15 @@ pub async fn run<P: Provider>(
                         )
                         .await
                         {
-                            return Ok(RunOutcome {
+                            return Ok(outcome(
+                                &cfg,
+                                &history,
                                 run_id,
-                                text: last_text,
-                                turns: total_turns,
+                                last_text,
+                                total_turns,
                                 cache_turns,
                                 compacted,
-                            });
+                            ));
                         }
                         turn = 0;
                         continue 'run;
@@ -926,13 +980,15 @@ pub async fn run<P: Provider>(
                 )
                 .await
                 {
-                    return Ok(RunOutcome {
+                    return Ok(outcome(
+                        &cfg,
+                        &history,
                         run_id,
-                        text: last_text,
-                        turns: total_turns,
+                        last_text,
+                        total_turns,
                         cache_turns,
                         compacted,
-                    });
+                    ));
                 }
                 turn = 0;
                 continue;
@@ -1111,13 +1167,15 @@ pub async fn run<P: Provider>(
                 )
                 .await
                 {
-                    return Ok(RunOutcome {
+                    return Ok(outcome(
+                        &cfg,
+                        &history,
                         run_id,
-                        text: last_text,
-                        turns: total_turns,
+                        last_text,
+                        total_turns,
                         cache_turns,
                         compacted,
-                    });
+                    ));
                 }
                 turn = 0;
             }
@@ -1150,15 +1208,18 @@ pub async fn run<P: Provider>(
                 reason: "stop".into(),
                 text: last_text.clone(),
             });
-            return Ok(RunOutcome {
+            return Ok(outcome(
+                &cfg,
+                &history,
                 run_id,
-                text: last_text,
-                turns: total_turns,
+                last_text,
+                total_turns,
                 cache_turns,
                 compacted,
-            });
+            ));
         }
 
+        checkpoint(&cfg, &history);
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
@@ -1178,13 +1239,15 @@ pub async fn run<P: Provider>(
                     reason: "stop".into(),
                     text: last_text.clone(),
                 });
-                return Ok(RunOutcome {
+                return Ok(outcome(
+                    &cfg,
+                    &history,
                     run_id,
-                    text: last_text,
-                    turns: total_turns,
+                    last_text,
+                    total_turns,
                     cache_turns,
                     compacted,
-                });
+                ));
             }
         }
     }
@@ -1260,6 +1323,8 @@ mod tests {
             workspace: PathBuf::from("."),
             images: Vec::new(),
             closed_backgrounds: None,
+            prior_history: Vec::new(),
+            persist_history: None,
             cancel: None,
             skills: None,
         }
@@ -2695,6 +2760,97 @@ mod tests {
             }
             _ => false,
         }));
+    }
+
+    #[tokio::test]
+    async fn prior_history_is_injected_before_the_new_prompt() {
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![CompleteResponse {
+                text: "continuing".into(),
+                ..CompleteResponse::new("1")
+            }])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("keep going", 2);
+        c.prior_history = vec![
+            json!({
+                "role": "user",
+                "content": format!("{COMPACT_MARK}\n## Original request\nship the kernel\n")
+            }),
+            json!({"role": "assistant", "content": "next I will patch the scheduler"}),
+        ];
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(out.text, "continuing");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let contents: Vec<&str> = calls[0]
+            .input
+            .iter()
+            .filter_map(|i| i.get("content").and_then(Value::as_str))
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.contains(COMPACT_MARK) && c.contains("ship the kernel")),
+            "{contents:?}"
+        );
+        assert_eq!(*contents.last().unwrap(), "keep going");
+        let events = rec.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| match e {
+            AgentEvent::Notice { message, .. } => message.contains("已載入上次上下文"),
+            _ => false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn persist_history_strips_images_and_keeps_the_compact_brief() {
+        let snaps: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snaps_cb = snaps.clone();
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![CompleteResponse {
+                text: "ok".into(),
+                ..CompleteResponse::new("1")
+            }])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let mut c = cfg("next", 2);
+        c.prior_history = vec![
+            json!({
+                "role": "user",
+                "content": format!("{COMPACT_MARK}\n## Original request\nlook\n")
+            }),
+            crate::vision::function_call_output(
+                "c1",
+                "shot",
+                Some("data:image/jpeg;base64,aaa"),
+            ),
+        ];
+        c.persist_history = Some(Arc::new(move |items| {
+            snaps_cb.lock().unwrap().push(items.to_vec());
+        }));
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        run(&provider, &tools, &rec, c).await.unwrap();
+        let saved = snaps.lock().unwrap();
+        assert!(!saved.is_empty(), "run end must persist a snapshot");
+        let last = saved.last().unwrap();
+        assert!(
+            last.iter().any(|i| i
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains(COMPACT_MARK))),
+            "{last:?}"
+        );
+        assert!(
+            !crate::vision::input_has_image(last),
+            "resume snapshot must not keep pixels: {last:?}"
+        );
     }
 
     #[tokio::test]

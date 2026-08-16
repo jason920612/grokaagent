@@ -203,6 +203,31 @@ impl SessionStore {
         let _ = fs::remove_file(&path);
         serde_json::from_slice(&raw).unwrap_or_default()
     }
+
+    /// Persist the model history so the next run in this chat can resume it.
+    pub fn save_context(&self, id: &str, items: &[serde_json::Value]) -> Result<()> {
+        let dir = self.dir(id);
+        if !dir.join("meta.json").exists() {
+            return Ok(());
+        }
+        if items.is_empty() {
+            let path = dir.join("context.json");
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(());
+        }
+        atomic_write(&dir.join("context.json"), &serde_json::to_vec(items)?)?;
+        Ok(())
+    }
+
+    pub fn load_context(&self, id: &str) -> Vec<serde_json::Value> {
+        let path = self.dir(id).join("context.json");
+        let Ok(raw) = fs::read(&path) else {
+            return Vec::new();
+        };
+        serde_json::from_slice(&raw).unwrap_or_default()
+    }
 }
 
 pub fn default_sessions_dir() -> Result<PathBuf> {
@@ -491,5 +516,31 @@ mod tests {
         store.save_closed_backgrounds(&a.id, &[item]).unwrap();
         store.delete(&a.id).unwrap();
         assert!(store.take_closed_backgrounds::<ClosedBackground>(&a.id).is_empty());
+    }
+
+    #[test]
+    fn context_save_load_roundtrip_and_vanishes_on_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().to_path_buf()).unwrap();
+        let a = store.create(PathBuf::from("/tmp/a")).unwrap();
+        let items = vec![serde_json::json!({
+            "role": "user",
+            "content": "[grokaagent compact v1]\n## Original request\nship"
+        })];
+        store.save_context(&a.id, &items).unwrap();
+        let loaded = store.load_context(&a.id);
+        assert_eq!(loaded, items);
+        store.delete(&a.id).unwrap();
+        assert!(store.load_context(&a.id).is_empty());
+    }
+
+    #[test]
+    fn context_skips_unknown_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().to_path_buf()).unwrap();
+        store
+            .save_context("missing-id", &[serde_json::json!({"role":"user","content":"x"})])
+            .unwrap();
+        assert!(store.load_context("missing-id").is_empty());
     }
 }
