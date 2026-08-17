@@ -1,12 +1,14 @@
-﻿use std::fmt::Write as _;
+﻿use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use md5::{Digest, Md5};
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -119,13 +121,66 @@ impl ClientTool for NowTool {
     }
 }
 
+fn md5_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Md5::digest(bytes))
+}
+
+/// Last `read_file` digest per canonical path. `edit_file` refuses a stale view.
+pub struct FileViewStore {
+    inner: Mutex<HashMap<PathBuf, String>>,
+}
+
+impl FileViewStore {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, String>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn key(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    pub fn remember(&self, path: &Path, bytes: &[u8]) {
+        self.lock().insert(Self::key(path), md5_hex(bytes));
+    }
+
+    pub fn check(&self, path: &Path, bytes: &[u8], rel: &str) -> Result<()> {
+        let now = md5_hex(bytes);
+        match self.lock().get(&Self::key(path)) {
+            None => Err(Error::Tool(format!(
+                "read_file {rel} before edit_file (md5 now {now})"
+            ))),
+            Some(seen) if *seen != now => Err(Error::Tool(format!(
+                "{rel} changed since last read_file (saw {seen}, now {now}). read_file it again before edit_file"
+            ))),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
 pub(crate) fn read_text_at(root: &Path, args: &Value) -> Result<String> {
+    read_text_at_tracked(root, args, None)
+}
+
+fn read_text_at_tracked(
+    root: &Path,
+    args: &Value,
+    views: Option<&FileViewStore>,
+) -> Result<String> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Tool("path is required".into()))?;
     let resolved = resolve_in_workspace(root, path)?;
     let text = read_utf8_capped(&resolved)?;
+    if let Some(v) = views {
+        v.remember(&resolved, text.as_bytes());
+    }
     let file = parse_text_file(&text);
     let n = file.lines.len();
     let start = optional_usize(args, "start_line")?.unwrap_or(1);
@@ -266,15 +321,20 @@ pub(crate) fn write_text_at(root: &Path, args: &Value) -> Result<String> {
 
 pub struct ReadFileTool {
     workspace: PathBuf,
+    views: Arc<FileViewStore>,
 }
 
 impl ReadFileTool {
     pub fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self::with_views(workspace, FileViewStore::new())
+    }
+
+    pub fn with_views(workspace: PathBuf, views: Arc<FileViewStore>) -> Self {
+        Self { workspace, views }
     }
 
     pub fn call_sync(&self, args: &Value) -> Result<String> {
-        read_text_at(&self.workspace, args)
+        read_text_at_tracked(&self.workspace, args, Some(&self.views))
     }
 }
 
@@ -506,7 +566,7 @@ impl ClientTool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file. Every returned line is prefixed with its 1-based line number (N|text) so later write_file line=N edits match. Optional pattern is a regex/keyword (only matching lines). Optional start_line/end_line slice the file.".into(),
+            description: "Read a UTF-8 text file. Every returned line is prefixed with its 1-based line number (N|text) so edit_file @@ hunks can use those numbers. You must read_file a path in this run before edit_file; if the file's MD5 changed since that read, read it again. Optional pattern is a regex/keyword (only matching lines). Optional start_line/end_line slice the file.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -608,7 +668,41 @@ impl WriteFileTool {
     }
 
     pub fn call_sync(&self, args: &Value) -> Result<String> {
-        write_text_at(&self.workspace, args)
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("path is required".into()))?;
+        let contents = args
+            .get("contents")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("contents is required".into()))?;
+        if contents.len() > MAX_FILE_BYTES {
+            return Err(Error::Tool("contents larger than 256KiB".into()));
+        }
+        if args.get("line").is_some()
+            || args.get("end_line").is_some()
+            || args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            || args.get("diff").is_some()
+        {
+            return Err(Error::Tool(
+                "write_file only creates a new file (path+contents). To change an existing file, read_file it then edit_file with a git unified diff.".into(),
+            ));
+        }
+        let target = resolve_target_in_workspace(&self.workspace, path)?;
+        if target.exists() {
+            return Err(Error::Tool(format!(
+                "file exists: {path}. write_file cannot overwrite. read_file then edit_file with a git unified diff (- deletes, + adds)."
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, contents)?;
+        let rel = path.replace('\\', "/");
+        Ok(diff::file_change_json(&rel, None, Some(contents)).to_string())
     }
 }
 
@@ -616,17 +710,79 @@ impl ClientTool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Create, overwrite, or edit a UTF-8 file. Set line/end_line (1-based, from read_file) to replace that range with contents (may be multiple lines), or pattern for regex replace-all ($1 captures). Omit both to overwrite the whole file. Result JSON includes a git unified diff of before vs after.".into(),
+            description: "Create a NEW UTF-8 file. Fails if the path already exists. For edits use edit_file. Result JSON includes a git unified diff of the created file.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Relative path inside the workspace"},
-                    "contents": {"type": "string", "description": "Full file, replacement lines, or regex replacement. Newlines write multiple lines."},
-                    "line": {"type": "integer", "description": "1-based start line to replace. Omit with pattern for regex; omit both to overwrite the whole file."},
-                    "end_line": {"type": "integer", "description": "1-based inclusive end line. Default is line."},
-                    "pattern": {"type": "string", "description": "Regex to replace everywhere in the file. Do not combine with line."}
+                    "contents": {"type": "string", "description": "Full file contents to create. Newlines write multiple lines."}
                 },
                 "required": ["path", "contents"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: &Value) -> ToolCallFut<'_> {
+        ready(self.call_sync(args))
+    }
+}
+
+pub struct EditFileTool {
+    workspace: PathBuf,
+    views: Arc<FileViewStore>,
+}
+
+impl EditFileTool {
+    pub fn new(workspace: PathBuf, views: Arc<FileViewStore>) -> Self {
+        Self { workspace, views }
+    }
+
+    pub fn call_sync(&self, args: &Value) -> Result<String> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("path is required".into()))?;
+        let patch = args
+            .get("diff")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("diff is required (git unified diff with @@, - deletes, + adds)".into()))?;
+        if patch.trim().is_empty() {
+            return Err(Error::Tool("diff is empty".into()));
+        }
+        if patch.len() > MAX_FILE_BYTES {
+            return Err(Error::Tool("diff larger than 256KiB".into()));
+        }
+        let target = resolve_in_workspace(&self.workspace, path)?;
+        let bytes = fs::read(&target).map_err(|_| Error::Tool(format!("file not found: {path}")))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(Error::Tool("file larger than 256KiB".into()));
+        }
+        self.views.check(&target, &bytes, path)?;
+        let before = String::from_utf8(bytes)
+            .map_err(|_| Error::Tool("file is not valid UTF-8".into()))?;
+        let after = diff::apply_unified(&before, patch)?;
+        if after.len() > MAX_FILE_BYTES {
+            return Err(Error::Tool("edited file would be larger than 256KiB".into()));
+        }
+        fs::write(&target, &after)?;
+        let rel = path.replace('\\', "/");
+        Ok(diff::file_change_json(&rel, Some(&before), Some(&after)).to_string())
+    }
+}
+
+impl ClientTool for EditFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "edit_file".into(),
+            description: "Edit an existing UTF-8 file with a git unified diff. Required: path + diff. diff must include @@ hunks; context lines start with a space, deleted lines with -, added lines with +. You MUST read_file this path first in this run. If the file MD5 changed since that read, read_file again. After a successful edit the file changed, so read it again before the next edit. Example: @@ -2,3 +2,3 @@\\n unchanged\\n-old\\n+new\\n more. Result JSON includes the applied unified diff.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path inside the workspace (must already exist)"},
+                    "diff": {"type": "string", "description": "Git unified diff for this one file. Use @@ -oldStart,oldCount +newStart,newCount @@ then context (space), -delete, +add. Line numbers come from the last read_file."}
+                },
+                "required": ["path", "diff"],
                 "additionalProperties": false
             }),
         }
@@ -1397,18 +1553,19 @@ mod tests {
     }
 
     #[test]
-    fn write_file_replaces_one_line_with_several() {
+    fn write_text_at_replaces_one_line_with_several() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        let tool = WriteFileTool::new(dir.path().to_path_buf());
         let out: Value = serde_json::from_str(
-            &tool
-                .call_sync(&json!({
+            &write_text_at(
+                dir.path(),
+                &json!({
                     "path": "a.txt",
                     "line": 2,
                     "contents": "TWO-A\nTWO-B\n"
-                }))
-                .unwrap(),
+                }),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(out["kind"], "modify");
@@ -1424,16 +1581,18 @@ mod tests {
     }
 
     #[test]
-    fn write_file_replaces_a_line_range() {
+    fn write_text_at_replaces_a_line_range() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "a\nb\nc\nd\n").unwrap();
-        let tool = WriteFileTool::new(dir.path().to_path_buf());
-        tool.call_sync(&json!({
-            "path": "a.txt",
-            "line": 2,
-            "end_line": 3,
-            "contents": "X\nY\nZ"
-        }))
+        write_text_at(
+            dir.path(),
+            &json!({
+                "path": "a.txt",
+                "line": 2,
+                "end_line": 3,
+                "contents": "X\nY\nZ"
+            }),
+        )
         .unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -1442,15 +1601,17 @@ mod tests {
     }
 
     #[test]
-    fn write_file_appends_when_line_is_len_plus_one() {
+    fn write_text_at_appends_when_line_is_len_plus_one() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
-        let tool = WriteFileTool::new(dir.path().to_path_buf());
-        tool.call_sync(&json!({
-            "path": "a.txt",
-            "line": 3,
-            "contents": "c\nd"
-        }))
+        write_text_at(
+            dir.path(),
+            &json!({
+                "path": "a.txt",
+                "line": 3,
+                "contents": "c\nd"
+            }),
+        )
         .unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -1459,18 +1620,19 @@ mod tests {
     }
 
     #[test]
-    fn write_file_regex_replaces_every_match() {
+    fn write_text_at_regex_replaces_every_match() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "foo 1\nbar\nfoo 2\n").unwrap();
-        let tool = WriteFileTool::new(dir.path().to_path_buf());
         let out: Value = serde_json::from_str(
-            &tool
-                .call_sync(&json!({
+            &write_text_at(
+                dir.path(),
+                &json!({
                     "path": "a.txt",
                     "pattern": r"foo (\d+)",
                     "contents": "FOO-$1"
-                }))
-                .unwrap(),
+                }),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(out["replacements"], 2);
@@ -1481,30 +1643,133 @@ mod tests {
     }
 
     #[test]
-    fn write_file_rejects_line_and_pattern_together() {
+    fn write_text_at_rejects_line_and_pattern_together() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-        let tool = WriteFileTool::new(dir.path().to_path_buf());
-        let err = tool
-            .call_sync(&json!({
+        let err = write_text_at(
+            dir.path(),
+            &json!({
                 "path": "a.txt",
                 "line": 1,
                 "pattern": "x",
                 "contents": "y"
-            }))
-            .unwrap_err();
+            }),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("either line or pattern"), "{err}");
     }
 
     #[test]
-    fn write_file_line_out_of_range_errors() {
+    fn write_text_at_line_out_of_range_errors() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "only\n").unwrap();
+        let err = write_text_at(
+            dir.path(),
+            &json!({"path": "a.txt", "line": 5, "contents": "no"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("past end"), "{err}");
+    }
+
+    #[test]
+    fn write_file_rejects_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "keep\n").unwrap();
         let tool = WriteFileTool::new(dir.path().to_path_buf());
         let err = tool
-            .call_sync(&json!({"path": "a.txt", "line": 5, "contents": "no"}))
+            .call_sync(&json!({"path": "a.txt", "contents": "nope\n"}))
             .unwrap_err();
-        assert!(err.to_string().contains("past end"), "{err}");
+        assert!(err.to_string().contains("file exists"), "{err}");
+        assert!(err.to_string().contains("edit_file"), "{err}");
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "keep\n");
+    }
+
+    fn file_pair(dir: &tempfile::TempDir) -> (ReadFileTool, EditFileTool) {
+        let views = FileViewStore::new();
+        let ws = dir.path().to_path_buf();
+        (
+            ReadFileTool::with_views(ws.clone(), views.clone()),
+            EditFileTool::new(ws, views),
+        )
+    }
+
+    #[test]
+    fn edit_file_requires_read_first() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let views = FileViewStore::new();
+        let edit = EditFileTool::new(dir.path().to_path_buf(), views);
+        let err = edit
+            .call_sync(&json!({
+                "path": "a.txt",
+                "diff": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("read_file"), "{err}");
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn edit_file_applies_unified_diff_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let (read, edit) = file_pair(&dir);
+        read.call_sync(&json!({"path": "a.txt"})).unwrap();
+        let out: Value = serde_json::from_str(
+            &edit
+                .call_sync(&json!({
+                    "path": "a.txt",
+                    "diff": "--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,4 @@\n one\n-two\n+TWO\n+TWO-B\n three\n"
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["kind"], "modify");
+        assert!(out["diff"].as_str().unwrap().contains("-two"), "{out}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\nTWO\nTWO-B\nthree\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_stale_md5_requires_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let (read, edit) = file_pair(&dir);
+        read.call_sync(&json!({"path": "a.txt"})).unwrap();
+        fs::write(dir.path().join("a.txt"), "one\nchanged\n").unwrap();
+        let err = edit
+            .call_sync(&json!({
+                "path": "a.txt",
+                "diff": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("changed since last read_file"), "{err}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\nchanged\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_after_success_requires_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let (read, edit) = file_pair(&dir);
+        read.call_sync(&json!({"path": "a.txt"})).unwrap();
+        edit.call_sync(&json!({
+            "path": "a.txt",
+            "diff": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+        }))
+        .unwrap();
+        let err = edit
+            .call_sync(&json!({
+                "path": "a.txt",
+                "diff": "@@ -1,2 +1,2 @@\n one\n-TWO\n+two\n"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("changed since last read_file"), "{err}");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::shellguard::{CommandReviewer, ProviderGuard};
 use crate::skills::{SkillStore, SkillTool};
 use crate::timer::{TimerHub, TimerTool};
 use crate::tools::{
-    DeleteFileTool, ListDirTool, NowTool, ReadFileTool, ReadImageTool, RunCommandTool,
+    DeleteFileTool, EditFileTool, FileViewStore, ListDirTool, NowTool, ReadFileTool, ReadImageTool, RunCommandTool,
     ScreenshotTool, ToolRegistry, WriteFileTool,
 };
 
@@ -108,11 +108,13 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         })))
     });
     let win = crate::wintrack::WindowHub::new();
+    let views = FileViewStore::new();
     let mut tools: Vec<Box<dyn crate::tools::ClientTool>> = vec![
         Box::new(NowTool),
-        Box::new(ReadFileTool::new(spec.workspace.clone())),
+        Box::new(ReadFileTool::with_views(spec.workspace.clone(), views.clone())),
         Box::new(ListDirTool::new(spec.workspace.clone())),
         Box::new(WriteFileTool::new(spec.workspace.clone())),
+        Box::new(EditFileTool::new(spec.workspace.clone(), views)),
         Box::new(DeleteFileTool::new(spec.workspace.clone())),
         Box::new(RunCommandTool::with_guard(
             spec.workspace.clone(),

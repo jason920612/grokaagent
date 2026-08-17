@@ -6,6 +6,8 @@ use std::process::Command;
 use serde_json::{json, Value};
 use similar::TextDiff;
 
+use crate::error::{Error, Result};
+
 const MAX_FILES: usize = 24;
 const MAX_DIFF_BYTES: usize = 32 * 1024;
 
@@ -17,6 +19,273 @@ pub fn unified_diff(path: &str, before: &str, after: &str) -> String {
         .unified_diff()
         .header(&format!("a/{path}"), &format!("b/{path}"))
         .to_string()
+}
+
+struct TextLines {
+    lines: Vec<String>,
+    newline: &'static str,
+    trailing_nl: bool,
+}
+
+fn split_text(s: &str) -> TextLines {
+    let newline = if s.contains("\r\n") { "\r\n" } else { "\n" };
+    let trailing_nl = s.ends_with('\n');
+    let mut body = if trailing_nl {
+        s.strip_suffix('\n').unwrap_or(s)
+    } else {
+        s
+    };
+    if newline == "\r\n" {
+        body = body.strip_suffix('\r').unwrap_or(body);
+    }
+    let lines = if s.is_empty() {
+        Vec::new()
+    } else {
+        body.split(newline).map(|l| l.to_string()).collect()
+    };
+    TextLines {
+        lines,
+        newline,
+        trailing_nl,
+    }
+}
+
+fn join_text(file: &TextLines) -> String {
+    if file.lines.is_empty() {
+        return if file.trailing_nl {
+            file.newline.to_string()
+        } else {
+            String::new()
+        };
+    }
+    let mut out = file.lines.join(file.newline);
+    if file.trailing_nl {
+        out.push_str(file.newline);
+    }
+    out
+}
+
+struct Hunk {
+    old_start: usize,
+    old_count: usize,
+    old_lines: Vec<String>,
+    new_lines: Vec<String>,
+}
+
+fn strip_fences(patch: &str) -> String {
+    let s = patch.trim();
+    if !s.starts_with("```") {
+        return s.to_string();
+    }
+    let mut lines: Vec<&str> = s.lines().collect();
+    if lines.first().is_some_and(|l| l.starts_with("```")) {
+        lines.remove(0);
+    }
+    if lines.last().is_some_and(|l| l.trim() == "```") {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn is_file_header(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("diff --git ")
+        || t.starts_with("index ")
+        || t.starts_with("--- ")
+        || t.starts_with("+++ ")
+        || t.starts_with("new file mode ")
+        || t.starts_with("deleted file mode ")
+        || t.starts_with("old mode ")
+        || t.starts_with("new mode ")
+        || t.starts_with("similarity index ")
+        || t.starts_with("rename from ")
+        || t.starts_with("rename to ")
+        || t.starts_with("copy from ")
+        || t.starts_with("copy to ")
+        || t.starts_with("Binary files ")
+}
+
+fn parse_hunk_range(s: &str) -> Result<((usize, usize), &str)> {
+    let s = s.trim_start();
+    let s = s
+        .strip_prefix(['-', '+'])
+        .ok_or_else(|| Error::Tool("hunk header missing +/- range".into()))?;
+    let digits = s
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    if digits == 0 {
+        return Err(Error::Tool("hunk header has no line number".into()));
+    }
+    let start: usize = s[..digits]
+        .parse()
+        .map_err(|_| Error::Tool("hunk header line is not an integer".into()))?;
+    let rest = &s[digits..];
+    if let Some(rest) = rest.strip_prefix(',') {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return Err(Error::Tool("hunk header count is empty".into()));
+        }
+        let count: usize = rest[..digits]
+            .parse()
+            .map_err(|_| Error::Tool("hunk header count is not an integer".into()))?;
+        Ok(((start, count), &rest[digits..]))
+    } else {
+        Ok(((start, 1), rest))
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Result<(usize, usize, usize, usize)> {
+    let s = line.trim();
+    let s = s
+        .strip_prefix("@@")
+        .ok_or_else(|| Error::Tool("expected @@ hunk header".into()))?
+        .trim();
+    let (old, s) = parse_hunk_range(s)?;
+    let (new, _) = parse_hunk_range(s)?;
+    Ok((old.0, old.1, new.0, new.1))
+}
+
+fn parse_hunks(patch: &str) -> Result<Vec<Hunk>> {
+    let stripped = strip_fences(patch);
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut hunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if !line.starts_with("@@") {
+            i += 1;
+            continue;
+        }
+        let (old_start, old_count, new_start, new_count) = parse_hunk_header(line)?;
+        let _ = (new_start, new_count);
+        i += 1;
+        let mut old_lines = Vec::new();
+        let mut new_lines = Vec::new();
+        while i < lines.len() {
+            let body = lines[i];
+            if body.starts_with("@@") {
+                break;
+            }
+            if body.is_empty() || is_file_header(body) {
+                i += 1;
+                continue;
+            }
+            if body.starts_with('\\') {
+                i += 1;
+                continue;
+            }
+            match body.as_bytes().first().copied() {
+                Some(b' ') => {
+                    let t = &body[1..];
+                    old_lines.push(t.to_string());
+                    new_lines.push(t.to_string());
+                }
+                Some(b'-') => old_lines.push(body[1..].to_string()),
+                Some(b'+') => new_lines.push(body[1..].to_string()),
+                _ => {
+                    return Err(Error::Tool(format!(
+                        "diff line must start with space, + or -: {body}"
+                    )));
+                }
+            }
+            i += 1;
+        }
+        if old_lines.len() != old_count {
+            return Err(Error::Tool(format!(
+                "hunk @@ -{old_start},{old_count} has {} old lines (space or -)",
+                old_lines.len()
+            )));
+        }
+        if new_lines.len() != new_count {
+            return Err(Error::Tool(format!(
+                "hunk @@ +{new_start},{new_count} has {} new lines (space or +)",
+                new_lines.len()
+            )));
+        }
+        hunks.push(Hunk {
+            old_start,
+            old_count,
+            old_lines,
+            new_lines,
+        });
+    }
+    if hunks.is_empty() {
+        return Err(Error::Tool(
+            "edit_file diff needs at least one @@ hunk with - deleted lines and + added lines".into(),
+        ));
+    }
+    Ok(hunks)
+}
+
+fn hunk_insert_at(h: &Hunk) -> Result<usize> {
+    if h.old_count == 0 {
+        return Ok(h.old_start);
+    }
+    if h.old_start == 0 {
+        return Err(Error::Tool("hunk old start is 0 but count is not 0".into()));
+    }
+    Ok(h.old_start - 1)
+}
+
+/// Apply a git unified diff (`---`/`+++`/`@@`, context, `-` deletes, `+` adds).
+pub fn apply_unified(original: &str, patch: &str) -> Result<String> {
+    if patch.len() > MAX_DIFF_BYTES * 8 {
+        return Err(Error::Tool("diff is larger than 256KiB".into()));
+    }
+    let mut file = split_text(original);
+    let mut hunks = parse_hunks(patch)?;
+    hunks.sort_by_key(|h| h.old_start);
+    for pair in hunks.windows(2) {
+        let a_end = if pair[0].old_count == 0 {
+            pair[0].old_start
+        } else {
+            pair[0].old_start.saturating_add(pair[0].old_count)
+        };
+        if pair[1].old_start < a_end && pair[1].old_count > 0 {
+            return Err(Error::Tool("diff hunks overlap".into()));
+        }
+    }
+    hunks.reverse();
+    for h in &hunks {
+        let at = hunk_insert_at(h)?;
+        if h.old_count == 0 {
+            if at > file.lines.len() {
+                return Err(Error::Tool(format!(
+                    "hunk inserts past end of file ({} lines)",
+                    file.lines.len()
+                )));
+            }
+            for (i, line) in h.new_lines.iter().enumerate() {
+                file.lines.insert(at + i, line.clone());
+            }
+            continue;
+        }
+        let end = at.saturating_add(h.old_count);
+        if end > file.lines.len() {
+            return Err(Error::Tool(format!(
+                "hunk @@ -{},{} is past end of file ({} lines)",
+                h.old_start,
+                h.old_count,
+                file.lines.len()
+            )));
+        }
+        if file.lines[at..end] != h.old_lines {
+            return Err(Error::Tool(format!(
+                "hunk @@ -{},{} does not match the file. read_file again and copy context lines exactly",
+                h.old_start, h.old_count
+            )));
+        }
+        file.lines.splice(at..end, h.new_lines.iter().cloned());
+    }
+    let no_nl = patch.lines().any(|l| l.trim_start().starts_with('\\'));
+    if no_nl {
+        file.trailing_nl = false;
+    } else if original.is_empty() && !file.lines.is_empty() {
+        file.trailing_nl = true;
+    }
+    Ok(join_text(&file))
 }
 
 pub fn kind_for(before: Option<&str>, after: Option<&str>) -> &'static str {
@@ -205,6 +474,42 @@ mod tests {
     #[test]
     fn identical_is_empty() {
         assert!(unified_diff("a.txt", "x\n", "x\n").is_empty());
+    }
+
+    #[test]
+    fn apply_unified_roundtrips_similar_diff() {
+        let before = "one\ntwo\nthree\n";
+        let after = "one\nTWO\nTWO-B\nthree\n";
+        let patch = unified_diff("a.txt", before, after);
+        assert_eq!(apply_unified(before, &patch).unwrap(), after, "{patch}");
+        let crlf_before = "a\r\nb\r\nc\r\n";
+        let crlf_after = "a\r\nB\r\nc\r\n";
+        let patch = unified_diff("w.txt", crlf_before, crlf_after);
+        assert_eq!(
+            apply_unified(crlf_before, &patch).unwrap(),
+            crlf_after,
+            "{patch}"
+        );
+    }
+
+    #[test]
+    fn apply_unified_inserts_at_start_of_empty_file() {
+        let patch = "--- a/n.txt\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n";
+        assert_eq!(apply_unified("", patch).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn apply_unified_rejects_context_mismatch() {
+        let patch = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n";
+        let err = apply_unified("a\nx\n", patch).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn apply_unified_strips_fences_and_multiple_hunks() {
+        let before = "a\nb\nc\nd\n";
+        let patch = "```diff\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -4,1 +4,1 @@\n-d\n+D\n```\n";
+        assert_eq!(apply_unified(before, patch).unwrap(), "a\nB\nc\nD\n");
     }
 
     #[test]

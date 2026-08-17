@@ -3069,7 +3069,7 @@ fn tool_started_line(name: &str, args: &Value) -> String {
                 }
             }
         }
-        "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
+        "write_file" | "edit_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
             format!("▸ {name}  {}", file_tool_target(name, args))
         }
         "project_memory" => {
@@ -3099,7 +3099,7 @@ fn tool_started_line(name: &str, args: &Value) -> String {
 
 fn tool_finished_line(name: &str, output: &str) -> String {
     match name {
-        "write_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" | "project_memory" => {
+        "write_file" | "edit_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" | "project_memory" => {
             format!("✓ {name}")
         }
         "run_command" => {
@@ -3201,7 +3201,7 @@ fn live_tool_activity(name: &str, args: &Value, phase: &str) -> String {
                 .unwrap_or_default();
             format!("{phase}  timer  {secs}s")
         }
-        "write_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
+        "write_file" | "edit_file" | "read_file" | "delete_file" | "list_dir" | "screenshot" | "read_image" => {
             format!("{phase}  {name}  {}", file_tool_target(name, args))
         }
         "project_memory" => {
@@ -11208,6 +11208,8 @@ mod tests {
         assert!(kill.contains("dev"), "{kill}");
         let path = tool_started_line("write_file", &serde_json::json!({"path": "src/a.rs"}));
         assert!(path.contains("src/a.rs"), "{path}");
+        let edit = tool_started_line("edit_file", &serde_json::json!({"path": "src/a.rs"}));
+        assert!(edit.contains("src/a.rs"), "{edit}");
         let ask = tool_started_line("ask_user", &serde_json::json!({"question": "挑一個"}));
         assert!(ask.contains("挑一個"), "{ask}");
         let mem = tool_started_line(

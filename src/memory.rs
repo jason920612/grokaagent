@@ -223,7 +223,7 @@ impl ClientTool for ProjectMemoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "project_memory".into(),
-            description: "Persistent notes for THIS workspace, stored outside the project (not in git). Multiple files allowed (goal.md, done.md, constraints.md, …). Notes are not in context until you list/read them. Read and write use the same line numbers, slices, regex, and unified diff as read_file/write_file. Record overall requirements, constraints, and what was done. Never put secrets here and never write these notes into the workspace.".into(),
+            description: "Persistent notes for THIS workspace, stored outside the project (not in git). Multiple files allowed (goal.md, done.md, constraints.md, …). Notes are not in context until you list/read them. Read is numbered like read_file. Write still accepts full overwrite or line/end_line/pattern and returns a unified diff. Record overall requirements, constraints, and what was done. Never put secrets here and never write these notes into the workspace.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
