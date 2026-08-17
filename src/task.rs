@@ -16,7 +16,6 @@ use crate::tools::{ClientTool, ToolCallFut, ToolSpec};
 pub const AGENT_NAME: &str = "任務系統";
 pub const KICK: &str = "[grokaagent task]";
 pub const MAX_GOAL: usize = 2000;
-pub const MAX_CONTINUES: u32 = 48;
 pub const MAX_ITEMS: usize = 20;
 const EXCERPT_CHARS: usize = 24_000;
 const NEXT_CHARS: usize = 1_200;
@@ -92,8 +91,6 @@ pub struct TaskState {
     pub checklist: Vec<CheckItem>,
     #[serde(default)]
     pub phase: TaskPhase,
-    #[serde(default)]
-    pub continues: u32,
     #[serde(default)]
     pub claim: Option<String>,
     #[serde(default)]
@@ -757,7 +754,7 @@ async fn review_and_steer<P: Provider>(
             return None;
         }
     };
-    apply_verdict(hub, run_id, snap, verdict, kind, sink)
+    apply_verdict(hub, run_id, snap, verdict, sink)
 }
 
 fn apply_verdict(
@@ -765,7 +762,6 @@ fn apply_verdict(
     run_id: &str,
     mut snap: TaskState,
     verdict: Verdict,
-    kind: &str,
     sink: &dyn EventSink,
 ) -> Option<String> {
     emit_spawn(sink, run_id, &snap.goal, hub);
@@ -817,19 +813,6 @@ fn apply_verdict(
             Some(explain_fail_instruction(&snap.goal, &reason))
         }
         Status::Continue => {
-            if snap.continues >= MAX_CONTINUES && kind != "plan" {
-                snap.phase = TaskPhase::Active;
-                hub.replace(snap);
-                emit_notice(
-                    sink,
-                    run_id,
-                    format!("任務循環已達 {MAX_CONTINUES} 次，先停下。再送一句即可繼續。"),
-                );
-                return None;
-            }
-            if kind != "plan" {
-                snap.continues = snap.continues.saturating_add(1);
-            }
             snap.phase = TaskPhase::Active;
             let next = if verdict.next.trim().is_empty() {
                 "繼續完成尚未勾選的檢查項，做完再停下。".into()
@@ -880,6 +863,16 @@ mod tests {
         assert!(is_kick(KICK));
         assert!(is_kick("  [grokaagent task] \n"));
         assert!(!is_kick("hello"));
+    }
+
+    #[test]
+    fn old_task_json_with_continues_still_loads() {
+        let s: TaskState = serde_json::from_str(
+            r#"{"goal":"x","phase":"active","continues":48,"checklist":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.goal, "x");
+        assert_eq!(s.phase, TaskPhase::Active);
     }
 
     #[test]
@@ -956,7 +949,6 @@ mod tests {
                 next: "go".into(),
                 reason: String::new(),
             },
-            "plan",
             &Rec(Mutex::new(Vec::new())),
         );
         hub.set_skip_steer(true);
@@ -1009,7 +1001,6 @@ mod tests {
                 next: "先寫測試".into(),
                 reason: String::new(),
             },
-            "plan",
             &rec,
         )
         .unwrap();
@@ -1026,7 +1017,6 @@ mod tests {
                 next: String::new(),
                 reason: "沒有帳號系統可接".into(),
             },
-            "check",
             &rec,
         )
         .unwrap();
@@ -1047,10 +1037,47 @@ mod tests {
                 next: String::new(),
                 reason: "ok".into(),
             },
-            "check",
             &rec,
         );
         assert_eq!(hub.snapshot().phase, TaskPhase::Done);
+        hub.start_goal("長任務");
+        apply_verdict(
+            &hub,
+            "r",
+            hub.snapshot(),
+            Verdict {
+                status: Status::Continue,
+                checklist: vec![CheckItem {
+                    text: "做".into(),
+                    done: false,
+                }],
+                next: "繼續".into(),
+                reason: String::new(),
+            },
+            &rec,
+        );
+        for i in 0..50 {
+            let inj = apply_verdict(
+                &hub,
+                "r",
+                hub.snapshot(),
+                Verdict {
+                    status: Status::Continue,
+                    checklist: vec![CheckItem {
+                        text: "做".into(),
+                        done: false,
+                    }],
+                    next: format!("第{}步", i + 1),
+                    reason: String::new(),
+                },
+                &rec,
+            );
+            assert!(
+                inj.is_some(),
+                "continue #{i} must keep steering; there is no round cap"
+            );
+        }
+        assert_eq!(hub.snapshot().phase, TaskPhase::Active);
         let events = rec.0.lock().unwrap().clone();
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ChildSpawned { name, .. } if name == AGENT_NAME)));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ChildExited { name, .. } if name == AGENT_NAME)));

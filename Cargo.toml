@@ -1,6 +1,6 @@
 [package]
 name = "grokaagent"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Minimal agent kernel: event loop, tools, xAI Grok OAuth, JSONL event pipe"
 license = "MIT"
