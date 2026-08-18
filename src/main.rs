@@ -2,19 +2,33 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use grokaagent::auth;
+use grokaagent::config::{ProviderConfig, ProviderKind};
 use grokaagent::events::JsonlSink;
 use grokaagent::kit::{self, KernelSpec};
-use grokaagent::provider::{ReasoningEffort, XaiOauthProvider};
+use grokaagent::provider::{AnyProvider, ReasoningEffort};
 use grokaagent::tui::{self, TuiOptions};
 use grokaagent::worker::{self, WorkerConfig, WorkerMode};
 
 #[derive(Parser)]
-#[command(name = "grokaagent", version, about = "Event-loop agent with xAI Grok OAuth and A2A workers")]
+#[command(name = "grokaagent", version, about = "Event-loop agent with xAI Grok OAuth or an OpenAI-compatible API")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+struct ApiArgs {
+    /// OpenAI-compatible base URL, e.g. http://host:port/v1
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Bearer token for a custom endpoint (optional for some local servers).
+    #[arg(long)]
+    api_key: Option<String>,
+    /// Context window, e.g. 262K or 262144
+    #[arg(long)]
+    context: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -27,11 +41,11 @@ enum Command {
     Login,
     /// Delete the saved xAI OAuth tokens.
     Logout,
-    /// Run one agent turn-loop against Grok (headless).
+    /// Run one agent turn-loop (headless).
     Run {
         prompt: Option<String>,
-        #[arg(long, default_value = "grok-4.6")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value = "groka-events.jsonl")]
         events: PathBuf,
         #[arg(long, default_value_t = 0, help = "0 = unlimited (default)")]
@@ -42,11 +56,13 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Interactive terminal UI.
     Tui {
-        #[arg(long, default_value = "grok-4.6")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value = "groka-events.jsonl")]
         events: PathBuf,
         #[arg(long, default_value_t = 0, help = "0 = unlimited (default)")]
@@ -58,6 +74,8 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// A2A worker (spawned by a parent; handshake JSON on the first stdout line).
     Worker {
@@ -75,12 +93,14 @@ enum Command {
         mode: String,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long, default_value = "grok-4.6")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value_t = 8)]
         max_turns: u32,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        #[command(flatten)]
+        api: ApiArgs,
     },
 }
 
@@ -102,6 +122,34 @@ fn wants_auto_update(cmd: &Option<Command>) -> bool {
     matches!(cmd, None | Some(Command::Tui { .. }))
 }
 
+fn boot_provider(
+    api: ApiArgs,
+    model: Option<String>,
+    persist: bool,
+) -> grokaagent::Result<(ProviderConfig, String)> {
+    let mut cfg = ProviderConfig::load();
+    let override_set = api.base_url.is_some()
+        || api.api_key.is_some()
+        || api.context.is_some()
+        || model.is_some();
+    cfg.apply_cli(
+        api.base_url,
+        api.api_key,
+        api.context.as_deref(),
+        model.as_deref(),
+    );
+    if persist && override_set {
+        let _ = cfg.save();
+    }
+    let model = cfg.effective_model().to_string();
+    if cfg.route().is_openai() && model.is_empty() {
+        return Err(grokaagent::Error::Provider(
+            "custom API needs --model (or GROKA_MODEL / saved provider.json)".into(),
+        ));
+    }
+    Ok((cfg, model))
+}
+
 async fn real_main() -> grokaagent::Result<()> {
     grokaagent::install::cleanup_old_exe();
     let cli = Cli::parse();
@@ -118,12 +166,13 @@ async fn real_main() -> grokaagent::Result<()> {
     let auth_path = auth::default_auth_path()?;
     match cli.command {
         None => {
+            let (cfg, model) = boot_provider(ApiArgs::default(), None, false)?;
             tui::run_tui(TuiOptions {
-                model: "grok-4.6".into(),
+                model,
                 events: PathBuf::from("groka-events.jsonl"),
                 workspace: std::env::current_dir()?,
                 max_turns: 0,
-                web_search: true,
+                web_search: cfg.kind != ProviderKind::Openai,
                 reasoning_effort: ReasoningEffort::High,
             })
             .await?;
@@ -168,7 +217,9 @@ async fn real_main() -> grokaagent::Result<()> {
             no_web_search,
             workspace,
             reasoning,
+            api,
         }) => {
+            let (cfg, model) = boot_provider(api, model, true)?;
             tui::run_tui(TuiOptions {
                 model,
                 events,
@@ -177,7 +228,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     None => std::env::current_dir()?,
                 },
                 max_turns,
-                web_search: !no_web_search,
+                web_search: !no_web_search && cfg.kind != ProviderKind::Openai,
                 reasoning_effort: reasoning,
             })
             .await?;
@@ -190,6 +241,7 @@ async fn real_main() -> grokaagent::Result<()> {
             web_search,
             workspace,
             reasoning,
+            api,
         }) => {
             let prompt = match prompt {
                 Some(p) => p,
@@ -207,9 +259,14 @@ async fn real_main() -> grokaagent::Result<()> {
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
+            let (cfg, model) = boot_provider(api, model, false)?;
             let sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
-            let provider = XaiOauthProvider::new(auth_path, Some(model.clone()))?;
-            let server_tools = kit::search_tools(web_search);
+            let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
+            let server_tools = if cfg.route().is_openai() {
+                vec![]
+            } else {
+                kit::search_tools(web_search)
+            };
             let outcome = kit::run_with_nursery(
                 &provider,
                 sink,
@@ -232,6 +289,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     inbox: None,
                     images: Vec::new(),
                     ask: None,
+                    context_window: cfg.window_tokens(),
                     cancel: None,
                     skills: None,
                     task: None,
@@ -269,7 +327,9 @@ async fn real_main() -> grokaagent::Result<()> {
             model,
             max_turns,
             reasoning,
+            api,
         }) => {
+            let (_, model) = boot_provider(api, model, false)?;
             worker::run_worker(WorkerConfig {
                 name,
                 depth,

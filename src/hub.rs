@@ -231,6 +231,14 @@ pub struct UiSettings {
     pub web_search: bool,
     pub import_claude: bool,
     pub import_codex: bool,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub context: String,
     pub skills: Vec<UiSkill>,
 }
 
@@ -335,6 +343,10 @@ pub enum UiCommand {
     EndTask,
     Login,
     Logout,
+    SetProviderKind { kind: String },
+    SetEndpoint { text: String },
+    SetApiKey { text: String },
+    SetContext { text: String },
     SetModel { id: String },
     SetEffort { id: String },
     ToggleSearch,

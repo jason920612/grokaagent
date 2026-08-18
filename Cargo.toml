@@ -1,8 +1,8 @@
 [package]
 name = "grokaagent"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
-description = "Minimal agent kernel: event loop, tools, xAI Grok OAuth, JSONL event pipe"
+description = "Event-loop agent: local tools, xAI Grok OAuth, or an OpenAI-compatible API"
 license = "MIT"
 repository = "https://github.com/jason920612/grokaagent"
 readme = "README.md"

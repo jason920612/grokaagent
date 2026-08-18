@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use crate::a2a::{self, Handshake};
 use crate::error::{Error, Result};
 use crate::events::JsonlSink;
-use crate::provider::XaiOauthProvider;
+use crate::provider::AnyProvider;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkerMode {
@@ -191,8 +191,8 @@ async fn cancel_task(
 async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
     let sink: std::sync::Arc<dyn crate::events::EventSink> =
         std::sync::Arc::new(JsonlSink::create(&st.cfg.events)?);
-    let auth = crate::auth::default_auth_path()?;
-    let provider = XaiOauthProvider::new(auth, Some(st.cfg.model.clone()))?;
+    let cfg = crate::config::ProviderConfig::load();
+    let provider = AnyProvider::connect(&cfg, Some(st.cfg.model.clone()))?;
     let out = crate::kit::run_with_nursery(
         &provider,
         sink,
@@ -214,6 +214,7 @@ async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
             inbox: None,
             images: Vec::new(),
             ask: None,
+            context_window: cfg.window_tokens(),
             cancel: None,
             skills: None,
             task: None,

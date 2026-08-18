@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use crate::agent::{CancelFlag, SessionKnobs, UserTurn};
 use crate::ask::{self, AskUserHub, Question};
 use crate::auth;
+use crate::config::{ProviderConfig, ProviderKind};
 use crate::error::{Error, Result};
 use crate::events::{AgentEvent, ChannelSink, EventMeta, EventSink, FanoutSink, JsonlSink};
 use crate::catalog::{clamp_effort_for_model, cycle_effort, EffortOpt, ModelCatalog};
@@ -35,7 +36,7 @@ use crate::folderpick::{self, FolderView};
 use crate::hub::{self, UiCommand, UiSnapshot};
 use crate::kit;
 use crate::md;
-use crate::provider::{ReasoningEffort, XaiOauthProvider};
+use crate::provider::{AnyProvider, ReasoningEffort};
 use crate::session::{self, SessionMeta, SessionStore};
 use crate::skills::{Skill, SkillStore};
 use crate::task::{self, TaskHub, TaskPhase};
@@ -249,8 +250,12 @@ enum Focus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingField {
+    Kind,
     Account,
+    Endpoint,
+    ApiKey,
     Model,
+    Context,
     Effort,
     Search,
     ImportClaude,
@@ -316,6 +321,11 @@ enum Hit {
     Max,
     SettingModel,
     SettingEffort,
+    SettingEndpoint,
+    SettingApiKey,
+    SettingContext,
+    ProviderXai,
+    ProviderOpenai,
     CatalogPick(u16),
     Search,
     ImportClaude,
@@ -1236,6 +1246,11 @@ struct App {
     focus: Focus,
     setting_field: SettingField,
     settings: Option<Win>,
+    conn: ProviderConfig,
+    endpoint_edit: Edit,
+    api_key_edit: Edit,
+    model_edit: Edit,
+    context_edit: Edit,
     drag: Option<(i16, i16)>,
     /// Mouse grab offset inside the chat scrollbar thumb.
     scroll_grab: Option<i16>,
@@ -4099,9 +4114,10 @@ fn apply_sgr(code: &str, mut style: Style) -> Style {
     style
 }
 
-fn sync_knobs(knobs: &Mutex<SessionKnobs>, opts: &TuiOptions, catalog: &ModelCatalog) {
+fn sync_knobs(app: &App, opts: &TuiOptions) {
+    let openai = app.conn.kind.is_openai();
     let model = if opts.model.trim().is_empty() {
-        catalog
+        app.catalog
             .models
             .first()
             .map(|m| m.id.clone())
@@ -4110,12 +4126,16 @@ fn sync_knobs(knobs: &Mutex<SessionKnobs>, opts: &TuiOptions, catalog: &ModelCat
     } else {
         opts.model.clone()
     };
-    let choice = clamp_effort_for_model(catalog, &model, opts.reasoning_effort);
-    if let Ok(mut k) = knobs.lock() {
+    let choice = clamp_effort_for_model(&app.catalog, &model, opts.reasoning_effort);
+    if let Ok(mut k) = app.knobs.lock() {
         k.model = model;
         k.reasoning_effort = choice.effort;
-        k.send_reasoning = choice.send_reasoning;
-        k.server_tools = kit::search_tools(opts.web_search);
+        k.send_reasoning = choice.send_reasoning && !openai;
+        k.server_tools = if openai {
+            Vec::new()
+        } else {
+            kit::search_tools(opts.web_search)
+        };
     }
 }
 
@@ -4148,15 +4168,160 @@ fn effort_choices(app: &App, opts: &TuiOptions) -> Vec<EffortOpt> {
 }
 
 fn apply_selected_model(app: &mut App, opts: &mut TuiOptions, model_id: String) {
-    opts.model = model_id;
+    opts.model = model_id.clone();
+    app.model_edit = Edit::at_end(model_id.clone());
+    app.conn.model = model_id;
     let choice = clamp_effort_for_model(&app.catalog, &opts.model, opts.reasoning_effort);
     opts.reasoning_effort = choice.effort;
-    sync_knobs(&app.knobs, opts, &app.catalog);
+    if app.conn.kind.is_openai() {
+        let _ = app.conn.save();
+        paint_custom_catalog(app, opts);
+        refresh_ready(app);
+    } else if app.conn.route_for(&opts.model).is_openai() {
+        app.conn.kind = ProviderKind::Openai;
+        opts.web_search = false;
+        app.want_catalog = false;
+        let _ = app.conn.save();
+        paint_custom_catalog(app, opts);
+        refresh_ready(app);
+    }
+    sync_knobs(app, opts);
 }
 
 fn apply_selected_effort(app: &App, opts: &mut TuiOptions, effort: ReasoningEffort) {
     opts.reasoning_effort = effort;
-    sync_knobs(&app.knobs, opts, &app.catalog);
+    sync_knobs(app, opts);
+}
+
+fn refresh_ready(app: &mut App) {
+    let xai = auth::load_tokens(&app.auth_path).is_ok();
+    app.logged_in = app.conn.ready(xai);
+}
+
+fn edits_from_conn(app: &mut App, opts: &TuiOptions) {
+    app.endpoint_edit = Edit::at_end(app.conn.base_url.clone());
+    app.api_key_edit = Edit::at_end(app.conn.api_key.clone());
+    let model = if app.conn.kind.is_openai() && !app.conn.model.trim().is_empty() {
+        app.conn.model.clone()
+    } else {
+        opts.model.clone()
+    };
+    app.model_edit = Edit::at_end(model);
+    app.context_edit = Edit::at_end(if app.conn.context_window > 0 {
+        crate::compact::format_window(app.conn.context_window)
+    } else {
+        String::new()
+    });
+}
+
+fn snapshot_conn(app: &mut App) {
+    app.conn.base_url = app.endpoint_edit.text.trim().to_string();
+    app.conn.api_key = app.api_key_edit.text.trim().to_string();
+    if app.conn.kind.is_openai() {
+        let model = app.model_edit.text.trim();
+        if !model.is_empty() {
+            app.conn.model = model.to_string();
+        }
+        app.conn.context_window =
+            crate::compact::parse_window(&app.context_edit.text).unwrap_or(0);
+    }
+    let _ = app.conn.save();
+    refresh_ready(app);
+}
+
+fn flush_conn(app: &mut App, opts: &mut TuiOptions) {
+    snapshot_conn(app);
+    if app.conn.kind.is_openai() {
+        if !app.conn.model.trim().is_empty() {
+            opts.model = app.conn.model.clone();
+        }
+        opts.web_search = false;
+        paint_custom_catalog(app, opts);
+    } else {
+        app.conn.model = opts.model.clone();
+        let _ = app.conn.save();
+    }
+    sync_knobs(app, opts);
+}
+
+fn paint_custom_catalog(app: &mut App, opts: &TuiOptions) {
+    let id = opts.model.trim();
+    if id.is_empty() {
+        return;
+    }
+    app.catalog = ModelCatalog {
+        models: vec![crate::catalog::CatalogModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            supports_reasoning_effort: false,
+            default_effort: None,
+            efforts: vec![],
+        }],
+    };
+    app.catalog_status = CatalogStatus::Ready;
+}
+
+fn set_provider_kind(app: &mut App, opts: &mut TuiOptions, kind: ProviderKind) {
+    flush_conn(app, opts);
+    app.conn.kind = kind;
+    if kind.is_openai() {
+        if app.model_edit.text.trim().is_empty() {
+            app.model_edit = Edit::at_end(opts.model.clone());
+        }
+        opts.web_search = false;
+        app.want_catalog = false;
+        paint_custom_catalog(app, opts);
+        app.setting_field = SettingField::Endpoint;
+    } else {
+        app.want_catalog = true;
+        app.catalog_status = CatalogStatus::Idle;
+        app.setting_field = SettingField::Account;
+    }
+    let _ = app.conn.save();
+    refresh_ready(app);
+    sync_knobs(app, opts);
+}
+
+fn setting_edit_mut(app: &mut App) -> Option<&mut Edit> {
+    match app.setting_field {
+        SettingField::Endpoint => Some(&mut app.endpoint_edit),
+        SettingField::ApiKey => Some(&mut app.api_key_edit),
+        SettingField::Model if app.conn.kind.is_openai() => Some(&mut app.model_edit),
+        SettingField::Context => Some(&mut app.context_edit),
+        _ => None,
+    }
+}
+
+fn cycle_setting_field(app: &mut App, opts: &mut TuiOptions) {
+    flush_conn(app, opts);
+    let openai = app.conn.kind.is_openai();
+    app.setting_field = if openai {
+        match app.setting_field {
+            SettingField::Kind => SettingField::Endpoint,
+            SettingField::Endpoint => SettingField::ApiKey,
+            SettingField::ApiKey => SettingField::Model,
+            SettingField::Model => SettingField::Context,
+            SettingField::Context => SettingField::ImportClaude,
+            SettingField::ImportClaude => SettingField::ImportCodex,
+            SettingField::ImportCodex => SettingField::Skills,
+            SettingField::Skills | SettingField::Account | SettingField::Effort | SettingField::Search => {
+                SettingField::Kind
+            }
+        }
+    } else {
+        match app.setting_field {
+            SettingField::Kind => SettingField::Account,
+            SettingField::Account => SettingField::Model,
+            SettingField::Model => SettingField::Effort,
+            SettingField::Effort => SettingField::Search,
+            SettingField::Search => SettingField::ImportClaude,
+            SettingField::ImportClaude => SettingField::ImportCodex,
+            SettingField::ImportCodex => SettingField::Skills,
+            SettingField::Skills | SettingField::Endpoint | SettingField::ApiKey | SettingField::Context => {
+                SettingField::Kind
+            }
+        }
+    };
 }
 
 fn open_drop(app: &mut App, opts: &TuiOptions, kind: DropKind) {
@@ -4210,6 +4375,10 @@ fn select_catalog_pick(app: &mut App, opts: &mut TuiOptions, index: usize) {
 }
 
 fn ingest_catalog(app: &mut App, opts: &mut TuiOptions, result: crate::error::Result<ModelCatalog>) {
+    if app.conn.kind.is_openai() {
+        paint_custom_catalog(app, opts);
+        return;
+    }
     match result {
         Ok(mut cat) => {
             cat.ensure_current(&opts.model, opts.reasoning_effort);
@@ -4217,7 +4386,7 @@ fn ingest_catalog(app: &mut App, opts: &mut TuiOptions, result: crate::error::Re
             app.catalog_status = CatalogStatus::Ready;
             let choice = clamp_effort_for_model(&app.catalog, &opts.model, opts.reasoning_effort);
             opts.reasoning_effort = choice.effort;
-            sync_knobs(&app.knobs, opts, &app.catalog);
+            sync_knobs(app, opts);
         }
         Err(e) => {
             app.catalog.ensure_current(&opts.model, opts.reasoning_effort);
@@ -4301,7 +4470,10 @@ fn logout_account(app: &mut App) {
         return;
     }
     app.logged_in = false;
-    app.want_catalog = false;
+    refresh_ready(app);
+    if !app.logged_in {
+        app.want_catalog = false;
+    }
     app.status = "已登出".into();
 }
 
@@ -4440,9 +4612,9 @@ fn open_settings(app: &mut App) {
     }
     let area = app.area;
     let w = 64u16.min(area.width.saturating_sub(4)).max(36);
-    let h = 28u16.min(area.height.saturating_sub(4)).max(16);
+    let h = 34u16.min(area.height.saturating_sub(2)).max(18);
     let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + 2;
+    let y = area.y + 1;
     app.settings = Some(Win {
         x,
         y,
@@ -4452,11 +4624,7 @@ fn open_settings(app: &mut App) {
         minimized: false,
     });
     app.focus = Focus::Settings;
-    app.setting_field = if app.logged_in {
-        SettingField::Model
-    } else {
-        SettingField::Account
-    };
+    app.setting_field = SettingField::Kind;
 }
 
 fn open_task(app: &mut App) {
@@ -6807,6 +6975,105 @@ fn draw_workspace_pick(f: &mut Frame, app: &mut App) -> Option<Position> {
     }
 }
 
+fn draw_kind_buttons(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let openai = app.conn.kind.is_openai();
+    let grok = " Grok ";
+    let custom = " 自訂 API ";
+    let gw = display_cols(grok).max(4);
+    let cw = display_cols(custom).max(4);
+    let grok_cell = Rect::new(area.x, area.y, gw.min(area.width), 1);
+    let custom_x = area.x.saturating_add(gw.saturating_add(1));
+    let custom_cell = Rect::new(
+        custom_x,
+        area.y,
+        cw.min(area.width.saturating_sub(gw.saturating_add(1))),
+        1,
+    );
+    let grok_on = focused && app.setting_field == SettingField::Kind && !openai;
+    let custom_on = focused && app.setting_field == SettingField::Kind && openai;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            grok,
+            if !openai {
+                Style::default()
+                    .bg(ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else if grok_on {
+                Style::default().fg(ACCENT).bg(COMPOSER)
+            } else {
+                Style::default().fg(TEXT).bg(COMPOSER)
+            },
+        )),
+        grok_cell,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            custom,
+            if openai {
+                Style::default()
+                    .bg(ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else if custom_on {
+                Style::default().fg(ACCENT).bg(COMPOSER)
+            } else {
+                Style::default().fg(TEXT).bg(COMPOSER)
+            },
+        )),
+        custom_cell,
+    );
+    app.hits.push((grok_cell, Hit::ProviderXai));
+    app.hits.push((custom_cell, Hit::ProviderOpenai));
+}
+
+fn draw_boxed_edit(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    edit: &Edit,
+    focus: bool,
+    hit: Hit,
+    mask: bool,
+) -> Position {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focus { ACCENT } else { BORDER }))
+        .style(Style::default().bg(COMPOSER));
+    f.render_widget(block, area);
+    app.hits.push((area, hit));
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
+    );
+    if inner.width == 0 {
+        return Position::new(area.x, area.y);
+    }
+    let shown = if mask && !edit.text.is_empty() {
+        "•".repeat(edit.len().min(inner.width as usize))
+    } else {
+        edit.text.clone()
+    };
+    let shown: String = shown.chars().take(inner.width as usize).collect();
+    f.render_widget(
+        Paragraph::new(Span::styled(shown, Style::default().fg(TEXT).bg(COMPOSER))),
+        inner,
+    );
+    let prefix: String = if mask {
+        "•".repeat(edit.caret.min(inner.width as usize))
+    } else {
+        edit.text.chars().take(edit.caret).collect()
+    };
+    let w = Line::from(prefix.as_str()).width() as u16;
+    Position::new(
+        inner.x.saturating_add(w.min(inner.width.saturating_sub(1))),
+        inner.y,
+    )
+}
+
 fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Position> {
     let win = *app.settings.as_ref()?;
     if win.minimized {
@@ -6848,6 +7115,8 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -6861,8 +7130,17 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
         .split(body);
 
     f.render_widget(
-        Paragraph::new(Span::styled("帳號", Style::default().fg(DIM))),
+        Paragraph::new(Span::styled("連線", Style::default().fg(DIM))),
         lines[0],
+    );
+    draw_kind_buttons(f, app, lines[1], focused);
+    if app.conn.kind.is_openai() {
+        return draw_openai_settings(f, app, body, &lines, focused);
+    }
+
+    f.render_widget(
+        Paragraph::new(Span::styled("帳號", Style::default().fg(DIM))),
+        lines[2],
     );
     let account_focus = focused && app.setting_field == SettingField::Account;
     let (btn_label, extra) = match &app.login_ui {
@@ -6891,7 +7169,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
         Style::default().fg(TEXT).bg(COMPOSER)
     };
     let btn_w = display_cols(&btn_label).max(4);
-    let btn_cell = Rect::new(lines[1].x, lines[1].y, btn_w.min(lines[1].width), 1);
+    let btn_cell = Rect::new(lines[3].x, lines[3].y, btn_w.min(lines[3].width), 1);
     f.render_widget(
         Paragraph::new(Span::styled(btn_label, btn_style)),
         btn_cell,
@@ -6899,8 +7177,8 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     app.hits.push((btn_cell, Hit::AccountBtn));
     if let LoginUi::Waiting { user_code, .. } = &app.login_ui {
         let code_label = format!(" {user_code} ");
-        let code_w = display_cols(&code_label).min(lines[2].width);
-        let code_cell = Rect::new(lines[2].x, lines[2].y, code_w, 1);
+        let code_w = display_cols(&code_label).min(lines[4].width);
+        let code_cell = Rect::new(lines[4].x, lines[4].y, code_w, 1);
         f.render_widget(
             Paragraph::new(Span::styled(
                 code_label,
@@ -6912,8 +7190,8 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             code_cell,
         );
         app.hits.push((code_cell, Hit::LoginCode));
-        let rest_x = lines[2].x.saturating_add(code_w.saturating_add(1));
-        if rest_x < lines[2].x.saturating_add(lines[2].width) {
+        let rest_x = lines[4].x.saturating_add(code_w.saturating_add(1));
+        if rest_x < lines[4].x.saturating_add(lines[4].width) {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     "點此複製 · 已開瀏覽器",
@@ -6921,10 +7199,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
                 )),
                 Rect::new(
                     rest_x,
-                    lines[2].y,
-                    lines[2]
+                    lines[4].y,
+                    lines[4]
                         .x
-                        .saturating_add(lines[2].width)
+                        .saturating_add(lines[4].width)
                         .saturating_sub(rest_x),
                     1,
                 ),
@@ -6933,13 +7211,13 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     } else {
         f.render_widget(
             Paragraph::new(Span::styled(extra, Style::default().fg(DIM))),
-            lines[2],
+            lines[4],
         );
     }
 
     f.render_widget(
         Paragraph::new(Span::styled("模型", Style::default().fg(DIM))),
-        lines[3],
+        lines[5],
     );
     let model_focus = focused && app.setting_field == SettingField::Model;
     let model_label = app
@@ -6948,7 +7226,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
         .map(|m| m.name.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| opts.model.clone());
-    draw_combo(f, app, lines[4], &model_label, model_focus, Hit::SettingModel);
+    draw_combo(f, app, lines[6], &model_label, model_focus, Hit::SettingModel);
 
     let efforts = effort_choices(app, opts);
     let effort_enabled = !efforts.is_empty();
@@ -6961,7 +7239,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             },
             Style::default().fg(DIM),
         )),
-        lines[5],
+        lines[7],
     );
     let effort_focus = focused && app.setting_field == SettingField::Effort;
     let effort_label = efforts
@@ -6973,7 +7251,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
         draw_combo(
             f,
             app,
-            lines[6],
+            lines[8],
             &effort_label,
             effort_focus,
             Hit::SettingEffort,
@@ -6984,11 +7262,11 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(BORDER))
             .style(Style::default().bg(COMPOSER));
-        f.render_widget(disabled, lines[6]);
+        f.render_widget(disabled, lines[8]);
         let inner = Rect::new(
-            lines[6].x.saturating_add(1),
-            lines[6].y.saturating_add(1),
-            lines[6].width.saturating_sub(2),
+            lines[8].x.saturating_add(1),
+            lines[8].y.saturating_add(1),
+            lines[8].width.saturating_sub(2),
             1,
         );
         f.render_widget(
@@ -7002,7 +7280,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             "搜尋（web + X）",
             Style::default().fg(DIM),
         )),
-        lines[7],
+        lines[9],
     );
     let search_on = opts.web_search;
     let search_focus = focused && app.setting_field == SettingField::Search;
@@ -7017,7 +7295,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     } else {
         Style::default().fg(DIM).bg(COMPOSER)
     };
-    let search_cell = Rect::new(lines[8].x, lines[8].y, 5, 1);
+    let search_cell = Rect::new(lines[10].x, lines[10].y, 5, 1);
     f.render_widget(
         Paragraph::new(Span::styled(search_label, search_style)),
         search_cell,
@@ -7040,7 +7318,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     draw_import_row(
         f,
         app,
-        lines[9],
+        lines[11],
         "引入 Claude Code 技能",
         import_claude,
         focused && app.setting_field == SettingField::ImportClaude,
@@ -7049,7 +7327,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
     draw_import_row(
         f,
         app,
-        lines[10],
+        lines[12],
         "引入 Codex 技能",
         import_codex,
         focused && app.setting_field == SettingField::ImportCodex,
@@ -7062,19 +7340,161 @@ fn draw_settings(f: &mut Frame, app: &mut App, opts: &TuiOptions) -> Option<Posi
             "技能（點名稱查看 · 不可編輯）",
             Style::default().fg(if skills_focus { ACCENT } else { DIM }),
         )),
-        lines[11],
+        lines[13],
     );
-    draw_skill_list(f, app, lines[12], skills_focus);
+    draw_skill_list(f, app, lines[14], skills_focus);
 
     if let Some(kind) = app.drop {
         let anchor = match kind {
-            DropKind::Model => lines[4],
-            DropKind::Effort => lines[6],
+            DropKind::Model => lines[6],
+            DropKind::Effort => lines[8],
         };
         draw_drop_list(f, app, opts, kind, anchor, f.area());
     }
 
     None
+}
+
+fn draw_openai_settings(
+    f: &mut Frame,
+    app: &mut App,
+    body: Rect,
+    lines: &[Rect],
+    focused: bool,
+) -> Option<Position> {
+    let rest = Rect::new(
+        lines[2].x,
+        lines[2].y,
+        lines[2].width,
+        body.y.saturating_add(body.height).saturating_sub(lines[2].y),
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
+        .split(rest);
+    let mut caret = None;
+    f.render_widget(
+        Paragraph::new(Span::styled("端點", Style::default().fg(DIM))),
+        rows[0],
+    );
+    let pos = draw_boxed_edit(
+        f,
+        app,
+        rows[1],
+        &app.endpoint_edit.clone(),
+        focused && app.setting_field == SettingField::Endpoint,
+        Hit::SettingEndpoint,
+        false,
+    );
+    if app.setting_field == SettingField::Endpoint {
+        caret = Some(pos);
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled("模型名", Style::default().fg(DIM))),
+        rows[2],
+    );
+    let pos = draw_boxed_edit(
+        f,
+        app,
+        rows[3],
+        &app.model_edit.clone(),
+        focused && app.setting_field == SettingField::Model,
+        Hit::SettingModel,
+        false,
+    );
+    if app.setting_field == SettingField::Model {
+        caret = Some(pos);
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled("API 金鑰（可留空）", Style::default().fg(DIM))),
+        rows[4],
+    );
+    let pos = draw_boxed_edit(
+        f,
+        app,
+        rows[5],
+        &app.api_key_edit.clone(),
+        focused && app.setting_field == SettingField::ApiKey,
+        Hit::SettingApiKey,
+        true,
+    );
+    if app.setting_field == SettingField::ApiKey {
+        caret = Some(pos);
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "上下文（token，例如 262K）",
+            Style::default().fg(DIM),
+        )),
+        rows[6],
+    );
+    let pos = draw_boxed_edit(
+        f,
+        app,
+        rows[7],
+        &app.context_edit.clone(),
+        focused && app.setting_field == SettingField::Context,
+        Hit::SettingContext,
+        false,
+    );
+    if app.setting_field == SettingField::Context {
+        caret = Some(pos);
+    }
+
+    app.refresh_skills();
+    let import_claude = app
+        .skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prefs()
+        .import_claude;
+    let import_codex = app
+        .skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prefs()
+        .import_codex;
+    draw_import_row(
+        f,
+        app,
+        rows[8],
+        "引入 Claude Code 技能",
+        import_claude,
+        focused && app.setting_field == SettingField::ImportClaude,
+        Hit::ImportClaude,
+    );
+    draw_import_row(
+        f,
+        app,
+        rows[9],
+        "引入 Codex 技能",
+        import_codex,
+        focused && app.setting_field == SettingField::ImportCodex,
+        Hit::ImportCodex,
+    );
+    let skills_focus = focused && app.setting_field == SettingField::Skills;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "技能（點名稱查看 · 不可編輯）",
+            Style::default().fg(if skills_focus { ACCENT } else { DIM }),
+        )),
+        rows[10],
+    );
+    draw_skill_list(f, app, rows[11], skills_focus);
+    caret
 }
 
 fn draw_import_row(
@@ -7337,6 +7757,10 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
             web_search: opts.web_search,
             import_claude,
             import_codex,
+            kind: app.conn.kind.as_str().to_string(),
+            base_url: app.endpoint_edit.text.clone(),
+            api_key: app.api_key_edit.text.clone(),
+            context: app.context_edit.text.clone(),
             skills: app
                 .skill_list
                 .iter()
@@ -7701,6 +8125,7 @@ fn apply_ui_command(
             open_settings(app);
         }
         UiCommand::CloseSettings => {
+            flush_conn(app, opts);
             app.settings = None;
             app.drop = None;
             if app.focus == Focus::Settings {
@@ -7718,6 +8143,26 @@ fn apply_ui_command(
         UiCommand::EndTask => end_task_mode(app),
         UiCommand::Login => activate_account(app),
         UiCommand::Logout => logout_account(app),
+        UiCommand::SetProviderKind { kind } => {
+            if let Some(k) = ProviderKind::parse(&kind) {
+                set_provider_kind(app, opts, k);
+            }
+        }
+        UiCommand::SetEndpoint { text } => {
+            app.endpoint_edit = Edit::at_end(text);
+            app.setting_field = SettingField::Endpoint;
+            flush_conn(app, opts);
+        }
+        UiCommand::SetApiKey { text } => {
+            app.api_key_edit = Edit::at_end(text);
+            app.setting_field = SettingField::ApiKey;
+            flush_conn(app, opts);
+        }
+        UiCommand::SetContext { text } => {
+            app.context_edit = Edit::at_end(text);
+            app.setting_field = SettingField::Context;
+            flush_conn(app, opts);
+        }
         UiCommand::SetModel { id } => apply_selected_model(app, opts, id),
         UiCommand::SetEffort { id } => {
             if let Some(e) = ReasoningEffort::parse(&id) {
@@ -7726,7 +8171,7 @@ fn apply_ui_command(
         }
         UiCommand::ToggleSearch => {
             opts.web_search = !opts.web_search;
-            sync_knobs(&app.knobs, opts, &app.catalog);
+            sync_knobs(app, opts);
         }
         UiCommand::ToggleImportClaude => app.toggle_import_claude(),
         UiCommand::ToggleImportCodex => app.toggle_import_codex(),
@@ -7912,6 +8357,11 @@ async fn tui_loop(
         focus: Focus::Chat,
         setting_field: SettingField::Model,
         settings: None,
+        conn: ProviderConfig::default(),
+        endpoint_edit: Edit::default(),
+        api_key_edit: Edit::default(),
+        model_edit: Edit::default(),
+        context_edit: Edit::default(),
         drag: None,
         scroll_grab: None,
         hits: Vec::new(),
@@ -7996,12 +8446,37 @@ async fn tui_loop(
             web_composer_seq: 0,
     };
     app.catalog.ensure_current(&opts.model, opts.reasoning_effort);
-    app.want_catalog = app.logged_in;
+    let mut conn = ProviderConfig::load();
+    if conn.route().is_openai() && !conn.kind.is_openai() {
+        conn.kind = ProviderKind::Openai;
+        opts.web_search = false;
+        let _ = conn.save();
+    }
+    if conn.kind.is_openai() {
+        if !conn.model.trim().is_empty() {
+            opts.model = conn.model.clone();
+        }
+        opts.web_search = false;
+    }
+    app.conn = conn;
+    edits_from_conn(&mut app, &opts);
+    refresh_ready(&mut app);
+    if app.conn.kind.is_openai() {
+        paint_custom_catalog(&mut app, &opts);
+    }
+    sync_knobs(&app, &opts);
+    app.want_catalog = app.logged_in && !app.conn.route().is_openai();
     if created || app.is_blank_draft() {
-        if app.logged_in {
+        if app.conn.kind.is_openai() {
+            app.push(Row::Meta(format!(
+                "自訂 API  {}  ·  {}",
+                app.conn.base_url,
+                opts.model
+            )));
+        } else if app.logged_in {
             app.push(Row::Meta("磁碟上有 xAI session".into()));
         } else {
-            app.push(Row::Meta("尚未登入 — 在設定中登入 Grok 帳號".into()));
+            app.push(Row::Meta("尚未登入 — 在設定中登入 Grok，或改連自訂 API".into()));
         }
     }
 
@@ -8050,15 +8525,16 @@ async fn tui_loop(
         }
         if app.want_catalog
             && app.logged_in
+            && !app.conn.route().is_openai()
             && !matches!(app.catalog_status, CatalogStatus::Loading)
         {
             app.want_catalog = false;
             app.catalog_status = CatalogStatus::Loading;
             content_dirty = true;
+            let cfg = app.conn.clone();
             let tx = cat_tx.clone();
-            let auth = auth_path.clone();
             tokio::spawn(async move {
-                let result = match XaiOauthProvider::new(auth, None) {
+                let result = match AnyProvider::connect(&cfg, None) {
                     Ok(p) => p.list_models().await,
                     Err(e) => Err(e),
                 };
@@ -8252,8 +8728,35 @@ fn start_or_send(
     if echo {
         app.push(Row::User(user_row_from_turn(&turn)));
     }
+    snapshot_conn(app);
+    if app.conn.route_for(&opts.model).is_openai() {
+        if !opts.model.trim().is_empty() {
+            app.conn.model = opts.model.clone();
+        }
+        if !app.conn.base_url.trim().is_empty() && !app.conn.kind.is_openai() {
+            app.conn.kind = ProviderKind::Openai;
+            let _ = app.conn.save();
+        }
+        refresh_ready(app);
+    }
     if !app.logged_in {
-        app.push(Row::Err("尚未登入 — 請在設定中登入 Grok 帳號".into()));
+        app.push(Row::Err(
+            if app.conn.route_for(&opts.model).is_openai() {
+                if app.conn.base_url.trim().is_empty() {
+                    ProviderConfig::missing_endpoint_error(
+                        if opts.model.trim().is_empty() {
+                            app.conn.effective_model()
+                        } else {
+                            opts.model.as_str()
+                        },
+                    )
+                } else {
+                    "自訂 API 未就緒 — 請在設定填端點和模型名".into()
+                }
+            } else {
+                "尚未登入 — 請在設定中登入 Grok 帳號，或改連自訂 API".into()
+            },
+        ));
         return;
     }
     app.mark_work_start();
@@ -8277,7 +8780,13 @@ fn start_or_send(
             app.session.name = fallback;
             app.session.named = true;
         }
-        spawn_title(sink, &app.session.id, &opts.model, &turn.text);
+        spawn_title(
+            sink,
+            &app.session.id,
+            app.conn.clone(),
+            &opts.model,
+            &turn.text,
+        );
     }
     app.session.updated_at = chrono::Utc::now();
     if let Some(store) = &app.store {
@@ -8293,6 +8802,10 @@ fn start_or_send(
     app.cancel = Some(cancel.clone());
     let mut opts = opts.clone();
     opts.workspace = app.session.workspace.clone();
+    if app.conn.route_for(&opts.model).is_openai() {
+        opts.web_search = false;
+    }
+    let cfg = app.conn.clone();
     let sink = sink.clone();
     let knobs = app.knobs.clone();
     let skills = app.skills.clone();
@@ -8303,7 +8816,7 @@ fn start_or_send(
     tokio::spawn(async move {
         let sid = run_id.clone();
         let out = run_one(
-            opts, turn, sink, knobs, skills, inbox_rx, run_id, ask, cancel, task,
+            opts, turn, sink, knobs, skills, inbox_rx, run_id, ask, cancel, task, cfg,
         )
         .await;
         let _ = done_tx.send((
@@ -8319,16 +8832,19 @@ fn start_or_send(
     });
 }
 
-fn spawn_title(sink: &Arc<FanoutSink>, session_id: &str, model: &str, prompt: &str) {
+fn spawn_title(
+    sink: &Arc<FanoutSink>,
+    session_id: &str,
+    cfg: ProviderConfig,
+    model: &str,
+    prompt: &str,
+) {
     let sink = sink.clone();
     let session_id = session_id.to_string();
     let model = model.to_string();
     let prompt = prompt.to_string();
     tokio::spawn(async move {
-        let Ok(auth_path) = auth::default_auth_path() else {
-            return;
-        };
-        let Ok(provider) = XaiOauthProvider::new(auth_path, Some(model)) else {
+        let Ok(provider) = AnyProvider::connect(&cfg, Some(model)) else {
             return;
         };
         let name = provider.generate_session_title(&prompt).await;
@@ -8924,7 +9440,7 @@ fn handle_settings_key(
     app: &mut App,
     opts: &mut TuiOptions,
     code: KeyCode,
-    _mods: KeyModifiers,
+    mods: KeyModifiers,
 ) -> bool {
     if app.drop.is_some() {
         match code {
@@ -8955,6 +9471,83 @@ fn handle_settings_key(
             _ => return false,
         }
     }
+    let editing = setting_edit_mut(app).is_some();
+    if editing {
+        let shift = mods.contains(KeyModifiers::SHIFT);
+        match code {
+            KeyCode::Esc => {
+                flush_conn(app, opts);
+                if login_in_flight(&app.login_ui) {
+                    cancel_login(app);
+                } else {
+                    app.settings = None;
+                    app.focus = Focus::Chat;
+                }
+                return false;
+            }
+            KeyCode::Tab => {
+                cycle_setting_field(app, opts);
+                return false;
+            }
+            KeyCode::Left => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.move_left(shift);
+                }
+                return false;
+            }
+            KeyCode::Right => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.move_right(shift);
+                }
+                return false;
+            }
+            KeyCode::Home => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.home(shift);
+                }
+                return false;
+            }
+            KeyCode::End => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.end(shift);
+                }
+                return false;
+            }
+            KeyCode::Backspace => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.backspace();
+                }
+                return false;
+            }
+            KeyCode::Delete => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.delete_forward();
+                }
+                return false;
+            }
+            KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.select_all();
+                }
+                return false;
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') if mods.contains(KeyModifiers::CONTROL) => {
+                if let Some(s) = clipboard_get() {
+                    if let Some(e) = setting_edit_mut(app) {
+                        e.insert_str(&s.replace('\n', "").replace('\r', ""));
+                    }
+                }
+                return false;
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) && !c.is_control() => {
+                if let Some(e) = setting_edit_mut(app) {
+                    e.insert_char(c);
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
     match code {
         KeyCode::Esc => {
             if login_in_flight(&app.login_ui) {
@@ -8962,27 +9555,34 @@ fn handle_settings_key(
             } else if app.skill_view.is_some() {
                 app.close_skill_view();
             } else {
+                flush_conn(app, opts);
                 app.settings = None;
                 app.focus = Focus::Chat;
             }
         }
         KeyCode::Tab => {
-            app.setting_field = match app.setting_field {
-                SettingField::Account => SettingField::Model,
-                SettingField::Model => SettingField::Effort,
-                SettingField::Effort => SettingField::Search,
-                SettingField::Search => SettingField::ImportClaude,
-                SettingField::ImportClaude => SettingField::ImportCodex,
-                SettingField::ImportCodex => SettingField::Skills,
-                SettingField::Skills => SettingField::Account,
+            cycle_setting_field(app, opts);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::Kind => {
+            let next = if app.conn.kind.is_openai() {
+                ProviderKind::Xai
+            } else {
+                ProviderKind::Openai
             };
+            set_provider_kind(app, opts, next);
+        }
+        KeyCode::Left if app.setting_field == SettingField::Kind => {
+            set_provider_kind(app, opts, ProviderKind::Xai);
+        }
+        KeyCode::Right if app.setting_field == SettingField::Kind => {
+            set_provider_kind(app, opts, ProviderKind::Openai);
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::Account => {
             activate_account(app);
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::Search => {
             opts.web_search = !opts.web_search;
-            sync_knobs(&app.knobs, opts, &app.catalog);
+            sync_knobs(app, opts);
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.setting_field == SettingField::ImportClaude => {
             app.toggle_import_claude();
@@ -9005,7 +9605,7 @@ fn handle_settings_key(
             }
         }
         KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Down
-            if app.setting_field == SettingField::Model =>
+            if app.setting_field == SettingField::Model && !app.conn.kind.is_openai() =>
         {
             open_drop(app, opts, DropKind::Model);
         }
@@ -9036,7 +9636,6 @@ fn handle_settings_key(
     }
     false
 }
-
 fn handle_skill_view_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     let shift = mods.contains(KeyModifiers::SHIFT);
     match code {
@@ -9370,6 +9969,7 @@ fn handle_mouse(
                 }
                 Some(Hit::Dock) => open_settings(app),
                 Some(Hit::Close) => {
+                    flush_conn(app, opts);
                     app.drop = None;
                     app.settings = None;
                     app.focus = Focus::Chat;
@@ -9395,11 +9995,38 @@ fn handle_mouse(
                 Some(Hit::SettingModel) => {
                     app.focus = Focus::Settings;
                     app.setting_field = SettingField::Model;
-                    if app.drop == Some(DropKind::Model) {
-                        app.drop = None;
-                    } else {
-                        open_drop(app, opts, DropKind::Model);
+                    if !app.conn.kind.is_openai() {
+                        if app.drop == Some(DropKind::Model) {
+                            app.drop = None;
+                        } else {
+                            open_drop(app, opts, DropKind::Model);
+                        }
                     }
+                }
+                Some(Hit::SettingEndpoint) => {
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Endpoint;
+                    app.drop = None;
+                }
+                Some(Hit::SettingApiKey) => {
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::ApiKey;
+                    app.drop = None;
+                }
+                Some(Hit::SettingContext) => {
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Context;
+                    app.drop = None;
+                }
+                Some(Hit::ProviderXai) => {
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Kind;
+                    set_provider_kind(app, opts, ProviderKind::Xai);
+                }
+                Some(Hit::ProviderOpenai) => {
+                    app.focus = Focus::Settings;
+                    app.setting_field = SettingField::Kind;
+                    set_provider_kind(app, opts, ProviderKind::Openai);
                 }
                 Some(Hit::SettingEffort) => {
                     app.focus = Focus::Settings;
@@ -9419,7 +10046,7 @@ fn handle_mouse(
                     app.focus = Focus::Settings;
                     app.setting_field = SettingField::Search;
                     opts.web_search = !opts.web_search;
-                    sync_knobs(&app.knobs, opts, &app.catalog);
+                    sync_knobs(app, opts);
                 }
                 Some(Hit::ImportClaude) => {
                     app.drop = None;
@@ -9624,6 +10251,11 @@ fn handle_input(
                     let clipped: String = s.chars().take(remain).collect();
                     ask.fill_edit.insert_str(&clipped);
                 }
+            } else if app.focus == Focus::Settings && setting_edit_mut(app).is_some() {
+                let clipped: String = s.replace('\n', "").replace('\r', "");
+                if let Some(e) = setting_edit_mut(app) {
+                    e.insert_str(&clipped);
+                }
             } else if let Some(TaskUi::Form { edit }) = &mut app.task_ui {
                 let remain = task::MAX_GOAL.saturating_sub(edit.len());
                 let clipped: String = s.chars().take(remain).collect();
@@ -9649,21 +10281,25 @@ async fn run_one(
     ask: Option<AskUserHub>,
     cancel: crate::agent::CancelFlag,
     task: Arc<TaskHub>,
+    cfg: ProviderConfig,
 ) -> Result<crate::agent::RunOutcome> {
-    let auth_path = auth::default_auth_path()?;
-    let model = if opts.model.trim().is_empty() {
-        "grok-4.6".to_string()
-    } else {
+    let model = if !opts.model.trim().is_empty() {
         opts.model.clone()
+    } else {
+        cfg.effective_model().to_string()
     };
-    let provider = XaiOauthProvider::new(auth_path, Some(model.clone()))?;
+    let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
     let run_id = if run_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
         run_id
     };
     let dyn_sink: Arc<dyn crate::events::EventSink> = sink.clone();
-    let server_tools = kit::search_tools(opts.web_search);
+    let server_tools = if cfg.route_for(&model).is_openai() {
+        vec![]
+    } else {
+        kit::search_tools(opts.web_search)
+    };
     let child_mode = std::env::var("GROKA_CHILD_MODE").unwrap_or_else(|_| "grok".into());
     crate::kit::run_with_nursery(
         &provider,
@@ -9686,6 +10322,7 @@ async fn run_one(
             knobs: Some(knobs),
             inbox: Some(inbox),
             ask,
+            context_window: cfg.window_tokens(),
             cancel: Some(cancel),
             skills: Some(skills),
             task: Some(task),
@@ -11308,6 +11945,11 @@ mod tests {
             focus: Focus::Chat,
             setting_field: SettingField::Model,
             settings: None,
+            conn: ProviderConfig::default(),
+            endpoint_edit: Edit::default(),
+            api_key_edit: Edit::default(),
+            model_edit: Edit::default(),
+            context_edit: Edit::default(),
             drag: None,
             scroll_grab: None,
             hits: Vec::new(),
@@ -12892,6 +13534,7 @@ mod tests {
         inject_two_model_catalog(&mut app);
         let mut opts = test_opts("alpha", ReasoningEffort::High);
         open_settings(&mut app);
+        app.setting_field = SettingField::Model;
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
@@ -13074,7 +13717,7 @@ mod tests {
         app.logged_in = false;
         app.area = Rect::new(0, 0, 80, 28);
         open_settings(&mut app);
-        assert_eq!(app.setting_field, SettingField::Account);
+        assert_eq!(app.setting_field, SettingField::Kind);
         let opts = test_opts("grok-4.6", ReasoningEffort::High);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 28)).unwrap();
         terminal
@@ -13083,8 +13726,44 @@ mod tests {
             })
             .unwrap();
         assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::AccountBtn)));
+        assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::ProviderXai)));
+        app.setting_field = SettingField::Account;
         handle_settings_key(&mut app, &mut test_opts("grok-4.6", ReasoningEffort::High), KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.want_login);
+    }
+
+    #[test]
+    fn custom_api_settings_show_endpoint_and_model_fields() {
+        let mut app = test_app();
+        app.logged_in = true;
+        app.conn.kind = ProviderKind::Openai;
+        app.conn.base_url = "http://127.0.0.1:40056/v1".into();
+        app.conn.model = "Qwen3.8-27B-ABLITERATED-Q8_0".into();
+        app.endpoint_edit = Edit::at_end(app.conn.base_url.clone());
+        app.model_edit = Edit::at_end(app.conn.model.clone());
+        app.context_edit = Edit::at_end("262K".into());
+        app.area = Rect::new(0, 0, 80, 36);
+        open_settings(&mut app);
+        let opts = test_opts("Qwen3.8-27B-ABLITERATED-Q8_0", ReasoningEffort::High);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw_settings(f, &mut app, &opts);
+            })
+            .unwrap();
+        assert!(
+            app.hits
+                .iter()
+                .any(|(_, h)| matches!(h, Hit::SettingEndpoint)),
+            "endpoint field missing: {:?}",
+            app.hits.iter().map(|(_, h)| *h).collect::<Vec<_>>()
+        );
+        assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::SettingModel)));
+        assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::SettingContext)));
+        assert!(
+            !app.hits.iter().any(|(_, h)| matches!(h, Hit::AccountBtn)),
+            "Grok login must hide on custom API"
+        );
     }
 
     #[test]
@@ -13133,6 +13812,29 @@ mod tests {
             .unwrap();
         assert!(err.contains("設定"), "{err}");
         assert!(!err.contains("另開終端"), "{err}");
+    }
+
+    #[test]
+    fn sending_qwen_on_xai_kind_asks_for_custom_endpoint() {
+        let mut app = test_app();
+        app.logged_in = true;
+        app.conn.kind = ProviderKind::Xai;
+        app.conn.model = "Qwen3.8-27B-ABLITERATED-Q8_0".into();
+        let opts = test_opts("Qwen3.8-27B-ABLITERATED-Q8_0", ReasoningEffort::High);
+        let sink = Arc::new(FanoutSink { sinks: vec![] });
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        start_or_send(&mut app, &opts, &sink, &done_tx, "hi".into(), true);
+        let err = app
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Err(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(err.contains("自訂 API"), "{err}");
+        assert!(!err.contains("xAI"), "{err}");
+        assert!(!app.running);
     }
 
     #[test]

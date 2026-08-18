@@ -396,6 +396,24 @@
     } else if (snap.settings) {
       const st = snap.settings;
       modal.append(h2("設定"));
+      const kindRow = document.createElement("div");
+      kindRow.className = "field";
+      kindRow.append(label("連線"));
+      [["xai", "Grok"], ["openai", "自訂 API"]].forEach(([id, name]) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = name;
+        if ((st.kind || "xai") === id) b.classList.add("on");
+        b.addEventListener("click", () => send({ type: "set_provider_kind", kind: id }));
+        kindRow.append(b);
+      });
+      modal.append(kindRow);
+      if ((st.kind || "xai") === "openai") {
+        modal.append(textField("端點", st.base_url || "", (v) => send({ type: "set_endpoint", text: v })));
+        modal.append(textField("模型名", snap.header.model, (v) => send({ type: "set_model", id: v })));
+        modal.append(textField("API 金鑰", st.api_key || "", (v) => send({ type: "set_api_key", text: v }), true));
+        modal.append(textField("上下文", st.context || "", (v) => send({ type: "set_context", text: v })));
+      } else {
       const acc = document.createElement("div");
       acc.className = "field";
       acc.append(label("帳號"));
@@ -432,6 +450,7 @@
       search.textContent = st.web_search ? "搜尋：開" : "搜尋：關";
       search.addEventListener("click", () => send({ type: "toggle_search" }));
       modal.append(search);
+      }
       const ic = document.createElement("button");
       ic.type = "button";
       ic.textContent = st.import_claude ? "Claude 技能：開" : "Claude 技能：關";
@@ -489,6 +508,18 @@
       row.append(b);
     });
     modal.append(row);
+  }
+  function textField(title, current, onChange, secret) {
+    const wrap = document.createElement("div");
+    wrap.className = "field";
+    wrap.append(label(title));
+    const inp = document.createElement("input");
+    inp.type = secret ? "password" : "text";
+    inp.value = current || "";
+    inp.addEventListener("input", () => onChange(inp.value));
+    inp.addEventListener("change", () => onChange(inp.value));
+    wrap.append(inp);
+    return wrap;
   }
   function selectField(title, pairs, current, onChange) {
     const wrap = document.createElement("div");

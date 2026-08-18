@@ -27,7 +27,7 @@ pub const COMPACT_MARK: &str = "[grokaagent compact v1]";
 pub const MEMORY_FOLD_MARK: &str = "[grokaagent memory-fold]";
 
 const GROK4_WINDOW: u32 = 500_000;
-const DEFAULT_WINDOW: u32 = 128_000;
+pub const DEFAULT_WINDOW: u32 = 128_000;
 const GOAL_CHARS: usize = 800;
 const SNIPPET_CHARS: usize = 280;
 const ASSISTANT_CHARS: usize = 400;
@@ -63,6 +63,34 @@ pub fn context_window(model: &str) -> u32 {
         GROK4_WINDOW
     } else {
         DEFAULT_WINDOW
+    }
+}
+
+/// `262K` → 262×1024, `128000` stays as-is.
+pub fn parse_window(s: &str) -> Option<u32> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(n) = t.strip_suffix('k') {
+        return n.trim().parse::<u32>().ok()?.checked_mul(1024);
+    }
+    if let Some(n) = t.strip_suffix('m') {
+        return n.trim().parse::<u32>().ok()?.checked_mul(1024 * 1024);
+    }
+    t.parse().ok()
+}
+
+pub fn format_window(n: u32) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    if n % (1024 * 1024) == 0 {
+        format!("{}M", n / (1024 * 1024))
+    } else if n % 1024 == 0 {
+        format!("{}K", n / 1024)
+    } else {
+        n.to_string()
     }
 }
 
@@ -840,6 +868,14 @@ mod tests {
 
     fn n_users(n: usize) -> Vec<Value> {
         (0..n).map(|i| user(&format!("u{i}"))).collect()
+    }
+
+    #[test]
+    fn parse_window_k_and_raw() {
+        assert_eq!(parse_window("262K"), Some(262 * 1024));
+        assert_eq!(parse_window(" 262144 "), Some(262_144));
+        assert_eq!(parse_window(""), None);
+        assert_eq!(format_window(262 * 1024), "262K");
     }
 
     #[test]

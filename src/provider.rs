@@ -420,6 +420,104 @@ fn grok_client_mode() -> String {
     std::env::var("GROKA_CLIENT_MODE").unwrap_or_else(|_| "interactive".into())
 }
 
+/// Grok OAuth Responses API, or an OpenAI-compatible Chat Completions endpoint.
+#[derive(Clone)]
+pub enum AnyProvider {
+    Xai(XaiOauthProvider),
+    Openai(crate::openai::OpenAiCompatProvider),
+}
+
+impl AnyProvider {
+    pub fn connect(cfg: &crate::config::ProviderConfig, model: Option<String>) -> Result<Self> {
+        let model = model
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let m = cfg.effective_model();
+                if m.is_empty() {
+                    None
+                } else {
+                    Some(m.to_string())
+                }
+            });
+        let resolved = model
+            .clone()
+            .unwrap_or_else(|| cfg.effective_model().to_string());
+        match cfg.route_for(&resolved) {
+            crate::config::ProviderKind::Xai => {
+                if !resolved.is_empty()
+                    && !crate::config::ProviderConfig::looks_like_grok(&resolved)
+                {
+                    return Err(Error::Provider(
+                        crate::config::ProviderConfig::missing_endpoint_error(&resolved),
+                    ));
+                }
+                let auth_path = auth::default_auth_path()?;
+                Ok(Self::Xai(XaiOauthProvider::new(auth_path, model)?))
+            }
+            crate::config::ProviderKind::Openai => {
+                if cfg.base_url.trim().is_empty() {
+                    return Err(Error::Provider(
+                        crate::config::ProviderConfig::missing_endpoint_error(&resolved),
+                    ));
+                }
+                Ok(Self::Openai(crate::openai::OpenAiCompatProvider::new(
+                    cfg, model,
+                )?))
+            }
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            Self::Xai(p) => p.model(),
+            Self::Openai(p) => p.model(),
+        }
+    }
+
+    pub async fn list_models(&self) -> Result<crate::catalog::ModelCatalog> {
+        match self {
+            Self::Xai(p) => p.list_models().await,
+            Self::Openai(p) => p.list_models().await,
+        }
+    }
+
+    pub async fn generate_session_title(&self, user_message: &str) -> String {
+        match self {
+            Self::Xai(p) => p.generate_session_title(user_message).await,
+            Self::Openai(p) => p.generate_session_title(user_message).await,
+        }
+    }
+}
+
+impl Provider for AnyProvider {
+    async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+        match self {
+            Self::Xai(p) => p.complete(req).await,
+            Self::Openai(p) => p.complete(req).await,
+        }
+    }
+
+    async fn complete_stream<'a>(
+        &'a self,
+        req: CompleteRequest,
+        on_text: &'a (dyn Fn(&str) + Send + Sync),
+        on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
+        on_reasoning: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompleteResponse> {
+        match self {
+            Self::Xai(p) => p.complete_stream(req, on_text, on_server, on_reasoning).await,
+            Self::Openai(p) => p.complete_stream(req, on_text, on_server, on_reasoning).await,
+        }
+    }
+
+    async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+        match self {
+            Self::Xai(p) => p.compact(req).await,
+            Self::Openai(p) => p.compact(req).await,
+        }
+    }
+}
+
 /// Server refused to hydrate `previous_response_id` (ZDR org, or it was never stored).
 pub fn previous_response_unusable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
@@ -474,7 +572,7 @@ impl SseParser {
     }
 }
 
-fn take_sse_block(buf: &mut String) -> Option<String> {
+pub(crate) fn take_sse_block(buf: &mut String) -> Option<String> {
     let cr = buf.find("\r\n\r\n").map(|i| (i, 4));
     let lf = buf.find("\n\n").map(|i| (i, 2));
     let (i, n) = match (cr, lf) {
@@ -494,7 +592,7 @@ fn take_sse_block(buf: &mut String) -> Option<String> {
     Some(block)
 }
 
-fn sse_data(block: &str) -> Option<String> {
+pub(crate) fn sse_data(block: &str) -> Option<String> {
     let mut data = Vec::new();
     for line in block.lines() {
         let line = line.trim_end_matches('\r');
@@ -1370,5 +1468,34 @@ mod tests {
             "content": [{"type": "reasoning.encrypted", "text": "nope"}]
         })];
         assert_eq!(extract_reasoning_text(&items), "");
+    }
+
+    #[test]
+    fn qwen_without_endpoint_does_not_connect_xai() {
+        let cfg = crate::config::ProviderConfig {
+            kind: crate::config::ProviderKind::Xai,
+            model: "Qwen3.8-27B-ABLITERATED-Q8_0".into(),
+            ..Default::default()
+        };
+        let err = match AnyProvider::connect(&cfg, None) {
+            Ok(_) => panic!("must not connect"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("自訂 API"), "{err}");
+        assert!(!err.to_ascii_lowercase().contains("xai http"), "{err}");
+    }
+
+    #[test]
+    fn qwen_with_http_endpoint_connects_openai_compat() {
+        let cfg = crate::config::ProviderConfig {
+            kind: crate::config::ProviderKind::Xai,
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "Qwen3.8-27B-ABLITERATED-Q8_0".into(),
+            ..Default::default()
+        };
+        match AnyProvider::connect(&cfg, None).unwrap() {
+            AnyProvider::Openai(p) => assert_eq!(p.model(), "Qwen3.8-27B-ABLITERATED-Q8_0"),
+            AnyProvider::Xai(_) => panic!("must not send Qwen to xAI"),
+        }
     }
 }

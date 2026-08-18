@@ -1,6 +1,6 @@
 # grokaagent
 
-Rust agent kernel：事件迴圈、本機工具、xAI Grok OAuth、A2A 子行程、JSONL 事件管道、終端 TUI。
+Rust agent kernel：事件迴圈、本機工具、xAI Grok OAuth 或 OpenAI 相容 API、A2A 子行程、JSONL 事件管道、終端 TUI。
 
 ## 一鍵安裝
 
@@ -40,7 +40,8 @@ grokaagent update
 
 - 一鍵安裝：上述三平台之一
 - 從原始碼編譯：Rust 1.75+
-- 有效的 SuperGrok / X Premium+（訂閱推論走 `cli-chat-proxy.grok.com`）
+- Grok：有效的 SuperGrok / X Premium+（訂閱推論走 `cli-chat-proxy.grok.com`）
+- 或自訂 OpenAI 相容端點（設定裡切「自訂 API」，或 `--base-url` / `--model` / `--context`）
 
 ## 從原始碼安裝
 

@@ -50,6 +50,8 @@ pub struct KernelSpec {
     pub images: Vec<PathBuf>,
     /// When set, the model may call `ask_user` and wait for a TUI pick.
     pub ask: Option<AskUserHub>,
+    /// 0 = look up from the model name.
+    pub context_window: u32,
     /// TUI Esc trips this; headless runs leave it `None`.
     pub cancel: Option<crate::agent::CancelFlag>,
     /// Shared with the TUI so Settings toggles apply on the next turn.
@@ -232,7 +234,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             model: spec.model,
             max_turns: spec.max_turns,
             server_tools: spec.server_tools,
-            context_window: 0,
+            context_window: spec.context_window,
             compact_keep_recent: 0,
             parent_run_id: spec.parent_run_id,
             run_id,
