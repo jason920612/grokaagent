@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use grokaagent::auth;
-use grokaagent::config::{ProviderConfig, ProviderKind};
+use grokaagent::config::ProviderConfig;
 use grokaagent::events::JsonlSink;
 use grokaagent::kit::{self, KernelSpec};
 use grokaagent::provider::{AnyProvider, ReasoningEffort};
@@ -67,7 +67,8 @@ enum Command {
         events: PathBuf,
         #[arg(long, default_value_t = 0, help = "0 = unlimited (default)")]
         max_turns: u32,
-        /// Disable server-side web_search and x_search (on by default).
+        /// Disable search (on by default): Grok's web_search / x_search, or
+        /// `grok_search` through the Grok login for other models.
         #[arg(long = "no-web-search", default_value_t = false)]
         no_web_search: bool,
         #[arg(long)]
@@ -104,6 +105,10 @@ enum Command {
         max_turns: u32,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        /// Give this child search: Grok's server tools, or `grok_search` on
+        /// other backends when a Grok login exists.
+        #[arg(long)]
+        search: bool,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -171,13 +176,13 @@ async fn real_main() -> grokaagent::Result<()> {
     let auth_path = auth::default_auth_path()?;
     match cli.command {
         None => {
-            let (cfg, model) = boot_provider(ApiArgs::default(), None, false)?;
+            let (_, model) = boot_provider(ApiArgs::default(), None, false)?;
             tui::run_tui(TuiOptions {
                 model,
                 events: PathBuf::from("groka-events.jsonl"),
                 workspace: std::env::current_dir()?,
                 max_turns: 0,
-                web_search: cfg.kind != ProviderKind::Openai,
+                web_search: true,
                 dispatcher: false,
                 child_model: String::new(),
                 reasoning_effort: ReasoningEffort::High,
@@ -226,7 +231,7 @@ async fn real_main() -> grokaagent::Result<()> {
             reasoning,
             api,
         }) => {
-            let (cfg, model) = boot_provider(api, model, true)?;
+            let (_, model) = boot_provider(api, model, true)?;
             tui::run_tui(TuiOptions {
                 model,
                 events,
@@ -235,7 +240,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     None => std::env::current_dir()?,
                 },
                 max_turns,
-                web_search: !no_web_search && cfg.kind != ProviderKind::Openai,
+                web_search: !no_web_search,
                 dispatcher: false,
                 child_model: String::new(),
                 reasoning_effort: reasoning,
@@ -271,11 +276,11 @@ async fn real_main() -> grokaagent::Result<()> {
             let (cfg, model) = boot_provider(api, model, false)?;
             let sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
             let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
-            let server_tools = if cfg.route_for(&model).is_openai() {
-                vec![]
-            } else {
-                kit::search_tools(web_search)
-            };
+            let server_tools = kit::search_tools(
+                web_search,
+                cfg.route_for(&model).is_openai(),
+                grokaagent::grok_search::grok_login_available(),
+            );
             let context_window = cfg.window_tokens_for(&model);
             let outcome = kit::run_with_nursery(
                 &provider,
@@ -289,6 +294,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     events_file: events.clone(),
                     events_dir: kit::events_dir(&events),
                     server_tools,
+                    search: web_search,
                     depth: 0,
                     parent_run_id: None,
                     run_id: String::new(),
@@ -338,6 +344,7 @@ async fn real_main() -> grokaagent::Result<()> {
             model,
             max_turns,
             reasoning,
+            search,
             api,
         }) => {
             let (_, model) = boot_provider(api, model, false)?;
@@ -356,6 +363,7 @@ async fn real_main() -> grokaagent::Result<()> {
                 model,
                 max_turns,
                 reasoning_effort: reasoning,
+                search,
             })
             .await?;
         }

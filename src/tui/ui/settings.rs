@@ -147,11 +147,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
             }
             y += 3;
         }
-        if y < bottom {
-            line(f, Rect::new(x, y, LABEL_W, 1), "搜尋（web + X）", focus_style(focused && field == Field::Search));
-            toggle(f, app, ctl_x, y, app.opts.web_search, focused && field == Field::Search, Hit::SetToggle(0));
-            y += 2;
-        }
+        y += 1;
     } else {
         let has_list = !app.settings.custom_catalog.models.is_empty();
         let endpoint = app.settings.endpoint.clone();
@@ -209,6 +205,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         y += 1;
     }
 
+    if y < bottom {
+        let foc = focused && field == Field::Search;
+        line(f, Rect::new(x, y, LABEL_W, 1), "搜尋（web + X）", focus_style(foc));
+        toggle(f, app, ctl_x, y, app.opts.web_search, foc, Hit::SetToggle(0));
+        let (hint, style) = search_hint(app);
+        line(f, Rect::new(ctl_x + 7, y, ctl_w.saturating_sub(7), 1), hint, style);
+        y += 1;
+    }
     for (fld, label, on, id) in [
         (Field::Dispatcher, "調度員模式", app.opts.dispatcher, 1u8),
         (Field::ImportClaude, "引入 Claude 技能", app.skills_pref(true), 2),
@@ -243,6 +247,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         return None;
     }
     caret
+}
+
+/// How search reaches the current model: Grok's own tools, or `grok_search`.
+fn search_hint(app: &App) -> (&'static str, Style) {
+    let dim = Style::default().fg(DIM);
+    if !app.settings.conn.route_for(&app.opts.model).is_openai() {
+        ("Grok 內建搜尋", dim)
+    } else if app.settings.xai_ready {
+        ("grok_search：借用已登入的 Grok 代查", dim)
+    } else {
+        ("需登入 Grok 才能借用搜尋", Style::default().fg(WARN))
+    }
 }
 
 fn skills(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {

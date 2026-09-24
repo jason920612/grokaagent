@@ -718,7 +718,13 @@ fn picking_a_custom_model_on_the_grok_panel_routes_by_model() {
     assert!(app.settings.conn.route_for(&app.opts.model).is_openai());
     let k = app.knobs.lock().unwrap();
     assert_eq!(k.model, "qwen-2");
-    assert!(k.server_tools.is_empty(), "xAI search does not follow a custom model");
+    assert!(k.server_tools.is_empty(), "no Grok login: nothing to lend search");
+    drop(k);
+    app.settings.xai_ready = true;
+    app.sync_knobs();
+    let k = app.knobs.lock().unwrap();
+    assert_eq!(k.server_tools, vec![crate::grok_search::GATE.to_string()], "custom models borrow Grok search");
+    assert!(k.search);
 }
 
 #[test]

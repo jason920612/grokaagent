@@ -64,6 +64,7 @@ grokaagent update
 - 從原始碼編譯：Rust 1.75+
 - Grok：有效的 SuperGrok / X Premium+（訂閱推論走 `cli-chat-proxy.grok.com`）
 - 或自訂 OpenAI 相容端點（設定裡切「自訂 API」，或 `--base-url` / `--model` / `--context`）
+- 搜尋：Grok 模型用內建 web / X 搜尋；其他模型（DeepSeek 等）在已登入 Grok 時會拿到 `grok_search` 工具——用自然語言發問，由最新的 Grok 模型代為搜尋 web 與 X 並附來源。設定（F2）的「搜尋」開關同時控制兩者，子代理會繼承；`GROKA_GROK_SEARCH_MODEL` 可指定代查模型
 
 ## 從原始碼安裝
 

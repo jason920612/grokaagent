@@ -23,11 +23,15 @@ use crate::tools::{
     ScreenshotTool, ToolRegistry, WriteFileTool,
 };
 
-pub fn search_tools(enabled: bool) -> Vec<String> {
-    if enabled {
-        vec!["web_search".into(), "x_search".into()]
-    } else {
-        Vec::new()
+/// Search for the live model: Grok's own server tools on the xAI route; on
+/// any other route, `grok_search` (Grok answers through the user's login)
+/// when a login exists.
+pub fn search_tools(enabled: bool, openai_route: bool, grok_login: bool) -> Vec<String> {
+    match (enabled, openai_route) {
+        (false, _) => Vec::new(),
+        (true, false) => vec!["web_search".into(), "x_search".into()],
+        (true, true) if grok_login => vec![crate::grok_search::GATE.into()],
+        (true, true) => Vec::new(),
     }
 }
 
@@ -40,6 +44,8 @@ pub struct KernelSpec {
     pub events_file: PathBuf,
     pub events_dir: PathBuf,
     pub server_tools: Vec<String>,
+    /// The search toggle, inherited by child agents.
+    pub search: bool,
     pub depth: u32,
     pub parent_run_id: Option<String>,
     pub run_id: String,
@@ -163,6 +169,9 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         )),
         Box::new(SkillTool::new(skills.clone(), spec.workspace.clone())),
     ];
+    if let Ok(auth_path) = crate::auth::default_auth_path() {
+        tools.push(Box::new(crate::grok_search::GrokSearchTool::new(auth_path)));
+    }
     if let Some(ask_hub) = spec.ask {
         tools.push(Box::new(AskUserTool::new(
             ask_hub,
@@ -190,6 +199,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         )?;
         // Finished children wake this session like a background exit does.
         n.set_notify(bg_tx.clone());
+        n.set_search(spec.search);
         if let Some(cancel) = &spec.cancel {
             n.follow_cancel(cancel.clone());
         }

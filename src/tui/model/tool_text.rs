@@ -78,6 +78,7 @@ pub(crate) fn tool_subject(name: &str, args: &Value) -> String {
             _ => "全部".into(),
         },
         "ask_user" => arg(args, "question").to_string(),
+        "grok_search" => arg(args, "query").to_string(),
         _ => String::new(),
     }
 }

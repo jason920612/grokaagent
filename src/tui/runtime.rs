@@ -61,11 +61,8 @@ fn boot_app(terminal: &Term, mut opts: TuiOptions, rt: Rt) -> Result<App> {
         conn.kind = ProviderKind::Openai;
         let _ = conn.save();
     }
-    if conn.kind.is_openai() {
-        if !conn.model.trim().is_empty() {
-            opts.model = conn.model.clone();
-        }
-        opts.web_search = false;
+    if conn.kind.is_openai() && !conn.model.trim().is_empty() {
+        opts.model = conn.model.clone();
     }
     let mut settings = Settings::new(conn, auth_path);
     settings.model_edit = crate::tui::edit::Edit::at_end(if settings.conn.kind.is_openai() && !settings.conn.model.trim().is_empty() {
@@ -463,11 +460,11 @@ async fn run_one(spec: RunSpec) -> Result<RunOutcome> {
         opts.model.clone()
     };
     let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
-    let server_tools = if cfg.route_for(&model).is_openai() {
-        vec![]
-    } else {
-        crate::kit::search_tools(opts.web_search)
-    };
+    let server_tools = crate::kit::search_tools(
+        opts.web_search,
+        cfg.route_for(&model).is_openai(),
+        crate::grok_search::grok_login_available(),
+    );
     let sink: Arc<dyn crate::events::EventSink> = rt.sink.clone();
     crate::kit::run_with_nursery(
         &provider,
@@ -483,6 +480,7 @@ async fn run_one(spec: RunSpec) -> Result<RunOutcome> {
             events_file: opts.events.clone(),
             events_dir: crate::kit::events_dir(&opts.events),
             server_tools,
+            search: opts.web_search,
             depth: 0,
             parent_run_id: None,
             run_id,

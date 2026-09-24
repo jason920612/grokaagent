@@ -480,9 +480,14 @@ impl App {
             model: opts.model.clone(),
             reasoning_effort: opts.reasoning_effort,
             send_reasoning: true,
-            server_tools: crate::kit::search_tools(opts.web_search),
+            server_tools: crate::kit::search_tools(
+                opts.web_search,
+                settings.conn.route_for(&opts.model).is_openai(),
+                settings.xai_ready,
+            ),
             dispatcher: opts.dispatcher,
             child_model: opts.child_model.clone(),
+            search: opts.web_search,
         }));
         let current = boot.id().to_string();
         let launch_workspace = opts.workspace.clone();
@@ -883,9 +888,6 @@ impl App {
         self.refresh_list(true);
         let mut opts = self.opts.clone();
         opts.workspace = workspace;
-        if self.settings.conn.route_for(&opts.model).is_openai() {
-            opts.web_search = false;
-        }
         super::runtime::spawn_run(super::runtime::RunSpec {
             opts,
             turn,

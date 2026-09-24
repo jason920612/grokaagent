@@ -58,6 +58,8 @@ pub struct WorkerConfig {
     /// Per-message turn budget; hitting it pauses the session (0 = unlimited).
     pub max_turns: u32,
     pub reasoning_effort: crate::provider::ReasoningEffort,
+    /// Parent's search toggle; the tools follow this child's model route.
+    pub search: bool,
 }
 
 struct Session {
@@ -98,6 +100,7 @@ struct WorkerConfigView {
     max_turns: u32,
     depth: u32,
     reasoning_effort: crate::provider::ReasoningEffort,
+    search: bool,
 }
 
 pub struct BoundWorker {
@@ -213,6 +216,7 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
             max_turns: cfg.max_turns,
             depth: cfg.depth,
             reasoning_effort: cfg.reasoning_effort,
+            search: cfg.search,
         },
         book,
         interrupting,
@@ -335,7 +339,15 @@ async fn run_session<P: Provider + Clone + 'static>(
             workspace: st.cfg.workspace.clone(),
             events_file: st.cfg.events.clone(),
             events_dir: crate::kit::events_dir(&st.cfg.events),
-            server_tools: vec![],
+            server_tools: {
+                let cfg = crate::config::ProviderConfig::load();
+                crate::kit::search_tools(
+                    st.cfg.search,
+                    cfg.route_for(&st.cfg.model).is_openai(),
+                    crate::grok_search::grok_login_available(),
+                )
+            },
+            search: st.cfg.search,
             depth: st.cfg.depth,
             parent_run_id: st.cfg.parent_run_id.clone(),
             run_id: st.run_id.clone(),
@@ -487,6 +499,7 @@ mod tests {
             model: "grok-4.6".into(),
             max_turns: 4,
             reasoning_effort: crate::provider::ReasoningEffort::High,
+            search: false,
         })
         .await
         .unwrap();

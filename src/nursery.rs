@@ -128,6 +128,8 @@ pub struct Nursery {
     /// The sink the tools emit to, for events raised outside a tool call.
     sink: OnceLock<Arc<dyn EventSink>>,
     stop_follow: Mutex<Option<oneshot::Sender<()>>>,
+    /// Search toggle for new children when there are no live knobs.
+    search: std::sync::atomic::AtomicBool,
 }
 
 /// The per-child model override from spawn args, or the parent's model.
@@ -207,7 +209,20 @@ impl Nursery {
             notify: OnceLock::new(),
             sink: OnceLock::new(),
             stop_follow: Mutex::new(None),
+            search: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Let new children search (Grok's server tools, or `grok_search`).
+    pub fn set_search(&self, on: bool) {
+        self.search.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn child_search(&self) -> bool {
+        match &self.knobs {
+            Some(k) => k.lock().unwrap_or_else(|e| e.into_inner()).search,
+            None => self.search.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Route finished children's replies into the parent session (its
@@ -332,8 +347,11 @@ impl Nursery {
             .arg("--workspace")
             .arg(&self.workspace)
             .arg("--model")
-            .arg(&model)
-            .stdin(std::process::Stdio::null())
+            .arg(&model);
+        if self.child_search() {
+            cmd.arg("--search");
+        }
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -1142,6 +1160,7 @@ mod tests {
             server_tools: vec![],
             dispatcher: false,
             child_model: "grok-3-mini".into(),
+            search: false,
         }));
         let n = nursery(&dir, 0, Some(knobs.clone()));
         assert_eq!(n.default_child_model(), "grok-3-mini");

@@ -30,6 +30,11 @@ pub type ToolCallFut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 
 pub trait ClientTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn call(&self, args: &Value) -> ToolCallFut<'_>;
+    /// A tool with a gate is offered only while `server_tools` carries that
+    /// marker (it follows the live model's route and the search toggle).
+    fn gate(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 pub struct ToolRegistry {
@@ -43,6 +48,15 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|t| t.spec()).collect()
+    }
+
+    /// Specs to send this turn: gated tools only when `server_tools` opens them.
+    pub fn specs_for(&self, server_tools: &[String]) -> Vec<ToolSpec> {
+        self.tools
+            .iter()
+            .filter(|t| t.gate().map_or(true, |g| server_tools.iter().any(|s| s == g)))
+            .map(|t| t.spec())
+            .collect()
     }
 
     pub async fn call(&self, name: &str, args: &Value) -> Result<String> {

@@ -1038,7 +1038,12 @@ fn tools_json(client_tools: &[ToolSpec], server_tools: &[String]) -> Vec<Value> 
             })
         })
         .collect();
-    let mut server = server_tools.to_vec();
+    // Client-side gates such as `grok_search` are not xAI tool types.
+    let mut server: Vec<String> = server_tools
+        .iter()
+        .filter(|s| s.as_str() != crate::grok_search::GATE)
+        .cloned()
+        .collect();
     server.sort();
     server.dedup();
     for name in server {
@@ -1301,6 +1306,12 @@ mod tests {
         assert_eq!(ReasoningEffort::High.cycle(), ReasoningEffort::Xhigh);
         assert_eq!(ReasoningEffort::Xhigh.cycle(), ReasoningEffort::Low);
         assert_eq!(ReasoningEffort::Low.cycle_back(), ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn grok_search_gate_is_never_sent_as_an_xai_tool() {
+        let tools = tools_json(&[], &["grok_search".into(), "web_search".into()]);
+        assert_eq!(tools, vec![json!({"type": "web_search"})]);
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub struct SessionKnobs {
     /// Default model for spawned child agents. Empty = follow [`Self::model`].
     /// A `model` argument on spawn_agent still wins.
     pub child_model: String,
+    /// The user's search toggle. [`Self::server_tools`] is what the live
+    /// model gets; this is what new child agents inherit.
+    pub search: bool,
 }
 
 pub struct RunConfig {
@@ -804,7 +807,7 @@ pub async fn run<P: Provider>(
     let mut cache_turns = Vec::new();
     let mut compacted = 0u32;
     let max_turns = cfg.max_turns;
-    let mut cache_key = prompt_cache_key(&start_model, &tools.specs(), &start_tools, &run_id);
+    let mut cache_key = prompt_cache_key(&start_model, &tools.specs_for(&start_tools), &start_tools, &run_id);
     let mut last_model = start_model;
     let mut last_server_tools = start_tools;
     let mut turn: u32 = 0;
@@ -896,7 +899,7 @@ pub async fn run<P: Provider>(
 
         let (model, effort, send_reasoning, server_tools) = live_knobs(&cfg);
         if model != last_model || server_tools != last_server_tools {
-            cache_key = prompt_cache_key(&model, &tools.specs(), &server_tools, &run_id);
+            cache_key = prompt_cache_key(&model, &tools.specs_for(&server_tools), &server_tools, &run_id);
             pending = history.clone();
             last_model = model.clone();
             last_server_tools = server_tools.clone();
@@ -942,7 +945,7 @@ pub async fn run<P: Provider>(
                         send_reasoning,
                         &cache_key,
                         &head,
-                        tools.specs(),
+                        tools.specs_for(&server_tools),
                         server_tools.clone(),
                     ),
                 )
@@ -1051,7 +1054,7 @@ pub async fn run<P: Provider>(
         let req = CompleteRequest {
             instructions: live_instructions(&cfg),
             input: history.clone(),
-            client_tools: tools.specs(),
+            client_tools: tools.specs_for(&server_tools),
             server_tools: server_tools.clone(),
             cache_key: cache_key.clone(),
             previous_response_id: None,
@@ -1567,6 +1570,7 @@ mod tests {
             server_tools: vec![],
             dispatcher: true,
             child_model: String::new(),
+            search: false,
         })));
         let text = live_instructions(&c);
         assert!(text.starts_with("use tools"));

@@ -43,6 +43,7 @@ impl Field {
                 Field::Model,
                 Field::ChildModel,
                 Field::Context,
+                Field::Search,
                 Field::Dispatcher,
                 Field::ImportClaude,
                 Field::ImportCodex,
@@ -199,6 +200,8 @@ impl App {
         let st = &mut self.settings;
         st.xai_ready = auth::load_tokens(&st.auth_path).is_ok();
         st.logged_in = st.conn.ready(st.xai_ready);
+        // Logging in or out turns `grok_search` on or off for custom models.
+        self.sync_knobs();
     }
 
     /// Push the chosen model / effort / tools into the running sessions.
@@ -221,11 +224,8 @@ impl App {
             k.model = model;
             k.reasoning_effort = choice.effort;
             k.send_reasoning = choice.send_reasoning && !openai;
-            k.server_tools = if openai {
-                Vec::new()
-            } else {
-                crate::kit::search_tools(self.opts.web_search)
-            };
+            k.server_tools = crate::kit::search_tools(self.opts.web_search, openai, st.xai_ready);
+            k.search = self.opts.web_search;
             k.dispatcher = self.opts.dispatcher;
             k.child_model = self.opts.child_model.trim().to_string();
         }
@@ -367,9 +367,6 @@ impl App {
                 // Typed while the endpoint has no model list.
                 self.opts.child_model = self.settings.child_model_edit.text.trim().to_string();
             }
-            if self.settings.conn.route_for(&self.opts.model).is_openai() {
-                self.opts.web_search = false;
-            }
             self.rebuild_catalog();
         } else {
             self.settings.conn.model = self.opts.model.clone();
@@ -479,9 +476,6 @@ impl App {
             }
             if st.conn.model.trim().is_empty() {
                 st.conn.model = self.opts.model.clone();
-            }
-            if st.conn.route_for(&self.opts.model).is_openai() {
-                self.opts.web_search = false;
             }
             st.want_catalog = st.xai_ready;
             st.field = Field::Endpoint;

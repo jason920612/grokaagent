@@ -9,6 +9,7 @@ pub mod compact;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod grok_search;
 pub mod folderpick;
 pub mod hostio;
 pub mod hub;
