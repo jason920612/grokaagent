@@ -22,6 +22,7 @@ pub const NAME: &str = "grok_search";
 const MAX_QUERY_CHARS: usize = 4000;
 const MAX_ANSWER_CHARS: usize = 12_000;
 const MAX_SOURCES: usize = 20;
+const MAX_UNCITED_SOURCES: usize = 8;
 
 /// True when a saved xAI login exists, so the tool can reach Grok.
 pub fn grok_login_available() -> bool {
@@ -139,7 +140,8 @@ Current UTC time: {now}.\n\
     )
 }
 
-/// Answer text, then the cited URLs and the searches Grok ran.
+/// Answer text, source URLs when the answer has none inline, and the number
+/// of searches Grok ran.
 pub fn format_answer(model: &str, text: &str, output_items: &[Value]) -> String {
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut push = |url: &str, title: &str| {
@@ -181,7 +183,12 @@ pub fn format_answer(model: &str, text: &str, output_items: &[Value]) -> String 
     } else {
         answer.to_string()
     };
-    if !sources.is_empty() {
+    // Grok's citation list covers every page it opened, relevant or not. When
+    // the answer already cites URLs inline, that list is noise; otherwise
+    // keep a short one so the caller has something to check.
+    let inline = answer.contains("https://") || answer.contains("http://");
+    if !inline && !sources.is_empty() {
+        sources.truncate(MAX_UNCITED_SOURCES);
         out.push_str("\n\nSources:");
         for (url, title) in &sources {
             if title.is_empty() || title == url {
@@ -253,6 +260,8 @@ mod tests {
         assert!(out.contains("- A — https://a.example"));
         assert_eq!(out.matches("https://b.example").count(), 1, "{out}");
         assert!(out.ends_with("[answered by grok-9 · 2 search call(s)]"), "{out}");
+        let inline = format_answer("grok-9", "See https://b.example for details.", &items);
+        assert!(!inline.contains("Sources:"), "inline citations make the list noise: {inline}");
     }
 
     #[test]
