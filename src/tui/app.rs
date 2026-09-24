@@ -1,672 +1,975 @@
-struct App {
-    web_receipts: Vec<(String, String)>,
-    side_view: SideView,
-    /// Side bar shown (docked when wide, overlaid when narrow).
-    side_open: bool,
-    side_scroll: usize,
-    /// Bottom panel tab; `None` = panel closed.
-    bottom: Option<BottomTab>,
-    bottom_scroll: usize,
-    side_area: Rect,
-    bottom_area: Rect,
-    /// Row hashes last published to the web, per view path.
-    web_sent: HashMap<String, Vec<u64>>,
-    /// Rendered rows by hash, so unchanged rows are not re-rendered.
-    web_cache: HashMap<u64, hub::UiRow>,
-    rows: Vec<Row>,
-    edit: Edit,
-    status: String,
-    cache: String,
-    child_count: u32,
-    running: bool,
-    awaiting: bool,
-    logged_in: bool,
-    auth_path: PathBuf,
-    login_ui: LoginUi,
-    login_gen: u64,
-    want_login: bool,
-    scroll: u16,
-    stick_bottom: bool,
-    send_mode: SendMode,
-    queue: VecDeque<Queued>,
-    inbox_tx: Option<mpsc::UnboundedSender<UserTurn>>,
-    cancel: Option<CancelFlag>,
-    knobs: Arc<Mutex<SessionKnobs>>,
-    focus: Focus,
-    setting_field: SettingField,
-    settings: Option<Win>,
-    conn: ProviderConfig,
-    endpoint_edit: Edit,
-    api_key_edit: Edit,
-    model_edit: Edit,
-    child_model_edit: Edit,
-    context_edit: Edit,
-    drag: Option<(i16, i16)>,
-    /// Mouse grab offset inside the chat scrollbar thumb.
-    scroll_grab: Option<i16>,
-    hits: Vec<(Rect, Hit)>,
-    area: Rect,
-    streaming: bool,
-    composer_inner: Rect,
-    composer_frame: Rect,
-    composer_snap: Option<Buffer>,
-    header_bar: Rect,
-    /// On-screen think-header rows whose clocks can be patched without redrawing chat or composer.
-    think_clocks: Vec<(usize, Rect)>,
-    last_clock_cells: Vec<(u16, u16, Cell)>,
-    last_caret: Position,
-    chat_inner: Rect,
-    chat_bar: Rect,
-    chat_total: u16,
-    chat_max_off: u16,
-    composer_vscroll: u16,
-    input_dragging: bool,
-    chat_dragging: bool,
-    chat_glyphs: Vec<ChatGlyphLine>,
-    /// Merged view of `grok_catalog` + `custom_catalog`; what every picker reads.
-    catalog: ModelCatalog,
-    catalog_status: CatalogStatus,
-    /// Raw Grok catalog from the xAI login.
-    grok_catalog: ModelCatalog,
-    /// Raw model list fetched from the custom endpoint's /models.
-    custom_catalog: ModelCatalog,
-    /// (base_url, api_key) the custom catalog was fetched for.
-    custom_cat_key: (String, String),
-    custom_cat_loading: bool,
-    custom_cat_err: Option<String>,
-    /// xAI OAuth tokens exist on disk (independent of the active panel).
-    xai_ready: bool,
-    drop: Option<DropKind>,
-    drop_cursor: usize,
-    drop_scroll: u16,
-    want_catalog: bool,
-    open_tool: Option<(usize, usize)>,
-    seal_tools: bool,
-    activity: String,
-    tick: u8,
-    current_id: String,
-    session: SessionMeta,
-    parked: HashMap<String, ParkedChat>,
-    sessions: Vec<SessionMeta>,
-    store: Option<SessionStore>,
-    launch_workspace: PathBuf,
-    sidebar_ids: Vec<String>,
-    /// Inline sidebar rename: session id + editor.
-    rename: Option<(String, Edit)>,
-    rename_inner: Rect,
-    work_started: Option<Instant>,
-    /// Composer is editing `queue[index]`; auto-send is paused until commit/cancel.
-    queue_edit: Option<usize>,
-    composer_stash: Option<Edit>,
-    pending: Vec<String>,
-    chat_sel: ChatSel,
-    preview: HashMap<(String, u16), Vec<Line<'static>>>,
-    picker: Option<Picker>,
-    image_proto: HashMap<(String, u16, u16), Protocol>,
-    image_cells: HashMap<(String, u16, u16), (u16, u16)>,
-    graphic_blits: Vec<crate::preview::GraphicBlit>,
-    last_graphic_blits: Vec<crate::preview::GraphicBlit>,
-    image_hits: Vec<String>,
-    image_view: Option<String>,
-    bench: Workbench,
-    monitors: Vec<SideMon>,
-    backgrounds: Vec<SideBg>,
-    inspector: Option<Inspector>,
-    inspector_scroll: u16,
-    ask_hub: AskUserHub,
-    ask_hubs: HashMap<String, AskUserHub>,
-    ask: Option<AskState>,
-    ask_fill_inner: Rect,
-    /// When routing an event into a parked session, do not open the overlay.
-    ask_passive: bool,
-    workspace_pick: Option<WorkspacePick>,
-    task: Arc<TaskHub>,
-    task_ui: Option<TaskUi>,
-    task_draft_inner: Rect,
-    task_action: Option<TaskAction>,
-    skills: Arc<Mutex<SkillStore>>,
-    skill_list: Vec<Skill>,
-    skill_cursor: usize,
-    skill_scroll: u16,
-    skill_view: Option<SkillView>,
-    web_url: Option<String>,
-    composer_seq: u64,
-    web_composer_seq: u64,
+//! Application state: every open session, the settings panel, and the UI
+//! state of the workbench (which views are open, what the last frame laid
+//! out). Actions that change sessions live here; drawing lives in `ui`,
+//! input decoding in `input`.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use tokio::sync::mpsc;
+
+use crate::agent::{CancelFlag, RunOutcome, SessionKnobs, UserTurn};
+use crate::ask::AskUserHub;
+use crate::events::{AgentEvent, EventMeta, EventSink, FanoutSink};
+use crate::folderpick::{self, FolderView};
+use crate::session::{self, SessionMeta, SessionStore};
+use crate::skills::SkillStore;
+use crate::task::{self, TaskHub, TaskPhase};
+
+use super::edit::{clipboard_get, clipboard_set, clipboard_set_image, Edit};
+use super::model::agents::{AgentTree, EventKind, SavedAgent};
+use super::model::rows::Row;
+use super::model::session::{intro_rows, user_row, ChatSel, Queued, Session};
+use super::settings::Settings;
+use super::TuiOptions;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendMode {
+    Queue,
+    Insert,
 }
 
-impl App {
-    fn push(&mut self, row: Row) {
-        if matches!(&row, Row::User(_) | Row::Agent(_)) {
-            self.seal_tools = true;
-            self.finish_open_think();
-        }
-        self.rows.push(row);
-        if self.rows.len() > 2_000 {
-            self.rows.drain(0..self.rows.len() - 1_500);
-            self.chat_sel = ChatSel::None;
-        }
-        if self.stick_bottom {
-            self.scroll = 0;
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Submit {
+    Start,
+    Queue,
+    Insert,
+}
 
-    fn apply_event(&mut self, ev: AgentEvent) {
-        match ev {
-            AgentEvent::RunStarted { model, .. } => {
-                self.running = true;
-                self.awaiting = false;
-                self.streaming = false;
-                self.mark_work_start();
-                self.activity = format!("連線 {model}");
-                self.status = "工作中".into();
-            }
-            AgentEvent::TurnStarted { turn, .. } => {
-                self.running = true;
-                self.awaiting = false;
-                self.streaming = false;
-                self.mark_work_start();
-                self.seal_tools = true;
-                self.finish_open_think();
-                self.mark_open_server_done();
-                self.activity = "思考中".into();
-                self.status = format!("第 {turn} 輪");
-            }
-            AgentEvent::ReasoningDelta { text, .. } => {
-                if text.is_empty() {
-                    return;
-                }
-                self.append_think(&text);
-            }
-            AgentEvent::ModelDelta { text, .. } => {
-                if text.is_empty() {
-                    return;
-                }
-                self.activity = "撰寫中".into();
-                self.finish_open_think();
-                if self.streaming {
-                    if let Some(Row::Agent(s)) = self.rows.last_mut() {
-                        s.text.push_str(&text);
-                        if self.stick_bottom {
-                            self.scroll = 0;
-                        }
-                        return;
-                    }
-                }
-                self.push(Row::Agent(AgentMsg::new(text)));
-                self.streaming = true;
-                self.seal_tools = true;
-            }
-            AgentEvent::ModelFinished {
-                text,
-                input_tokens,
-                cached_tokens,
-                ..
-            } => {
-                self.streaming = false;
-                self.finish_open_think();
-                if input_tokens > 0 {
-                    let pct = (cached_tokens as f32 / input_tokens as f32) * 100.0;
-                    self.cache = format!("{cached_tokens}/{input_tokens} ({pct:.0}%)");
-                }
-                if text.is_empty() {
-                    return;
-                }
-                // The streamed agent row may no longer be the last row (a think
-                // or server-tool row can land after the text deltas). Search
-                // back within this turn so the final text replaces the streamed
-                // partial instead of being appended again as a duplicate.
-                for r in self.rows.iter_mut().rev() {
-                    match r {
-                        Row::User(_) => break,
-                        Row::Agent(s) => {
-                            if s.text.is_empty()
-                                || text.starts_with(s.text.as_str())
-                                || s.text.starts_with(text.as_str())
-                            {
-                                s.text = text;
-                                return;
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                self.push(Row::Agent(AgentMsg::new(text)));
-            }
-            AgentEvent::ToolStarted { call_id, name, args, .. } => {
-                self.streaming = false;
-                self.finish_open_think();
-                self.activity = live_tool_activity(&name, &args, "執行中");
-                self.push_tool_start(call_id, name, args);
-            }
-            AgentEvent::ToolFinished { call_id, name, output, .. } => {
-                let _ = enable_raw_mode();
-                let pic = picture_from_tool(&name, &output);
-                self.finish_tool(&call_id, &name, output);
-                if let Some((path, label)) = pic {
-                    self.push(Row::Picture { path, label });
-                }
-                self.activity = "思考中".into();
-            }
-            AgentEvent::ServerToolObserved { kind, payload, .. } => {
-                self.streaming = false;
-                self.finish_open_think();
-                if kind == "gateway" {
-                    if let Some(msg) = payload.get("error").and_then(|v| v.as_str()) {
-                        self.push(Row::Err(msg.to_string()));
-                    }
-                } else {
-                    self.observe_server(&kind, payload);
-                }
-            }
-            AgentEvent::FileChanged {
-                path, kind, diff, ..
-            } => {
-                self.streaming = false;
-                self.attach_file(FileChange { path, kind, diff });
-            }
-            AgentEvent::ContextCompacted {
-                method,
-                dropped_items,
-                kept_items,
-                ..
-            } => {
-                self.push(Row::Meta(format!(
-                    "壓縮 ({method}) 丟 {dropped_items} 留 {kept_items}"
-                )));
-            }
-            AgentEvent::ChildSpawned {
-                name,
-                prompt,
-                model,
-                ..
-            } => {
-                // The task supervisor reports itself like a child but is not a process.
-                if name != task::AGENT_NAME {
-                    self.agent_spawned("", &name, &prompt, &model);
-                }
-                self.push(Row::Meta(format!("子代理 {name} 已啟動")));
-            }
-            AgentEvent::ChildExited { name, detail, .. } => {
-                if name != task::AGENT_NAME {
-                    self.agent_exited("", &name, &detail);
-                }
-                self.mark_spawn_tool_done(&name);
-                self.push(Row::Meta(format!("子代理 {name} 結束")));
-            }
-            AgentEvent::MonitorAttached {
-                name,
-                command,
-                pid,
-                ..
-            } => {
-                self.upsert_monitor(name.clone(), command.clone(), pid);
-                self.push(Row::Meta(format!("監控 {name} 已掛上  $ {command}")));
-            }
-            AgentEvent::MonitorExited { name, detail, .. } => {
-                if let Some(m) = self.mon_named_mut(&name) {
-                    m.alive = false;
-                    m.status = "結束".into();
-                    m.detail = detail.clone();
-                }
-                self.push(Row::Meta(format!("監控 {name} 結束  {detail}")));
-            }
-            AgentEvent::BackgroundStarted {
-                name,
-                command,
-                pid,
-                ..
-            } => {
-                self.upsert_background(name.clone(), command.clone(), pid);
-                self.push(Row::Meta(format!("後台 {name} 已掛上  $ {command}")));
-            }
-            AgentEvent::BackgroundOutput {
-                name,
-                stream,
-                text,
-                ..
-            } => {
-                if let Some(b) = self.bg_named_mut(&name) {
-                    b.push_log(format!("{stream} {text}"));
-                }
-            }
-            AgentEvent::BackgroundExited { name, detail, .. } => {
-                if let Some(b) = self.bg_named_mut(&name) {
-                    b.alive = false;
-                    b.status = "結束".into();
-                    b.detail = detail.clone();
-                }
-                self.push(Row::Meta(format!("後台 {name} 結束  {detail}")));
-            }
-            AgentEvent::TimerStarted {
-                name,
-                seconds,
-                command,
-                ..
-            } => {
-                let label = if command.is_empty() {
-                    format!("timer {seconds}s")
-                } else {
-                    format!("timer {seconds}s  $ {command}")
-                };
-                self.upsert_background(name.clone(), label, 0);
-                if let Some(b) = self.bg_named_mut(&name) {
-                    b.status = "倒數中".into();
-                }
-                self.push(Row::Meta(format!("計時器 {name} 開始  {seconds}s")));
-            }
-            AgentEvent::TimerFired { name, detail, .. } => {
-                if let Some(b) = self.bg_named_mut(&name) {
-                    b.alive = false;
-                    b.status = "已到時".into();
-                    b.detail = detail.clone();
-                }
-                self.push(Row::Meta(format!("計時器 {name} 到時")));
-            }
-            AgentEvent::TimerCancelled { name, .. } => {
-                if let Some(b) = self.bg_named_mut(&name) {
-                    b.alive = false;
-                    b.status = "已取消".into();
-                }
-                self.push(Row::Meta(format!("計時器 {name} 已取消")));
-            }
-            AgentEvent::AgentMessage {
-                from, to, text, ..
-            } => {
-                if from == task::AGENT_NAME || to == task::AGENT_NAME {
-                    let preview: String = text.chars().take(160).collect();
-                    let line = format!("{from} → {to}  {}", preview.replace('\n', " "));
-                    self.bench.log_event("", "message", line);
-                } else {
-                    self.agent_message("", &from, &to, &text);
-                }
-            }
-            AgentEvent::AskUser {
-                question,
-                allow_multiple,
-                options,
-                ..
-            } => {
-                if options.is_empty() {
-                    return;
-                }
-                self.push(Row::Meta(format!("問卷  {question}")));
-                if self.ask_passive {
-                    if let Some(h) = self.ask_hubs.get(&self.current_id) {
-                        h.cancel();
-                    }
-                    return;
-                }
-                self.ask = Some(AskState::new(Question {
-                    prompt: question,
-                    allow_multiple,
-                    options,
-                }));
-                self.focus = Focus::Ask;
-                self.status = "請選擇".into();
-            }
-            AgentEvent::Notice { message, .. } => {
-                self.push(Row::Meta(message));
-            }
-            AgentEvent::Error { message, .. } => {
-                self.streaming = false;
-                self.push(Row::Err(message));
-            }
-            AgentEvent::AwaitingInput { .. } => {
-                let stopped = self.activity == "中斷中" || self.task.snapshot().skip_steer;
-                self.running = false;
-                self.awaiting = true;
-                self.streaming = false;
-                self.finish_open_think();
-                self.stamp_work();
-                self.activity.clear();
-                self.status = if stopped { "已停止" } else { "待命" }.into();
-            }
-            AgentEvent::RunFinished { reason, text, .. } => {
-                self.cancel_ask();
-                self.running = false;
-                self.awaiting = false;
-                self.streaming = false;
-                self.finish_open_think();
-                self.inbox_tx = None;
-                self.activity.clear();
-                self.status = format!("結束 ({reason})");
-                if !text.is_empty()
-                    && !self
-                        .rows
-                        .iter()
-                        .any(|r| matches!(r, Row::Agent(t) if t.text == text))
-                {
-                    self.push(Row::Agent(AgentMsg::new(text)));
-                }
-                self.stamp_work();
-            }
-            AgentEvent::SessionNamed { .. } => {}
+pub(crate) fn submit_kind(has_session: bool, running: bool, mode: SendMode) -> Submit {
+    if !has_session {
+        Submit::Start
+    } else if running && mode == SendMode::Queue {
+        Submit::Queue
+    } else {
+        Submit::Insert
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Focus {
+    Chat,
+    Settings,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SideView {
+    Sessions,
+    Agents,
+    Changes,
+    Background,
+    Task,
+}
+
+impl SideView {
+    pub const ALL: [SideView; 5] = [
+        SideView::Sessions,
+        SideView::Agents,
+        SideView::Changes,
+        SideView::Background,
+        SideView::Task,
+    ];
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Sessions => "≡",
+            Self::Agents => "◎",
+            Self::Changes => "±",
+            Self::Background => "▶",
+            Self::Task => "✔",
         }
     }
 
-    fn mon_named_mut(&mut self, name: &str) -> Option<&mut SideMon> {
-        self.monitors.iter_mut().find(|m| m.name == name)
-    }
-
-    fn bg_named_mut(&mut self, name: &str) -> Option<&mut SideBg> {
-        self.backgrounds.iter_mut().find(|b| b.name == name)
-    }
-
-    fn upsert_monitor(&mut self, name: String, command: String, pid: u32) {
-        if let Some(m) = self.mon_named_mut(&name) {
-            m.command = command;
-            m.pid = pid;
-            m.alive = true;
-            m.status = "執行中".into();
-            m.detail.clear();
-            return;
-        }
-        self.monitors.push(SideMon {
-            name,
-            command,
-            pid,
-            status: "執行中".into(),
-            alive: true,
-            detail: String::new(),
-        });
-    }
-
-    fn upsert_background(&mut self, name: String, command: String, pid: u32) {
-        if let Some(b) = self.bg_named_mut(&name) {
-            b.command = command;
-            b.pid = pid;
-            b.alive = true;
-            b.status = "執行中".into();
-            b.detail.clear();
-            return;
-        }
-        self.backgrounds.push(SideBg {
-            name,
-            command,
-            pid,
-            status: "執行中".into(),
-            alive: true,
-            detail: String::new(),
-            log: Vec::new(),
-        });
-    }
-
-    #[cfg(test)]
-    fn has_side(&self) -> bool {
-        !self.bench.agents.is_empty() || !self.monitors.is_empty() || !self.backgrounds.is_empty()
-    }
-
-    fn close_inspector(&mut self) {
-        self.inspector = None;
-        self.inspector_scroll = 0;
-        if self.focus == Focus::Inspector {
-            self.focus = Focus::Chat;
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Sessions => "對話",
+            Self::Agents => "代理",
+            Self::Changes => "檔案變更",
+            Self::Background => "背景工作",
+            Self::Task => "任務",
         }
     }
+}
 
-    fn open_image_view(&mut self, rel: String) {
-        self.chat_sel = ChatSel::Image(rel.clone());
-        self.image_view = Some(rel);
-        self.close_inspector();
-        self.open_tool = None;
-        self.focus = Focus::Chat;
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BottomTab {
+    Tools,
+    Output,
+    Events,
+}
 
-    fn close_image_view(&mut self) {
-        self.image_view = None;
-        self.focus = Focus::Chat;
-    }
+impl BottomTab {
+    pub const ALL: [BottomTab; 3] = [BottomTab::Tools, BottomTab::Output, BottomTab::Events];
 
-    fn refresh_skills(&mut self) {
-        let ws = self.session.workspace.clone();
-        let list = self
-            .skills
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .scan(&ws);
-        if self.skill_cursor >= list.len() && !list.is_empty() {
-            self.skill_cursor = list.len() - 1;
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Tools => "工具",
+            Self::Output => "輸出",
+            Self::Events => "事件",
         }
-        self.skill_list = list;
     }
+}
 
-    fn toggle_import_claude(&mut self) {
-        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
-        let on = !g.prefs().import_claude;
-        let _ = g.set_import_claude(on);
-        drop(g);
-        self.refresh_skills();
-        self.status = if on {
-            "已引入 Claude Code 技能".into()
-        } else {
-            "已停止引入 Claude Code 技能".into()
-        };
-    }
+/// A mouse target from the last frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hit {
+    // Workbench chrome
+    Activity(u8),
+    ActivitySettings,
+    SideItem(u16),
+    SideScroll,
+    EditorTab(u16),
+    EditorTabClose(u16),
+    BottomTab(u8),
+    BottomClose,
+    BottomRow(u16),
+    OutputPick(u16),
+    ReadOnlyBar,
+    // Status bar
+    StatusTask,
+    StatusModel,
+    StatusAgents,
+    // Sessions view
+    NewChat,
+    Session(u16),
+    RenameSession(u16),
+    DeleteSession(u16),
+    // Chat
+    Chat,
+    ChatRow(u16),
+    ChatImage(u16),
+    ToolGroup(usize),
+    ToolItem(usize, usize),
+    Think(usize),
+    ToolPanel,
+    ToolPanelClose,
+    JumpBottom,
+    ScrollBar,
+    ScrollThumb,
+    // Composer
+    Composer,
+    QueueChip,
+    InsertChip,
+    PasteImage,
+    StopChip,
+    QueueItem(u16),
+    CancelQueueEdit,
+    PendingClose(u16),
+    // Overlays
+    Overlay,
+    OverlayClose,
+    AskOption(u16),
+    AskFill,
+    AskConfirm,
+    AskCancel,
+    TaskDraft,
+    TaskConfirm,
+    TaskCancel,
+    TaskEnd,
+    WsPath,
+    WsEntry(u16),
+    WsConfirm,
+    WsCreate,
+    WsCancel,
+    SkillText,
+    // Settings tab
+    SetKind(u8),
+    SetAccount,
+    SetLoginCode,
+    SetField(u8),
+    SetToggle(u8),
+    DropPick(u16),
+    SkillToggle(u16),
+    SkillRow(u16),
+}
 
-    fn toggle_import_codex(&mut self) {
-        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
-        let on = !g.prefs().import_codex;
-        let _ = g.set_import_codex(on);
-        drop(g);
-        self.refresh_skills();
-        self.status = if on {
-            "已引入 Codex 技能".into()
-        } else {
-            "已停止引入 Codex 技能".into()
-        };
-    }
+pub(crate) struct WorkspacePick {
+    pub view: FolderView,
+    pub edit: Edit,
+    pub cursor: usize,
+    pub scroll: u16,
+    pub path_focus: bool,
+    pub notice: Option<String>,
+}
 
-    fn toggle_skill(&mut self, i: usize) {
-        let Some(id) = self.skill_list.get(i).map(|s| s.id.clone()) else {
-            return;
-        };
-        let enabled = self.skill_list.get(i).map(|s| s.enabled).unwrap_or(false);
-        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = g.set_enabled(&id, !enabled);
-        drop(g);
-        self.refresh_skills();
-    }
-
-    fn open_skill_view(&mut self, i: usize) {
-        let Some(skill) = self.skill_list.get(i).cloned() else {
-            return;
-        };
-        let body = crate::skills::read_skill_file(&skill.path).unwrap_or_else(|e| e.to_string());
-        let mut edit = Edit::at_end(body);
-        edit.home(false);
-        self.skill_view = Some(SkillView {
-            title: skill.name,
-            origin: skill.origin.label().to_string(),
+impl WorkspacePick {
+    pub fn open(start: &std::path::Path) -> Self {
+        let view = folderpick::list_folder(&folderpick::existing_dir(start));
+        let edit = Edit::at_end(folderpick::display_path(&view.cwd));
+        Self {
+            view,
             edit,
+            cursor: 0,
             scroll: 0,
-            inner: Rect::default(),
-            dragging: false,
-        });
-        self.focus = Focus::Settings;
-    }
-
-    fn close_skill_view(&mut self) {
-        self.skill_view = None;
-        if self.settings.is_some() {
-            self.focus = Focus::Settings;
-        } else {
-            self.focus = Focus::Chat;
+            path_focus: true,
+            notice: None,
         }
     }
 
-    fn attach_pending(&mut self, rel: String) -> bool {
-        if self.pending.len() >= crate::vision::MAX_USER_IMAGES {
-            self.status = format!("最多 {} 張圖片", crate::vision::MAX_USER_IMAGES);
+    pub fn sync(&mut self) {
+        let fallback = self.view.cwd.clone();
+        self.view = folderpick::view_for_input(&self.edit.text, &fallback);
+        self.cursor = self.cursor.min(self.view.entries.len().saturating_sub(1));
+        self.notice = self.view.error.clone();
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        self.path_focus = false;
+        let n = self.view.entries.len() as i32;
+        self.cursor = if n == 0 {
+            0
+        } else {
+            (self.cursor as i32 + delta).clamp(0, n - 1) as usize
+        };
+    }
+
+    pub fn enter_dir(&mut self, dir: PathBuf) {
+        if !dir.is_dir() {
+            self.notice = Some("不是資料夾".into());
+            return;
+        }
+        self.view = folderpick::list_folder(&dir);
+        self.edit = Edit::at_end(folderpick::display_path(&self.view.cwd));
+        self.cursor = 0;
+        self.scroll = 0;
+        self.notice = self.view.error.clone();
+        self.path_focus = false;
+    }
+
+    /// The folder a confirm would pick.
+    pub fn target(&self) -> PathBuf {
+        let selected = self.view.entries.get(self.cursor).cloned();
+        match std::fs::canonicalize(self.edit.text.trim()) {
+            Ok(abs) if abs.is_dir() => folderpick::normalize(&abs),
+            Ok(abs) if abs.is_file() => folderpick::existing_dir(&abs),
+            _ => folderpick::workspace_of(&self.view.cwd, selected.as_ref()),
+        }
+    }
+}
+
+pub(crate) enum TaskUi {
+    Form(Edit),
+    Status,
+}
+
+pub(crate) struct SkillView {
+    pub title: String,
+    pub origin: String,
+    pub edit: Edit,
+    pub scroll: u16,
+}
+
+/// Selectable glyph run of a drawn chat line.
+pub(crate) struct GlyphLine {
+    pub y: u16,
+    pub x: u16,
+    pub text_w: u16,
+    pub row: usize,
+    pub start: usize,
+    pub chars: Vec<char>,
+}
+
+/// UI state, including where the last frame put things.
+pub(crate) struct Ui {
+    pub focus: Focus,
+    pub send_mode: SendMode,
+    pub side_open: bool,
+    pub side_view: SideView,
+    pub side_scroll: usize,
+    pub bottom: Option<BottomTab>,
+    pub bottom_scroll: usize,
+    /// Settings editor tab open / shown.
+    pub settings_open: bool,
+    pub settings_active: bool,
+    pub rename: Option<(String, Edit)>,
+    pub workspace_pick: Option<WorkspacePick>,
+    pub task_ui: Option<TaskUi>,
+    pub image_view: Option<String>,
+    pub skill_view: Option<SkillView>,
+    /// Monitor shown in the inspector overlay.
+    pub inspector: Option<String>,
+    // Layout of the last frame.
+    pub area: Rect,
+    pub hits: Vec<(Rect, Hit)>,
+    pub chat_inner: Rect,
+    pub chat_bar: Rect,
+    pub chat_total: u16,
+    pub chat_max_off: u16,
+    pub chat_glyphs: Vec<GlyphLine>,
+    pub image_hits: Vec<String>,
+    /// Live think headers (row index, rect) for clock patches.
+    pub think_clocks: Vec<(usize, Rect)>,
+    pub composer_frame: Rect,
+    pub composer_inner: Rect,
+    pub composer_vscroll: u16,
+    pub composer_snap: Option<Buffer>,
+    pub status_bar: Rect,
+    pub side_area: Rect,
+    pub bottom_area: Rect,
+    pub field_inner: Rect,
+    pub skill_inner: Rect,
+    pub last_caret: Position,
+    pub last_clock_cells: Vec<(u16, u16, Cell)>,
+    // Pointer drags.
+    pub chat_dragging: bool,
+    pub input_dragging: bool,
+    pub skill_dragging: bool,
+    pub scroll_grab: Option<i16>,
+    /// Side items of the last frame (what `Hit::SideItem(i)` means).
+    pub side_items: Vec<SideItem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SideItem {
+    Root,
+    Agent(String),
+    Change { view: String, row: usize, call: usize },
+    Background(String),
+    Monitor(String),
+    OpenTask,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self {
+            focus: Focus::Chat,
+            send_mode: SendMode::Queue,
+            side_open: true,
+            side_view: SideView::Sessions,
+            side_scroll: 0,
+            bottom: None,
+            bottom_scroll: 0,
+            settings_open: false,
+            settings_active: false,
+            rename: None,
+            workspace_pick: None,
+            task_ui: None,
+            image_view: None,
+            skill_view: None,
+            inspector: None,
+            area: Rect::default(),
+            hits: Vec::new(),
+            chat_inner: Rect::default(),
+            chat_bar: Rect::default(),
+            chat_total: 0,
+            chat_max_off: 0,
+            chat_glyphs: Vec::new(),
+            image_hits: Vec::new(),
+            think_clocks: Vec::new(),
+            composer_frame: Rect::default(),
+            composer_inner: Rect::default(),
+            composer_vscroll: 0,
+            composer_snap: None,
+            status_bar: Rect::default(),
+            side_area: Rect::default(),
+            bottom_area: Rect::default(),
+            field_inner: Rect::default(),
+            skill_inner: Rect::default(),
+            last_caret: Position::ORIGIN,
+            last_clock_cells: Vec::new(),
+            chat_dragging: false,
+            input_dragging: false,
+            skill_dragging: false,
+            scroll_grab: None,
+            side_items: Vec::new(),
+        }
+    }
+}
+
+/// Image previews: terminal graphics protocol and cached renderings.
+pub(crate) struct Images {
+    pub picker: Option<Picker>,
+    pub halfblocks: HashMap<(String, u16), Vec<ratatui::text::Line<'static>>>,
+    pub protos: HashMap<(String, u16, u16), Protocol>,
+    pub cells: HashMap<(String, u16, u16), (u16, u16)>,
+    pub blits: Vec<crate::preview::GraphicBlit>,
+    pub last_blits: Vec<crate::preview::GraphicBlit>,
+}
+
+impl Images {
+    pub fn new(picker: Option<Picker>) -> Self {
+        Self {
+            picker,
+            halfblocks: HashMap::new(),
+            protos: HashMap::new(),
+            cells: HashMap::new(),
+            blits: Vec::new(),
+            last_blits: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.halfblocks.clear();
+        self.protos.clear();
+        self.cells.clear();
+        self.blits.clear();
+        self.last_blits.clear();
+    }
+}
+
+/// What the web mirror was last sent.
+#[derive(Default)]
+pub(crate) struct WebSync {
+    pub receipts: Vec<(String, String)>,
+    pub sent: HashMap<String, Vec<u64>>,
+    pub cache: HashMap<u64, crate::hub::UiRow>,
+    pub url: Option<String>,
+    /// Composer edits from the terminal / from the browser.
+    pub composer_seq: u64,
+    pub web_composer_seq: u64,
+}
+
+/// Runtime handles the app uses to start agent runs.
+#[derive(Clone)]
+pub(crate) struct Rt {
+    pub sink: Arc<FanoutSink>,
+    pub done_tx: mpsc::UnboundedSender<(String, RunOutcome)>,
+}
+
+impl Rt {
+    /// Handles that go nowhere (tests).
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        let (done_tx, _) = mpsc::unbounded_channel();
+        Self {
+            sink: Arc::new(FanoutSink { sinks: vec![] }),
+            done_tx,
+        }
+    }
+}
+
+pub(crate) struct App {
+    pub opts: TuiOptions,
+    pub knobs: Arc<Mutex<SessionKnobs>>,
+    pub skills: Arc<Mutex<SkillStore>>,
+    pub store: Option<SessionStore>,
+    pub launch_workspace: PathBuf,
+    pub sessions: HashMap<String, Session>,
+    pub current: String,
+    /// Session list for the side bar, newest first.
+    pub listed: Vec<SessionMeta>,
+    listed_at: Option<Instant>,
+    pub settings: Settings,
+    pub ui: Ui,
+    pub images: Images,
+    pub web: WebSync,
+    pub tick: u8,
+    pub rt: Rt,
+}
+
+const LIST_REFRESH: Duration = Duration::from_secs(3);
+
+impl App {
+    pub fn new(
+        opts: TuiOptions,
+        store: Option<SessionStore>,
+        boot: Session,
+        settings: Settings,
+        skills: Arc<Mutex<SkillStore>>,
+        rt: Rt,
+        picker: Option<Picker>,
+    ) -> Self {
+        let knobs = Arc::new(Mutex::new(SessionKnobs {
+            model: opts.model.clone(),
+            reasoning_effort: opts.reasoning_effort,
+            send_reasoning: true,
+            server_tools: crate::kit::search_tools(opts.web_search),
+            dispatcher: opts.dispatcher,
+            child_model: opts.child_model.clone(),
+        }));
+        let current = boot.id().to_string();
+        let launch_workspace = opts.workspace.clone();
+        let mut sessions = HashMap::new();
+        sessions.insert(current.clone(), boot);
+        let mut app = Self {
+            opts,
+            knobs,
+            skills,
+            store,
+            launch_workspace,
+            sessions,
+            current,
+            listed: Vec::new(),
+            listed_at: None,
+            settings,
+            ui: Ui::default(),
+            images: Images::new(picker),
+            web: WebSync::default(),
+            tick: 0,
+            rt,
+        };
+        app.refresh_list(true);
+        app
+    }
+
+    pub fn cur(&self) -> &Session {
+        self.sessions.get(&self.current).expect("current session is loaded")
+    }
+
+    pub fn cur_mut(&mut self) -> &mut Session {
+        self.sessions.get_mut(&self.current).expect("current session is loaded")
+    }
+
+    /// Show a short status on the visible chat.
+    pub fn flash(&mut self, msg: impl Into<String>) {
+        self.cur_mut().chat.status = msg.into();
+    }
+
+    pub fn workspace(&self) -> PathBuf {
+        self.cur().meta.workspace.clone()
+    }
+
+    // —— Sessions ——
+
+    /// Rebuild the side-bar list from the store plus loaded sessions.
+    pub fn refresh_list(&mut self, force: bool) {
+        if !force && self.listed_at.is_some_and(|t| t.elapsed() < LIST_REFRESH) {
+            return;
+        }
+        self.listed_at = Some(Instant::now());
+        let mut by_id: HashMap<String, SessionMeta> = HashMap::new();
+        if let Some(list) = self.store.as_ref().and_then(|s| s.list().ok()) {
+            for s in list {
+                by_id.insert(s.id.clone(), s);
+            }
+        }
+        for s in self.sessions.values() {
+            by_id.insert(s.meta.id.clone(), s.meta.clone());
+        }
+        let mut list: Vec<SessionMeta> = by_id.into_values().collect();
+        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        self.listed = list;
+    }
+
+    fn load_session(&self, id: &str) -> Session {
+        let store = self.store.as_ref();
+        let meta = store.and_then(|s| s.load_meta(id).ok()).unwrap_or_else(|| {
+            let mut m = SessionMeta::new(self.launch_workspace.clone());
+            m.id = id.to_string();
+            m
+        });
+        let rows: Vec<Row> = store
+            .and_then(|s| s.load_transcript(id).ok())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let task = TaskHub::from_state(
+            id,
+            store
+                .and_then(|s| s.load_task::<crate::task::TaskState>(id))
+                .unwrap_or_default(),
+        );
+        let mut s = Session::new(meta, rows, task);
+        s.agents = store
+            .and_then(|st| st.load_agents::<Vec<SavedAgent>>(id))
+            .map(AgentTree::restore)
+            .unwrap_or_default();
+        s
+    }
+
+    /// Save a session's transcript / agents if they changed.
+    pub fn persist(&mut self, id: &str) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        if s.dirty {
+            s.dirty = false;
+            if let Ok(rows) = serde_json::to_value(&s.chat.rows) {
+                let _ = store.save_transcript(&s.meta.id, &rows);
+            }
+            s.meta.updated_at = chrono::Utc::now();
+            let _ = store.save_meta(&s.meta);
+        }
+        if s.agents.dirty {
+            s.agents.dirty = false;
+            let _ = store.save_agents(&s.meta.id, &s.agents.saved());
+        }
+    }
+
+    pub fn persist_all(&mut self) {
+        let ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for id in ids {
+            self.persist(&id);
+        }
+    }
+
+    fn after_session_change(&mut self) {
+        self.ui.image_view = None;
+        self.ui.inspector = None;
+        self.ui.task_ui = None;
+        self.ui.composer_vscroll = 0;
+        self.ui.scroll_grab = None;
+        self.ui.settings_active = false;
+        self.images.clear();
+        self.refresh_list(true);
+    }
+
+    pub fn switch_to(&mut self, id: &str) {
+        if id == self.current {
+            return;
+        }
+        let cur = self.current.clone();
+        self.persist(&cur);
+        if !self.sessions.contains_key(id) {
+            let loaded = self.load_session(id);
+            self.sessions.insert(id.to_string(), loaded);
+        }
+        self.current = id.to_string();
+        self.after_session_change();
+    }
+
+    pub fn begin_new_chat(&mut self) {
+        self.cancel_rename();
+        let start = if self.cur().meta.workspace.as_os_str().is_empty() {
+            self.launch_workspace.clone()
+        } else {
+            self.cur().meta.workspace.clone()
+        };
+        self.ui.workspace_pick = Some(WorkspacePick::open(&start));
+    }
+
+    pub fn create_chat(&mut self, workspace: PathBuf) {
+        let workspace = folderpick::existing_dir(&workspace);
+        self.launch_workspace = workspace.clone();
+        if self.cur().is_blank() {
+            let Self { store, sessions, current, .. } = self;
+            let s = sessions.get_mut(current.as_str()).expect("current session");
+            s.meta.workspace = workspace.clone();
+            s.meta.updated_at = chrono::Utc::now();
+            if let Some(st) = store.as_ref() {
+                let _ = st.save_meta(&s.meta);
+            }
+            self.flash(format!("工作目錄  {}", folderpick::display_path(&workspace)));
+            return;
+        }
+        let cur = self.current.clone();
+        self.persist(&cur);
+        let meta = match &self.store {
+            Some(st) => st
+                .create(workspace.clone())
+                .unwrap_or_else(|_| SessionMeta::new(workspace.clone())),
+            None => SessionMeta::new(workspace.clone()),
+        };
+        let id = meta.id.clone();
+        let task = TaskHub::new(id.clone());
+        self.sessions.insert(id.clone(), Session::new(meta, intro_rows(), task));
+        self.current = id;
+        self.after_session_change();
+        self.flash(format!("工作目錄  {}", folderpick::display_path(&workspace)));
+    }
+
+    pub fn delete_session(&mut self, id: &str) {
+        self.cancel_rename();
+        if let Some(mut s) = self.sessions.remove(id) {
+            s.cancel_ask();
+            // Dropping the inbox ends the run; its nursery kills the children.
+            s.inbox = None;
+        }
+        if let Some(store) = &self.store {
+            let _ = store.delete(id);
+        }
+        self.refresh_list(true);
+        if id != self.current {
+            return;
+        }
+        let next = self.listed.iter().map(|m| m.id.clone()).find(|n| n != id);
+        match next {
+            Some(n) => {
+                if !self.sessions.contains_key(&n) {
+                    let loaded = self.load_session(&n);
+                    self.sessions.insert(n.clone(), loaded);
+                }
+                self.current = n;
+            }
+            None => {
+                let ws = self.launch_workspace.clone();
+                let meta = match &self.store {
+                    Some(st) => st.create(ws.clone()).unwrap_or_else(|_| SessionMeta::new(ws)),
+                    None => SessionMeta::new(ws),
+                };
+                let nid = meta.id.clone();
+                let task = TaskHub::new(nid.clone());
+                self.sessions.insert(nid.clone(), Session::new(meta, intro_rows(), task));
+                self.current = nid;
+            }
+        }
+        self.after_session_change();
+    }
+
+    /// LLM-suggested title (ignored after a manual rename).
+    pub fn apply_title(&mut self, id: &str, name: &str) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            match &self.store {
+                Some(st) => {
+                    let _ = st.touch_name(&mut s.meta, name.to_string(), true);
+                }
+                None if !s.meta.name_is_manual => {
+                    s.meta.name = session::sanitize_title(name);
+                    s.meta.named = true;
+                }
+                None => {}
+            }
+        }
+        self.refresh_list(true);
+    }
+
+    pub fn begin_rename(&mut self, id: &str) {
+        let name = self
+            .listed
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "新對話".into());
+        self.ui.rename = Some((id.to_string(), Edit::at_end(name)));
+        self.ui.focus = Focus::Rename;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.ui.rename = None;
+        if self.ui.focus == Focus::Rename {
+            self.ui.focus = Focus::Chat;
+        }
+    }
+
+    pub fn commit_rename(&mut self) {
+        let Some((id, edit)) = self.ui.rename.take() else {
+            return;
+        };
+        if self.ui.focus == Focus::Rename {
+            self.ui.focus = Focus::Chat;
+        }
+        let name = session::sanitize_title(&edit.text);
+        if !name.is_empty() {
+            self.rename_manual(&id, &name);
+        }
+    }
+
+    pub fn rename_manual(&mut self, id: &str, name: &str) {
+        match (self.sessions.get_mut(id), &self.store) {
+            (Some(s), Some(st)) => {
+                let _ = st.rename_manual(&mut s.meta, name.to_string());
+            }
+            (Some(s), None) => {
+                s.meta.name = name.to_string();
+                s.meta.named = true;
+                s.meta.name_is_manual = true;
+            }
+            (None, Some(st)) => {
+                if let Ok(mut meta) = st.load_meta(id) {
+                    let _ = st.rename_manual(&mut meta, name.to_string());
+                }
+            }
+            (None, None) => {}
+        }
+        self.refresh_list(true);
+    }
+
+    // —— Events ——
+
+    pub fn route_event(&mut self, ev: AgentEvent) {
+        let sid = ev.session_id().to_string();
+        if let AgentEvent::SessionNamed { name, .. } = &ev {
+            self.apply_title(&sid, name);
+            return;
+        }
+        let visible = sid == self.current;
+        let Some(s) = self.sessions.get_mut(&sid) else {
+            return;
+        };
+        let routed = s.route(ev, visible);
+        if routed.ask_opened && visible {
+            self.ui.focus = Focus::Chat;
+            self.ui.settings_active = false;
+        }
+        if routed.run_finished {
+            self.persist(&sid);
+        }
+    }
+
+    pub fn finish_run(&mut self, id: &str, out: RunOutcome) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.finish_run(out.turns);
+        }
+        self.persist(id);
+    }
+
+    // —— Sending ——
+
+    /// Composer submit (Enter; Ctrl+Enter forces insert).
+    pub fn submit_current(&mut self, force_insert: bool) {
+        let Some(turn) = self.cur_mut().take_turn() else {
+            return;
+        };
+        let mode = if force_insert { SendMode::Insert } else { self.ui.send_mode };
+        let s = self.cur();
+        match submit_kind(s.inbox.is_some(), s.chat.running, mode) {
+            Submit::Queue => {
+                let q = Queued {
+                    text: turn.text.clone(),
+                    images: user_row(&turn).images,
+                };
+                self.cur_mut().queue.push_back(q);
+            }
+            Submit::Start | Submit::Insert => self.start_or_send(turn, true),
+        }
+    }
+
+    /// Send into the running session, or start one.
+    pub fn start_or_send(&mut self, turn: UserTurn, echo: bool) {
+        if echo {
+            self.cur_mut().chat.push(Row::User(user_row(&turn)));
+        }
+        self.snapshot_conn();
+        self.adopt_route_for_model();
+        if !self.settings.logged_in {
+            let msg = self.not_ready_message();
+            self.cur_mut().chat.push(Row::Err(msg));
+            return;
+        }
+        self.cur_mut().chat.mark_work_start();
+        let id = self.current.clone();
+        if let Some(tx) = self.cur().inbox.clone() {
+            let _ = tx.send(turn);
+            let s = self.cur_mut();
+            s.chat.running = true;
+            s.chat.awaiting = false;
+            s.chat.status = "工作中".into();
+            s.dirty = true;
+            self.persist(&id);
+            return;
+        }
+        if !self.cur().meta.named {
+            let fallback = if task::is_kick(&turn.text) {
+                "任務模式".to_string()
+            } else {
+                session::title_fallback_from_user_text(&turn.text)
+            };
+            let Self { store, sessions, current, .. } = self;
+            let meta = &mut sessions.get_mut(current.as_str()).expect("current session").meta;
+            match store.as_ref() {
+                Some(st) => {
+                    let _ = st.touch_name(meta, fallback, false);
+                }
+                None => {
+                    meta.name = fallback;
+                    meta.named = true;
+                }
+            }
+            super::runtime::spawn_title(&self.rt.sink, &id, self.settings.conn.clone(), &self.opts.model, &turn.text);
+        }
+        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        let cancel = CancelFlag::new();
+        let ask = AskUserHub::new();
+        let s = self.cur_mut();
+        s.dirty = true;
+        s.chat.running = true;
+        s.chat.awaiting = false;
+        s.chat.status = "工作中".into();
+        s.inbox = Some(inbox_tx);
+        s.cancel = Some(cancel.clone());
+        s.ask_hub = Some(ask.clone());
+        let task = s.task.clone();
+        let workspace = s.meta.workspace.clone();
+        self.persist(&id);
+        self.refresh_list(true);
+        let mut opts = self.opts.clone();
+        opts.workspace = workspace;
+        if self.settings.conn.route_for(&opts.model).is_openai() {
+            opts.web_search = false;
+        }
+        super::runtime::spawn_run(super::runtime::RunSpec {
+            opts,
+            turn,
+            rt: self.rt.clone(),
+            knobs: self.knobs.clone(),
+            skills: self.skills.clone(),
+            inbox: inbox_rx,
+            run_id: id,
+            ask,
+            cancel,
+            task,
+            cfg: self.settings.conn.clone(),
+        });
+    }
+
+    /// Start the queue's head when no run is alive.
+    pub fn kick_idle_queue(&mut self) {
+        let s = self.cur();
+        if s.queue_edit.is_some() || s.chat.running || s.inbox.is_some() || s.queue.is_empty() {
+            return;
+        }
+        let msg = self.cur_mut().queue.pop_front().expect("checked");
+        self.start_or_send(msg.into_turn(), true);
+    }
+
+    /// Deliver queued messages in every session that is waiting.
+    pub fn flush_queues(&mut self) {
+        for s in self.sessions.values_mut() {
+            if s.flush_queue() {
+                s.dirty = true;
+            }
+        }
+    }
+
+    pub fn interrupt(&mut self) -> bool {
+        self.cur_mut().interrupt()
+    }
+
+    // —— Attachments & clipboard ——
+
+    pub fn attach_pending(&mut self, rel: String) -> bool {
+        let s = self.cur_mut();
+        if s.pending.len() >= crate::vision::MAX_USER_IMAGES {
+            let msg = format!("最多 {} 張圖片", crate::vision::MAX_USER_IMAGES);
+            self.flash(msg);
             return false;
         }
-        if self.pending.iter().any(|p| p == &rel) {
-            return true;
+        if !s.pending.contains(&rel) {
+            s.pending.push(rel);
         }
-        self.pending.push(rel);
         true
     }
 
     fn ingest_paths(&mut self, paths: &[PathBuf]) -> usize {
+        let ws = self.workspace();
         let mut n = 0;
         for p in paths {
-            match crate::vision::ingest_image_file(&self.session.workspace, p) {
+            match crate::vision::ingest_image_file(&ws, p) {
                 Ok(rel) => {
                     if self.attach_pending(rel) {
                         n += 1;
                     }
                 }
-                Err(e) => self.status = format!("無法加入圖片: {e}"),
+                Err(e) => self.flash(format!("無法加入圖片: {e}")),
             }
         }
         n
     }
 
-    fn paste_text_or_images(&mut self, s: &str) {
-        let dropped = crate::vision::parse_image_drop(s);
-        if !dropped.is_empty() {
-            let n = self.ingest_paths(&dropped);
-            if n > 0 {
-                self.status = format!("已附上 {n} 張圖片");
-                return;
-            }
-        }
-        self.edit.insert_str(s);
-    }
-
-    /// Bracketed paste from the terminal. Empty payloads still read the OS
-    /// clipboard so Ctrl+V of a bitmap/file is not dropped on the floor.
-    fn paste_from_terminal(&mut self, s: &str) {
-        let dropped = crate::vision::parse_image_drop(s);
-        if !dropped.is_empty() {
-            let n = self.ingest_paths(&dropped);
-            if n > 0 {
-                self.status = format!("已附上 {n} 張圖片");
-                return;
-            }
-        }
-        if s.trim().is_empty() {
-            self.paste_clipboard();
-            return;
-        }
-        self.edit.insert_str(s);
-    }
-
     fn ingest_clipboard_images(&mut self) -> bool {
         if let Some(img) = crate::clipimg::read_image() {
-            match crate::vision::save_user_image(&self.session.workspace, &img) {
+            return match crate::vision::save_user_image(&self.workspace(), &img) {
                 Ok(rel) => {
-                    if self.attach_pending(rel) {
-                        self.status = "已貼上圖片".into();
-                        return true;
+                    let ok = self.attach_pending(rel);
+                    if ok {
+                        self.flash("已貼上圖片");
                     }
-                    return false;
+                    ok
                 }
                 Err(e) => {
-                    self.status = format!("無法貼上圖片: {e}");
-                    return false;
+                    self.flash(format!("無法貼上圖片: {e}"));
+                    false
                 }
-            }
+            };
         }
         let files = crate::clipimg::read_image_files();
         if files.is_empty() {
@@ -674,1062 +977,369 @@ impl App {
         }
         let n = self.ingest_paths(&files);
         if n > 0 {
-            self.status = format!("已附上 {n} 張圖片");
-            true
-        } else {
-            false
+            self.flash(format!("已附上 {n} 張圖片"));
         }
+        n > 0
     }
 
-    fn paste_image(&mut self) {
+    /// "貼上圖片" button: clipboard image or copied image files.
+    pub fn paste_image(&mut self) {
         if !self.ingest_clipboard_images() {
-            self.status = "剪貼簿沒有圖片 — 先複製截圖或圖片檔，再點「貼上圖片」".into();
+            self.flash("剪貼簿沒有圖片 — 先複製截圖或圖片檔，再點「貼上圖片」");
         }
     }
 
-    fn paste_clipboard(&mut self) {
+    /// Text pasted into the composer; dropped image paths become attachments.
+    pub fn paste_text(&mut self, s: &str) {
+        let dropped = crate::vision::parse_image_drop(s);
+        if !dropped.is_empty() {
+            let n = self.ingest_paths(&dropped);
+            if n > 0 {
+                self.flash(format!("已附上 {n} 張圖片"));
+                return;
+            }
+        }
+        self.cur_mut().draft.insert_str(s);
+    }
+
+    /// Bracketed paste. An empty payload (Ctrl+V of a bitmap) reads the clipboard.
+    pub fn paste_from_terminal(&mut self, s: &str) {
+        if s.trim().is_empty() && crate::vision::parse_image_drop(s).is_empty() {
+            self.paste_clipboard();
+        } else {
+            self.paste_text(s);
+        }
+    }
+
+    pub fn paste_clipboard(&mut self) {
         if self.ingest_clipboard_images() {
             return;
         }
         if let Some(s) = clipboard_get() {
-            self.paste_text_or_images(&s);
+            self.paste_text(&s);
         }
     }
 
-    fn copy_selection(&mut self) -> bool {
-        if let Some(view) = self.skill_view.as_ref() {
-            if let Some(s) = view.edit.selected_text() {
-                if clipboard_set(&s) {
-                    self.status = "已複製".into();
-                } else {
-                    self.status = "無法複製到剪貼簿".into();
-                }
-                return true;
-            }
+    /// Ctrl+C: copy the selection. `false` = nothing selected.
+    pub fn copy_selection(&mut self) -> bool {
+        let text = if let Some(v) = &self.ui.skill_view {
+            v.edit.selected_text()
+        } else {
+            None
         }
-        if self.edit.has_sel() {
-            if let Some(s) = self.edit.selected_text() {
-                if clipboard_set(&s) {
-                    self.status = "已複製".into();
-                } else {
-                    self.status = "無法複製到剪貼簿".into();
-                }
-                return true;
-            }
+        .or_else(|| self.cur().draft.selected_text());
+        if let Some(text) = text {
+            let msg = if clipboard_set(&text) { "已複製" } else { "無法複製到剪貼簿" };
+            self.flash(msg);
+            return true;
         }
-        match &self.chat_sel {
+        let sel = self.cur().view().sel;
+        match sel {
             ChatSel::Image(rel) => {
-                let abs = self.session.workspace.join(rel);
-                if clipboard_set_image(&abs) {
-                    self.status = "已複製圖片".into();
-                } else if clipboard_set(rel) {
-                    self.status = "已複製路徑".into();
+                let abs = self.workspace().join(&rel);
+                let msg = if clipboard_set_image(&abs) {
+                    "已複製圖片"
+                } else if clipboard_set(&rel) {
+                    "已複製路徑"
                 } else {
-                    self.status = "無法複製到剪貼簿".into();
-                }
+                    "無法複製到剪貼簿"
+                };
+                self.flash(msg);
                 true
             }
             ChatSel::Text { .. } => {
-                let Some(text) = chat_selected_text(&self.rows, &self.chat_sel) else {
-                    return false;
-                };
-                if text.is_empty() {
-                    return false;
+                let text = super::ui::chat::selected_text(&self.cur().view_transcript().rows, &sel);
+                match text.filter(|t| !t.is_empty()) {
+                    Some(t) => {
+                        let msg = if clipboard_set(&t) { "已複製" } else { "無法複製到剪貼簿" };
+                        self.flash(msg);
+                        true
+                    }
+                    None => false,
                 }
-                if clipboard_set(&text) {
-                    self.status = "已複製".into();
-                } else {
-                    self.status = "無法複製到剪貼簿".into();
-                }
-                true
             }
             ChatSel::None => false,
         }
     }
 
-    fn take_turn(&mut self) -> Option<UserTurn> {
-        let text = self.edit.text.trim().to_string();
-        let images: Vec<PathBuf> = self.pending.drain(..).map(PathBuf::from).collect();
-        if text.is_empty() && images.is_empty() {
-            return None;
-        }
-        self.edit.clear();
-        Some(UserTurn { text, images })
+    pub fn open_image(&mut self, rel: String) {
+        self.cur_mut().view_mut().sel = ChatSel::Image(rel.clone());
+        self.ui.image_view = Some(rel);
     }
 
-    fn finish_open_think(&mut self) {
-        for r in self.rows.iter_mut().rev() {
-            if let Row::Think(t) = r {
-                if !t.done {
-                    if let Some(start) = t.started.take() {
-                        t.elapsed_ms = start.elapsed().as_millis() as u64;
-                    }
-                    t.done = true;
-                }
-                return;
-            }
-        }
-    }
+    // —— Task mode ——
 
-    fn mark_work_start(&mut self) {
-        if self.work_started.is_none() {
-            self.work_started = Some(Instant::now());
-        }
-    }
-
-    fn stamp_work(&mut self) {
-        let Some(start) = self.work_started.take() else {
-            return;
-        };
-        let ms = start.elapsed().as_millis() as u64;
-        for r in self.rows.iter_mut().rev() {
-            if let Row::Agent(a) = r {
-                a.work_ms = ms;
-                return;
-            }
-        }
-        self.push(Row::Meta(format!("工作 {}", md::fmt_duration(ms))));
-    }
-
-    fn append_think(&mut self, delta: &str) {
-        self.activity = "思考中".into();
-        self.streaming = false;
-        if let Some(Row::Think(t)) = self.rows.last_mut() {
-            if !t.done {
-                t.text.push_str(delta);
-                if t.started.is_none() {
-                    t.started = Some(Instant::now());
-                }
-                if self.stick_bottom {
-                    self.scroll = 0;
-                }
-                return;
-            }
-        }
-        self.push(Row::Think(Think {
-            text: delta.to_string(),
-            expanded: false,
-            done: false,
-            elapsed_ms: 0,
-            started: Some(Instant::now()),
-        }));
-    }
-
-    fn push_tool_start(&mut self, call_id: String, name: String, args: Value) {
-        let call = ToolCall {
-            call_id,
-            name,
-            args,
-            output: String::new(),
-            files: Vec::new(),
-            done: false,
-            phase: "執行中".into(),
-        };
-        let fresh = self.seal_tools || !matches!(self.rows.last(), Some(Row::Tools(_)));
-        if fresh {
-            self.push(Row::Tools(ToolGroup {
-                calls: vec![call],
-                expanded: false,
-            }));
-            self.seal_tools = false;
-        } else if let Some(Row::Tools(g)) = self.rows.last_mut() {
-            g.calls.push(call);
-        }
-    }
-
-    fn finish_tool(&mut self, call_id: &str, name: &str, output: String) {
-        // Match by call id anywhere in the transcript first; fall back to the
-        // newest group by name for rows restored from before call ids existed.
-        let by_id = if call_id.is_empty() {
-            None
+    pub fn open_task(&mut self) {
+        let phase = self.cur().task.snapshot().phase;
+        self.ui.task_ui = Some(if phase.is_live() || matches!(phase, TaskPhase::Done | TaskPhase::Failed) {
+            TaskUi::Status
         } else {
-            self.rows.iter().rposition(|r| {
-                matches!(r, Row::Tools(g) if g.calls.iter().any(|c| c.call_id == call_id))
-            })
-        };
-        let group = by_id.or_else(|| self.rows.iter().rposition(|r| matches!(r, Row::Tools(_))));
-        let Some(Row::Tools(g)) = group.and_then(|i| self.rows.get_mut(i)) else {
-            return;
-        };
-        let idx = (!call_id.is_empty())
-            .then(|| g.calls.iter().rposition(|c| c.call_id == call_id))
-            .flatten()
-            .or_else(|| g.calls.iter().rposition(|c| c.name == name && !c.done))
-            .or_else(|| g.calls.iter().rposition(|c| !c.done))
-            .or_else(|| g.calls.len().checked_sub(1));
-        if let Some(i) = idx {
-            let c = &mut g.calls[i];
-            c.done = true;
-            c.phase = tool_phase(name, &output).into();
-            c.files.extend(parse_file_changes(&output));
-            c.output = output;
-        }
-    }
-
-    fn mark_spawn_tool_done(&mut self, child_name: &str) {
-        let Some(g) = self.rows.iter_mut().rev().find_map(|r| match r {
-            Row::Tools(g) => Some(g),
-            _ => None,
-        }) else {
-            return;
-        };
-        for c in g.calls.iter_mut().rev() {
-            if c.name != "spawn_agent" || c.done {
-                continue;
-            }
-            let matches = serde_json::from_str::<Value>(&c.output)
-                .ok()
-                .and_then(|v| {
-                    v.get("name")
-                        .and_then(Value::as_str)
-                        .map(|n| n == child_name)
-                })
-                .unwrap_or(false);
-            if matches {
-                c.done = true;
-                c.phase = "完成".into();
-                break;
-            }
-        }
-    }
-
-    fn observe_server(&mut self, kind: &str, payload: Value) {
-        let name = canonical_server_tool(kind);
-        let phase = server_phase(kind, &payload);
-        let query = server_query(&payload);
-        self.activity = if query.is_empty() {
-            format!("{name}  {phase}")
-        } else {
-            format!("{name}  {phase}  {query}")
-        };
-
-        let mut args = payload;
-        if args.get("query").is_none() && !query.is_empty() {
-            args["query"] = Value::String(query.clone());
-        }
-        let done = phase_is_done(&phase);
-
-        if !self.seal_tools {
-            if let Some(Row::Tools(g)) = self.rows.last_mut() {
-                if let Some(c) = g.calls.iter_mut().rev().find(|c| c.name == name) {
-                    if !query.is_empty() {
-                        c.args["query"] = Value::String(query);
-                    }
-                    c.phase = phase.clone();
-                    c.output = server_tool_line(kind, &c.args);
-                    c.done = done;
-                    return;
-                }
-            }
-        }
-
-        let output = server_tool_line(kind, &args);
-        let call = ToolCall {
-            call_id: String::new(),
-            name,
-            args,
-            output,
-            files: Vec::new(),
-            done,
-            phase,
-        };
-        let fresh = self.seal_tools || !matches!(self.rows.last(), Some(Row::Tools(_)));
-        if fresh {
-            self.push(Row::Tools(ToolGroup {
-                calls: vec![call],
-                expanded: false,
-            }));
-            self.seal_tools = false;
-        } else if let Some(Row::Tools(g)) = self.rows.last_mut() {
-            g.calls.push(call);
-        }
-    }
-
-    fn mark_open_server_done(&mut self) {
-        if let Some(Row::Tools(g)) = self.rows.last_mut() {
-            for c in &mut g.calls {
-                if !c.done && (c.name == "web_search" || c.name == "x_search") {
-                    c.done = true;
-                    if c.phase != "完成" {
-                        c.phase = "完成".into();
-                    }
-                }
-            }
-        }
-    }
-
-    fn attach_file(&mut self, file: FileChange) {
-        let Some(g) = self.rows.iter_mut().rev().find_map(|r| match r {
-            Row::Tools(g) => Some(g),
-            _ => None,
-        }) else {
-            return;
-        };
-        if let Some(c) = g.calls.last_mut() {
-            if !c.files.iter().any(|f| f.path == file.path) {
-                c.files.push(file);
-            }
-        }
-    }
-
-    fn dismiss_tool_ui(&mut self) -> bool {
-        if self.open_tool.take().is_some() {
-            return true;
-        }
-        let mut any = false;
-        for r in &mut self.rows {
-            if let Row::Tools(g) = r {
-                if g.expanded {
-                    g.expanded = false;
-                    any = true;
-                }
-            }
-            if let Row::Think(t) = r {
-                if t.expanded {
-                    t.expanded = false;
-                    any = true;
-                }
-            }
-        }
-        any
-    }
-
-    fn cancel_ask(&mut self) {
-        let id = self.current_id.clone();
-        self.cancel_session_ask(&id);
-    }
-
-    /// Stop working child agents while the main agent itself is idle. The
-    /// session ignores Esc while paused, so only the nursery reacts to the trip.
-    fn interrupt_children(&mut self) -> bool {
-        if self.running || self.bench.live_count() == 0 {
-            return false;
-        }
-        let Some(c) = &self.cancel else {
-            return false;
-        };
-        c.trip();
-        self.bench.log_event("", "agent", "中斷工作中的子代理".into());
-        self.status = "已中斷子代理".into();
-        true
-    }
-
-    fn interrupt_work(&mut self) -> bool {
-        if !self.running {
-            return self.interrupt_children();
-        }
-        if let Some(c) = &self.cancel {
-            c.trip();
-        }
-        self.cancel_ask();
-        self.streaming = false;
-        self.finish_open_think();
-        self.activity = "中斷中".into();
-        self.status = "中斷中".into();
-        true
-    }
-
-    fn cancel_session_ask(&mut self, id: &str) {
-        if let Some(h) = self.ask_hubs.get(id) {
-            h.cancel();
-        }
-        if id == self.current_id {
-            self.ask_hub.cancel();
-            if self.ask.take().is_some() {
-                if self.focus == Focus::Ask {
-                    self.focus = Focus::Chat;
-                }
-                self.status = "已取消問卷".into();
-            }
-        }
-    }
-
-    fn bind_ask_hub(&mut self) {
-        self.ask_hub = self
-            .ask_hubs
-            .get(&self.current_id)
-            .cloned()
-            .unwrap_or_else(AskUserHub::new);
-    }
-
-    fn attach_ask_hub(&mut self, run_id: &str) -> AskUserHub {
-        let hub = AskUserHub::new();
-        self.ask_hubs.insert(run_id.to_string(), hub.clone());
-        self.ask_hub = hub.clone();
-        hub
-    }
-
-    fn submit_ask(&mut self) {
-        let Some(mut ask) = self.ask.take() else {
-            return;
-        };
-        let mut values = ask.values.clone();
-        if ask.filling {
-            if let Some(slot) = values.get_mut(ask.cursor) {
-                *slot = ask.fill_edit.text.chars().take(ask::MAX_INPUT).collect();
-            }
-        }
-        match ask::answer_from_picks(&ask.question, &ask.chosen, &values) {
-            Ok(body) => {
-                ask.values = values;
-                let summary = ask.summary();
-                self.ask_hub.answer(body);
-                self.push(Row::Meta(summary));
-                self.focus = Focus::Chat;
-                self.status = "已回答".into();
-            }
-            Err(msg) => {
-                self.status = msg;
-                self.ask = Some(ask);
-                self.focus = Focus::Ask;
-            }
-        }
-    }
-
-    fn activate_ask_option(&mut self, index: usize, submit_if_ready: bool) {
-        let Some(ask) = self.ask.as_mut() else {
-            return;
-        };
-        if index >= ask.n() {
-            return;
-        }
-        ask.save_fill();
-        ask.cursor = index;
-        let input = ask.question.options.get(index).is_some_and(|o| o.input);
-        ask.mark_cursor();
-        if input {
-            ask.enter_fill();
-            return;
-        }
-        if submit_if_ready && !ask.question.allow_multiple {
-            self.submit_ask();
-        }
-    }
-
-    fn snapshot_live(&mut self) -> ParkedChat {
-        ParkedChat {
-            session: self.session.clone(),
-            rows: std::mem::take(&mut self.rows),
-            status: std::mem::take(&mut self.status),
-            cache: std::mem::take(&mut self.cache),
-            child_count: self.child_count,
-            running: self.running,
-            awaiting: self.awaiting,
-            scroll: self.scroll,
-            stick_bottom: self.stick_bottom,
-            queue: std::mem::take(&mut self.queue),
-            inbox_tx: self.inbox_tx.take(),
-            cancel: self.cancel.clone(),
-            streaming: self.streaming,
-            open_tool: self.open_tool.take(),
-            seal_tools: self.seal_tools,
-            activity: std::mem::take(&mut self.activity),
-            edit: std::mem::take(&mut self.edit),
-            work_started: self.work_started.take(),
-            queue_edit: self.queue_edit.take(),
-            composer_stash: self.composer_stash.take(),
-            pending: std::mem::take(&mut self.pending),
-            bench: std::mem::take(&mut self.bench),
-            monitors: std::mem::take(&mut self.monitors),
-            backgrounds: std::mem::take(&mut self.backgrounds),
-            inspector: self.inspector.take(),
-            inspector_scroll: self.inspector_scroll,
-            task: self.task.clone(),
-        }
-    }
-
-    fn install_live(&mut self, p: ParkedChat) {
-        self.session = p.session;
-        self.current_id = self.session.id.clone();
-        self.rows = p.rows;
-        self.status = p.status;
-        self.cache = p.cache;
-        self.child_count = p.child_count;
-        self.running = p.running;
-        self.awaiting = p.awaiting;
-        self.scroll = p.scroll;
-        self.stick_bottom = p.stick_bottom;
-        self.queue = p.queue;
-        self.inbox_tx = p.inbox_tx;
-        self.cancel = p.cancel;
-        self.streaming = p.streaming;
-        self.open_tool = p.open_tool;
-        self.seal_tools = p.seal_tools;
-        self.activity = p.activity;
-        self.edit = p.edit;
-        self.work_started = p.work_started;
-        self.queue_edit = p.queue_edit;
-        self.composer_stash = p.composer_stash;
-        self.pending = p.pending;
-        self.chat_sel = ChatSel::None;
-        self.preview.clear();
-        self.image_proto.clear();
-        self.image_cells.clear();
-        self.graphic_blits.clear();
-        self.last_graphic_blits.clear();
-        self.bench = p.bench;
-        self.monitors = p.monitors;
-        self.backgrounds = p.backgrounds;
-        self.inspector = p.inspector;
-        self.inspector_scroll = p.inspector_scroll;
-        self.task = p.task;
-        self.task_ui = None;
-        self.composer_vscroll = 0;
-        self.scroll_grab = None;
-        self.image_view = None;
-        self.ask = None;
-        if self.focus == Focus::Ask {
-            self.focus = Focus::Chat;
-        }
-        if self.focus == Focus::Workspace {
-            self.focus = Focus::Chat;
-        }
-        if self.focus == Focus::Task {
-            self.focus = Focus::Chat;
-        }
-    }
-
-    fn persist_transcript(&mut self) {
-        let Some(store) = &self.store else {
-            return;
-        };
-        let Ok(rows) = serde_json::to_value(&self.rows) else {
-            return;
-        };
-        let _ = store.save_transcript(&self.session.id, &rows);
-        self.session.updated_at = chrono::Utc::now();
-        let _ = store.save_meta(&self.session);
-    }
-
-    fn apply_title(&mut self, id: &str, name: &str) {
-        if self.current_id == id {
-            if let Some(store) = &self.store {
-                let _ = store.touch_name(&mut self.session, name.to_string(), true);
-            } else if !self.session.name_is_manual {
-                self.session.name = session::sanitize_title(name);
-                self.session.named = true;
-            }
-            return;
-        }
-        if let Some(p) = self.parked.get_mut(id) {
-            if let Some(store) = &self.store {
-                let _ = store.touch_name(&mut p.session, name.to_string(), true);
-            } else if !p.session.name_is_manual {
-                p.session.name = session::sanitize_title(name);
-                p.session.named = true;
-            }
-        }
-    }
-
-    fn route_event(&mut self, ev: AgentEvent) {
-        let sid = ev.session_id().to_string();
-        if let AgentEvent::SessionNamed { name, .. } = &ev {
-            self.apply_title(&sid, name);
-            return;
-        }
-        let child_work = ev.is_child_work();
-        let skip_persist = matches!(ev, AgentEvent::BackgroundOutput { .. });
-        if sid.is_empty() || sid == self.current_id {
-            if child_work {
-                self.apply_child_work(ev);
-            } else {
-                self.log_root_event(&ev);
-                self.apply_event(ev);
-                if !skip_persist {
-                    self.persist_transcript();
-                }
-            }
-            return;
-        }
-        if !self.parked.contains_key(&sid) {
-            return;
-        }
-        let parked = self.parked.remove(&sid).unwrap();
-        let parked = self.with_parked(parked, |app| {
-            if child_work {
-                app.apply_child_work(ev);
-            } else {
-                app.log_root_event(&ev);
-                app.apply_event(ev);
-                if !skip_persist {
-                    app.persist_transcript();
-                }
-            }
+            TaskUi::Form(Edit::default())
         });
-        self.parked.insert(sid, parked);
     }
 
-    fn with_parked<F: FnOnce(&mut Self)>(&mut self, parked: ParkedChat, f: F) -> ParkedChat {
-        let saved_ask = self.ask.take();
-        let ask_focus = self.focus == Focus::Ask;
-        let saved = self.snapshot_live();
-        self.install_live(parked);
-        self.ask_passive = true;
-        f(self);
-        self.ask_passive = false;
-        let parked = self.snapshot_live();
-        self.install_live(saved);
-        self.ask = saved_ask;
-        if self.ask.is_some() && ask_focus {
-            self.focus = Focus::Ask;
+    pub fn close_task(&mut self) {
+        self.ui.task_ui = None;
+    }
+
+    pub fn submit_task_goal(&mut self, goal: &str) {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            self.flash("請填寫任務目標");
+            return;
         }
-        parked
+        let s = self.cur_mut();
+        s.task.start_goal(goal.clone());
+        s.chat.push(Row::meta(format!("已啟動任務模式：{goal}")));
+        s.agents.log("", EventKind::Message, format!("任務目標：{goal}"));
+        s.dirty = true;
+        self.ui.task_ui = Some(TaskUi::Status);
+        if self.cur().inbox.is_none() {
+            self.start_or_send(UserTurn::from(task::KICK), false);
+        }
     }
 
-    fn is_blank_draft(&self) -> bool {
-        !self.session.named
-            && self.inbox_tx.is_none()
-            && !self.running
-            && self
-                .rows
-                .iter()
-                .all(|r| matches!(r, Row::Meta(_)))
+    pub fn end_task(&mut self) {
+        let phase = self.cur().task.snapshot().phase;
+        if phase.is_live() || matches!(phase, TaskPhase::Done | TaskPhase::Failed) {
+            let s = self.cur_mut();
+            s.task.end();
+            s.agents.log("", EventKind::Message, "任務模式由使用者結束");
+            s.chat.push(Row::meta("已結束任務模式"));
+        }
+        self.close_task();
     }
 
-    fn begin_new_chat(&mut self) {
-        self.cancel_ask();
-        self.cancel_rename();
-        let start = if self.session.workspace.as_os_str().is_empty() {
-            self.launch_workspace.clone()
+    // —— Skills ——
+
+    pub fn refresh_skills(&mut self) {
+        let ws = self.workspace();
+        let list = self.skills.lock().unwrap_or_else(|e| e.into_inner()).scan(&ws);
+        self.settings.skill_cursor = self.settings.skill_cursor.min(list.len().saturating_sub(1));
+        self.settings.skill_list = list;
+    }
+
+    pub fn toggle_import(&mut self, claude: bool) {
+        let mut g = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let on = if claude {
+            let on = !g.prefs().import_claude;
+            let _ = g.set_import_claude(on);
+            on
         } else {
-            self.session.workspace.clone()
+            let on = !g.prefs().import_codex;
+            let _ = g.set_import_codex(on);
+            on
         };
-        self.workspace_pick = Some(WorkspacePick::open(&start));
-        self.focus = Focus::Workspace;
-    }
-
-    fn sync_workspace_pick(&mut self) {
-        let Some(p) = self.workspace_pick.as_mut() else {
-            return;
-        };
-        let fallback = p.view.cwd.clone();
-        p.view = folderpick::view_for_input(&p.edit.text, &fallback);
-        if p.view.entries.is_empty() {
-            p.cursor = 0;
-        } else if p.cursor >= p.view.entries.len() {
-            p.cursor = p.view.entries.len() - 1;
-        }
-        p.scroll = p.scroll.min(p.cursor as u16);
-        p.notice = p.view.error.clone();
-    }
-
-    fn enter_workspace_dir(&mut self, dir: PathBuf) {
-        let Some(p) = self.workspace_pick.as_mut() else {
-            return;
-        };
-        if !dir.is_dir() {
-            p.notice = Some("不是資料夾".into());
-            return;
-        }
-        p.view = folderpick::list_folder(&dir);
-        p.edit = Edit::at_end(folderpick::display_path(&p.view.cwd));
-        p.cursor = 0;
-        p.scroll = 0;
-        p.notice = p.view.error.clone();
-        p.focus = WsFocus::List;
-    }
-
-    fn activate_ws_entry(&mut self, idx: usize) {
-        let Some(ent) = self
-            .workspace_pick
-            .as_ref()
-            .and_then(|p| p.view.entries.get(idx).cloned())
-        else {
-            return;
-        };
-        if let Some(p) = self.workspace_pick.as_mut() {
-            p.cursor = idx;
-        }
-        if ent.is_dir {
-            self.enter_workspace_dir(ent.path);
-        } else if let Some(p) = self.workspace_pick.as_mut() {
-            p.edit = Edit::at_end(folderpick::display_path(&ent.path));
-            p.notice = Some("檔案：確定時會使用上層資料夾".into());
-            p.focus = WsFocus::List;
-        }
-    }
-
-    fn cancel_workspace_pick(&mut self) {
-        self.workspace_pick = None;
-        if self.focus == Focus::Workspace {
-            self.focus = Focus::Chat;
-        }
-    }
-
-    fn confirm_workspace_pick(&mut self) {
-        let Some(p) = self.workspace_pick.as_ref() else {
-            return;
-        };
-        let typed = p.edit.text.clone();
-        let cwd = p.view.cwd.clone();
-        let selected = p.selected().cloned();
-        let dir = if let Ok(abs) = std::fs::canonicalize(typed.trim()) {
-            if abs.is_dir() {
-                folderpick::normalize(&abs)
-            } else if abs.is_file() {
-                folderpick::existing_dir(&abs)
-            } else {
-                folderpick::workspace_of(&cwd, selected.as_ref())
-            }
+        drop(g);
+        self.refresh_skills();
+        let who = if claude { "Claude Code" } else { "Codex" };
+        self.flash(if on {
+            format!("已引入 {who} 技能")
         } else {
-            folderpick::workspace_of(&cwd, selected.as_ref())
-        };
-        if !dir.is_dir() {
-            if let Some(p) = self.workspace_pick.as_mut() {
-                p.notice = Some("請選擇存在的資料夾".into());
-            }
-            return;
-        }
-        self.workspace_pick = None;
-        self.focus = Focus::Chat;
-        self.create_chat(dir);
+            format!("已停止引入 {who} 技能")
+        });
     }
 
-    fn create_workspace_dir(&mut self) {
-        let Some(p) = self.workspace_pick.as_ref() else {
+    pub fn toggle_skill(&mut self, i: usize) {
+        let Some(skill) = self.settings.skill_list.get(i).cloned() else {
             return;
         };
-        let target = folderpick::create_target(&p.edit.text, &p.view.cwd);
-        match folderpick::mkdir(&target) {
-            Ok(dir) => {
-                self.enter_workspace_dir(dir);
-                if let Some(p) = self.workspace_pick.as_mut() {
-                    p.notice = Some("已建立資料夾".into());
-                }
-            }
-            Err(e) => {
-                if let Some(p) = self.workspace_pick.as_mut() {
-                    p.notice = Some(format!("無法建立: {e}"));
-                }
-            }
-        }
+        let _ = self
+            .skills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_enabled(&skill.id, !skill.enabled);
+        self.refresh_skills();
     }
 
-    fn new_chat(&mut self) {
-        self.begin_new_chat();
-    }
-
-    fn create_chat(&mut self, workspace: PathBuf) {
-        let workspace = folderpick::existing_dir(&workspace);
-        self.launch_workspace = workspace.clone();
-        if self.is_blank_draft() {
-            self.session.workspace = workspace.clone();
-            if let Some(store) = &self.store {
-                self.session.updated_at = chrono::Utc::now();
-                let _ = store.save_meta(&self.session);
-            }
-            self.status = format!("工作目錄  {}", folderpick::display_path(&workspace));
+    pub fn open_skill(&mut self, i: usize) {
+        let Some(skill) = self.settings.skill_list.get(i).cloned() else {
             return;
-        }
-        self.cancel_ask();
-        self.persist_transcript();
-        self.persist_agents();
-        let parked = self.snapshot_live();
-        self.parked.insert(parked.session.id.clone(), parked);
-        let session = if let Some(store) = &self.store {
-            store
-                .create(workspace.clone())
-                .unwrap_or_else(|_| SessionMeta::new(workspace.clone()))
-        } else {
-            SessionMeta::new(workspace)
         };
-        self.install_live(fresh_chat(session));
-        self.bind_ask_hub();
-        self.refresh_session_list();
-        self.status = format!(
-            "工作目錄  {}",
-            folderpick::display_path(&self.session.workspace)
-        );
-    }
-
-    fn switch_to(&mut self, id: &str) {
-        if id == self.current_id {
-            return;
-        }
-        self.cancel_ask();
-        self.persist_transcript();
-        self.persist_agents();
-        let parked = self.snapshot_live();
-        self.parked.insert(parked.session.id.clone(), parked);
-        if let Some(p) = self.parked.remove(id) {
-            self.install_live(p);
-            self.bind_ask_hub();
-            return;
-        }
-        let loaded = self.load_from_store(id);
-        self.install_live(loaded);
-        self.bind_ask_hub();
-    }
-
-    fn load_from_store(&self, id: &str) -> ParkedChat {
-        let session = self
-            .store
-            .as_ref()
-            .and_then(|s| s.load_meta(id).ok())
-            .unwrap_or_else(|| {
-                let mut m = SessionMeta::new(self.launch_workspace.clone());
-                m.id = id.to_string();
-                m
-            });
-        let rows = self
-            .store
-            .as_ref()
-            .and_then(|s| s.load_transcript(id).ok())
-            .and_then(|v| serde_json::from_value::<Vec<Row>>(v).ok())
-            .unwrap_or_default();
-        ParkedChat {
-            session,
-            rows,
-            status: "待命".into(),
-            cache: "cache —".into(),
-            child_count: 0,
-            running: false,
-            awaiting: false,
+        let body = crate::skills::read_skill_file(&skill.path).unwrap_or_else(|e| e.to_string());
+        let mut edit = Edit::at_end(body);
+        edit.home(false);
+        self.ui.skill_view = Some(super::app::SkillView {
+            title: skill.name,
+            origin: skill.origin.label().to_string(),
+            edit,
             scroll: 0,
-            stick_bottom: true,
-            queue: VecDeque::new(),
-            inbox_tx: None,
-            cancel: None,
-            streaming: false,
-            open_tool: None,
-            seal_tools: false,
-            activity: String::new(),
-            edit: Edit::default(),
-            work_started: None,
-            queue_edit: None,
-            composer_stash: None,
-            pending: Vec::new(),
-            bench: self
-                .store
-                .as_ref()
-                .and_then(|s| s.load_agents::<Vec<SavedAgent>>(id))
-                .map(Workbench::restore)
-                .unwrap_or_default(),
-            monitors: Vec::new(),
-            backgrounds: Vec::new(),
-            inspector: None,
-            inspector_scroll: 0,
-            task: TaskHub::from_state(
-                id,
-                self.store
-                    .as_ref()
-                    .and_then(|s| s.load_task::<crate::task::TaskState>(id))
-                    .unwrap_or_default(),
-            ),
+        });
+    }
+
+    // —— Tabs & views ——
+
+    pub fn open_settings(&mut self) {
+        self.ui.settings_open = true;
+        self.ui.settings_active = true;
+        self.ui.focus = Focus::Settings;
+        self.settings.drop = None;
+        self.refresh_skills();
+        if self.settings.logged_in
+            && !matches!(
+                self.settings.catalog_status,
+                super::settings::CatalogStatus::Ready | super::settings::CatalogStatus::Loading
+            )
+        {
+            self.settings.want_catalog = true;
         }
     }
 
-    fn refresh_session_list(&mut self) {
-        let mut by_id: HashMap<String, SessionMeta> = HashMap::new();
-        if let Some(store) = &self.store {
-            if let Ok(list) = store.list() {
-                for s in list {
-                    by_id.insert(s.id.clone(), s);
-                }
-            }
-        }
-        by_id.insert(self.session.id.clone(), self.session.clone());
-        for p in self.parked.values() {
-            by_id.insert(p.session.id.clone(), p.session.clone());
-        }
-        let mut list: Vec<SessionMeta> = by_id.into_values().collect();
-        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
-        self.sessions = list;
-        self.sidebar_ids = self.sessions.iter().map(|s| s.id.clone()).collect();
-    }
-
-    fn finish_run(&mut self, id: &str, out: crate::agent::RunOutcome) {
-        self.cancel_session_ask(id);
-        self.ask_hubs.remove(id);
-        if id == self.current_id {
-            self.bind_ask_hub();
-            self.running = false;
-            self.awaiting = false;
-            self.inbox_tx = None;
-            self.cancel = None;
-            if self.status.starts_with("工作") || self.status.starts_with("第") || self.status.starts_with("中斷") {
-                self.status = format!("結束 ({} 輪)", out.turns);
-            }
-            return;
-        }
-        if let Some(p) = self.parked.get_mut(id) {
-            p.running = false;
-            p.awaiting = false;
-            p.inbox_tx = None;
-            p.cancel = None;
-            if p.status.starts_with("工作") || p.status.starts_with("第") || p.status.starts_with("中斷") {
-                p.status = format!("結束 ({} 輪)", out.turns);
-            }
+    pub fn close_settings(&mut self) {
+        self.flush_conn();
+        self.settings.drop = None;
+        self.ui.settings_open = false;
+        self.ui.settings_active = false;
+        self.ui.skill_view = None;
+        if self.ui.focus == Focus::Settings {
+            self.ui.focus = Focus::Chat;
         }
     }
 
-    fn begin_rename(&mut self, id: &str) {
-        let name = if self.current_id == id {
-            self.session.name.clone()
-        } else if let Some(p) = self.parked.get(id) {
-            p.session.name.clone()
-        } else {
-            self.sessions
-                .iter()
-                .find(|s| s.id == id)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "新對話".into())
-        };
-        self.rename = Some((id.to_string(), Edit::at_end(name)));
-        self.focus = Focus::Rename;
-    }
-
-    fn cancel_rename(&mut self) {
-        self.rename = None;
-        if self.focus == Focus::Rename {
-            self.focus = Focus::Chat;
+    /// Show the main chat (or an agent tab) instead of settings.
+    pub fn show_chat(&mut self, agent: Option<String>) {
+        self.ui.settings_active = false;
+        if self.ui.focus == Focus::Settings {
+            self.ui.focus = Focus::Chat;
+        }
+        let s = self.cur_mut();
+        match agent {
+            Some(p) => s.open_agent(&p),
+            None => s.active = None,
         }
     }
 
-    fn commit_rename(&mut self) {
-        let Some((id, edit)) = self.rename.take() else {
-            return;
-        };
-        if self.focus == Focus::Rename {
-            self.focus = Focus::Chat;
+    /// Editor tabs in strip order.
+    pub fn tabs(&self) -> Vec<Tab> {
+        let mut out = vec![Tab::Chat];
+        out.extend(self.cur().open_tabs.iter().map(|p| Tab::Agent(p.clone())));
+        if self.ui.settings_open {
+            out.push(Tab::Settings);
         }
-        let name = session::sanitize_title(&edit.text);
-        if name.is_empty() {
-            return;
-        }
-        self.apply_manual_name(&id, &name);
-        self.refresh_session_list();
+        out
     }
 
-    fn begin_queue_edit(&mut self, index: usize) {
-        if index >= self.queue.len() {
-            return;
+    pub fn active_tab(&self) -> Tab {
+        if self.ui.settings_active && self.ui.settings_open {
+            return Tab::Settings;
         }
-        if self.queue_edit == Some(index) {
-            return;
-        }
-        let mut idx = index;
-        if let Some(cur) = self.queue_edit {
-            let removed = self.commit_queue_edit();
-            if removed && cur < idx {
-                idx = idx.saturating_sub(1);
-            }
-            if idx >= self.queue.len() {
-                return;
-            }
-        }
-        if self.composer_stash.is_none() {
-            self.composer_stash = Some(std::mem::take(&mut self.edit));
-        }
-        let text = self.queue[idx].text.clone();
-        self.edit = Edit::at_end(text);
-        self.queue_edit = Some(idx);
-        self.focus = Focus::Chat;
-        self.composer_vscroll = 0;
-    }
-
-    /// Restore the original queued text and the previous composer draft.
-    fn cancel_queue_edit(&mut self) {
-        if self.queue_edit.take().is_none() {
-            return;
-        }
-        self.edit = self.composer_stash.take().unwrap_or_default();
-        self.composer_vscroll = 0;
-    }
-
-    /// Save the composer into the queued item. Empty text drops that item.
-    /// Returns true if the item was removed.
-    fn commit_queue_edit(&mut self) -> bool {
-        let Some(i) = self.queue_edit.take() else {
-            return false;
-        };
-        let text = self.edit.text.trim().to_string();
-        let mut removed = false;
-        if i < self.queue.len() {
-            if text.is_empty() && self.queue[i].images.is_empty() {
-                self.queue.remove(i);
-                removed = true;
-            } else if let Some(slot) = self.queue.get_mut(i) {
-                slot.text = text;
-            }
-        }
-        self.edit = self.composer_stash.take().unwrap_or_default();
-        self.composer_vscroll = 0;
-        removed
-    }
-
-    fn apply_manual_name(&mut self, id: &str, name: &str) {
-        if self.current_id == id {
-            if let Some(store) = &self.store {
-                let _ = store.rename_manual(&mut self.session, name.to_string());
-            } else {
-                self.session.name = name.to_string();
-                self.session.named = true;
-                self.session.name_is_manual = true;
-            }
-            return;
-        }
-        if let Some(p) = self.parked.get_mut(id) {
-            if let Some(store) = &self.store {
-                let _ = store.rename_manual(&mut p.session, name.to_string());
-            } else {
-                p.session.name = name.to_string();
-                p.session.named = true;
-                p.session.name_is_manual = true;
-            }
-            return;
-        }
-        if let Some(store) = &self.store {
-            if let Ok(mut meta) = store.load_meta(id) {
-                let _ = store.rename_manual(&mut meta, name.to_string());
-            }
+        match self.cur().view_key() {
+            k if k.is_empty() => Tab::Chat,
+            k => Tab::Agent(k),
         }
     }
 
-    fn delete_session(&mut self, id: &str) {
-        self.cancel_rename();
-        self.cancel_session_ask(id);
-        self.ask_hubs.remove(id);
-        let deleting_current = self.current_id == id;
-        if deleting_current {
-            self.inbox_tx = None;
-            self.cancel = None;
-            self.running = false;
-            self.awaiting = false;
-        } else {
-            self.parked.remove(id);
+    pub fn activate(&mut self, tab: Tab) {
+        match tab {
+            Tab::Chat => self.show_chat(None),
+            Tab::Agent(p) => self.show_chat(Some(p)),
+            Tab::Settings => self.open_settings(),
         }
-        if let Some(store) = &self.store {
-            let _ = store.delete(id);
-        }
-        let next = self
-            .sessions
-            .iter()
-            .map(|s| s.id.clone())
-            .chain(self.parked.keys().cloned())
-            .find(|sid| sid != id);
-        if deleting_current {
-            if let Some(nid) = next.filter(|n| n != id) {
-                if let Some(p) = self.parked.remove(&nid) {
-                    self.install_live(p);
-                } else {
-                    let loaded = self.load_from_store(&nid);
-                    self.install_live(loaded);
-                }
-            } else {
-                let workspace = self.launch_workspace.clone();
-                let session = if let Some(store) = &self.store {
-                    store
-                        .create(workspace)
-                        .unwrap_or_else(|_| SessionMeta::new(self.launch_workspace.clone()))
-                } else {
-                    SessionMeta::new(workspace)
-                };
-                self.install_live(fresh_chat(session));
+    }
+
+    pub fn close_tab(&mut self, tab: &Tab) {
+        match tab {
+            Tab::Chat => {}
+            Tab::Agent(p) => {
+                let p = p.clone();
+                self.cur_mut().close_agent(&p);
             }
-            self.bind_ask_hub();
+            Tab::Settings => self.close_settings(),
         }
-        self.refresh_session_list();
+    }
+
+    pub fn cycle_tab(&mut self, delta: i32) {
+        let tabs = self.tabs();
+        let cur = self.active_tab();
+        let i = tabs.iter().position(|t| *t == cur).unwrap_or(0) as i32;
+        let n = tabs.len() as i32;
+        let next = tabs[(i + delta).rem_euclid(n) as usize].clone();
+        self.activate(next);
+    }
+
+    /// Jump to a tool call in the transcript that owns it.
+    pub fn reveal_tool(&mut self, view: &str, row: usize, call: usize) {
+        self.show_chat((!view.is_empty()).then(|| view.to_string()));
+        self.cur_mut().view_mut().open_tool = Some((row, call));
+    }
+
+    /// Anything is spinning: advance the animation tick.
+    pub fn pulsing(&self) -> bool {
+        self.sessions.values().any(|s| {
+            s.chat.running
+                || s.agents.live_count() > 0
+                || s.backgrounds.iter().any(|b| b.alive)
+                || s.monitors.iter().any(|m| m.alive)
+        })
+    }
+
+    pub fn has_modal(&self) -> bool {
+        self.ui.workspace_pick.is_some()
+            || self.cur().ask.is_some()
+            || self.ui.task_ui.is_some()
+            || self.ui.image_view.is_some()
+            || self.ui.skill_view.is_some()
+            || self.ui.inspector.is_some()
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Tab {
+    Chat,
+    Agent(String),
+    Settings,
+}
+
+/// Session to resume at start: the newest one with real content; blank
+/// drafts from earlier launches are skipped.
+pub(crate) fn boot_session(store: Option<&SessionStore>, workspace: PathBuf) -> (Session, bool) {
+    let listed = store.and_then(|s| s.list().ok()).unwrap_or_default();
+    let rows_of = |id: &str| -> Vec<Row> {
+        store
+            .and_then(|s| s.load_transcript(id).ok())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
+    };
+    let pick = listed
+        .iter()
+        .find(|m| m.named || m.name_is_manual || rows_of(&m.id).iter().any(|r| !matches!(r, Row::Meta(_))))
+        .or_else(|| listed.first())
+        .cloned();
+    if let Some(meta) = pick {
+        let id = meta.id.clone();
+        let rows = rows_of(&id);
+        let rows = if rows.is_empty() { intro_rows() } else { rows };
+        let task = TaskHub::from_state(
+            id.clone(),
+            store
+                .and_then(|s| s.load_task::<crate::task::TaskState>(&id))
+                .unwrap_or_default(),
+        );
+        let mut s = Session::new(meta, rows, task);
+        s.agents = store
+            .and_then(|st| st.load_agents::<Vec<SavedAgent>>(&id))
+            .map(AgentTree::restore)
+            .unwrap_or_default();
+        return (s, false);
+    }
+    let meta = match store {
+        Some(s) => s.create(workspace.clone()).unwrap_or_else(|_| SessionMeta::new(workspace)),
+        None => SessionMeta::new(workspace),
+    };
+    let task = TaskHub::new(meta.id.clone());
+    (Session::new(meta, intro_rows(), task), true)
+}
+
+/// Emit a session title event (the runtime also uses this for LLM titles).
+pub(crate) fn title_event(sink: &dyn EventSink, session_id: &str, name: String) {
+    sink.emit(&AgentEvent::SessionNamed {
+        meta: EventMeta {
+            ts: chrono::Utc::now(),
+            agent_name: "root".into(),
+            run_id: session_id.to_string(),
+            parent_run_id: None,
+            path: String::new(),
+        },
+        name,
+    });
+}

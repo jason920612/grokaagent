@@ -75,6 +75,11 @@ impl ProviderConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Unit tests drive settings actions that save; never let them
+        // overwrite the developer's real ~/.grokaagent/provider.json.
+        if cfg!(test) {
+            return Ok(());
+        }
         save_at(&groka_dir()?, self)
     }
 
