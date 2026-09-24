@@ -937,7 +937,7 @@ fn handle_key(
                     app.edit.clear_sel();
                 } else if app.chat_sel != ChatSel::None {
                     app.chat_sel = ChatSel::None;
-                } else {
+                } else if !app.interrupt_children() {
                     app.settings = None;
                     app.focus = Focus::Chat;
                 }

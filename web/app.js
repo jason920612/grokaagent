@@ -639,7 +639,9 @@
         box.append(b);
       });
     }
-    $("interrupt").classList.toggle("hidden", !snap.header.running);
+    const liveAgents = logs.agents.some((a) => a.state === "working" || a.state === "starting");
+    $("interrupt").classList.toggle("hidden", !snap.header.running && !liveAgents);
+    $("interrupt").textContent = snap.header.running ? "停止目前工作" : "中斷子代理";
     $("mode-queue").classList.toggle("on", sendMode !== "insert");
     $("mode-insert").classList.toggle("on", sendMode === "insert");
     composer.placeholder = isCustom()
@@ -1186,7 +1188,7 @@
       if (!overlay.classList.contains("hidden")) { overlay.click(); e.preventDefault(); }
       else if (sideOpen && narrow.matches) { sideOpen = false; renderAll(); }
       else if (activeTab) activate("");
-      else if (snap?.header.running) send({ type: "interrupt" });
+      else if (snap?.header.running || logs.agents.some((a) => a.state === "working")) send({ type: "interrupt" });
       return;
     }
     if (e.key === "Tab" && !overlay.classList.contains("hidden")) {

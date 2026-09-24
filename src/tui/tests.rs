@@ -4230,3 +4230,22 @@
         assert!(k.server_tools.is_empty(), "xai search tools must not follow a custom model");
     }
 
+
+    #[test]
+    fn esc_interrupts_working_children_while_the_main_agent_is_idle() {
+        let mut app = test_app();
+        let cancel = CancelFlag::new();
+        app.cancel = Some(cancel.clone());
+        app.running = false;
+        let (mut opts, sink, tx) = dummy_key_env();
+        handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert_eq!(cancel.trips(), 0, "no children: Esc has nothing to stop");
+
+        app.agent_spawned("", "coder", "fix", "");
+        if let Some(a) = app.bench.agent_mut("coder") {
+            a.set_state(AgentState::Working);
+        }
+        handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert_eq!(cancel.trips(), 1, "Esc reaches the nursery through the session flag");
+        assert_eq!(app.status, "已中斷子代理");
+    }

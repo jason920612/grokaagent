@@ -999,9 +999,24 @@ impl App {
         self.cancel_session_ask(&id);
     }
 
+    /// Stop working child agents while the main agent itself is idle. The
+    /// session ignores Esc while paused, so only the nursery reacts to the trip.
+    fn interrupt_children(&mut self) -> bool {
+        if self.running || self.bench.live_count() == 0 {
+            return false;
+        }
+        let Some(c) = &self.cancel else {
+            return false;
+        };
+        c.trip();
+        self.bench.log_event("", "agent", "中斷工作中的子代理".into());
+        self.status = "已中斷子代理".into();
+        true
+    }
+
     fn interrupt_work(&mut self) -> bool {
         if !self.running {
-            return false;
+            return self.interrupt_children();
         }
         if let Some(c) = &self.cancel {
             c.trip();
