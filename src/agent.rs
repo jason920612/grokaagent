@@ -21,6 +21,12 @@ pub struct SessionKnobs {
     pub reasoning_effort: ReasoningEffort,
     pub send_reasoning: bool,
     pub server_tools: Vec<String>,
+    /// Dispatcher mode: append instructions telling the root model to plan
+    /// and delegate to child agents instead of working directly.
+    pub dispatcher: bool,
+    /// Default model for spawned child agents. Empty = follow [`Self::model`].
+    /// A `model` argument on spawn_agent still wins.
+    pub child_model: String,
 }
 
 pub struct RunConfig {
@@ -216,16 +222,21 @@ fn emit_model_finished(
 }
 
 fn live_instructions(cfg: &RunConfig) -> String {
+    let mut out = cfg.instructions.clone();
+    let dispatcher = cfg
+        .knobs
+        .as_ref()
+        .is_some_and(|k| k.lock().unwrap_or_else(|e| e.into_inner()).dispatcher);
+    if dispatcher {
+        out.push_str(crate::instructions::DISPATCHER_INSTRUCTIONS);
+    }
     let extra = cfg.skills.as_ref().map(|s| {
         s.lock()
             .unwrap_or_else(|e| e.into_inner())
             .catalog_suffix(&cfg.workspace)
     }).unwrap_or_default();
-    if extra.is_empty() {
-        cfg.instructions.clone()
-    } else {
-        format!("{}{extra}", cfg.instructions)
-    }
+    out.push_str(&extra);
+    out
 }
 
 fn live_knobs(cfg: &RunConfig) -> (String, ReasoningEffort, bool, Vec<String>) {
@@ -714,7 +725,7 @@ pub async fn run<P: Provider>(
     }
     if let Some(hub) = cfg.task.clone() {
         let (model, effort, send_reasoning, _) = live_knobs(&cfg);
-        if let Some(instr) = crate::task::prepare_first_turn(
+        if let Some(instr) = race_cancel(&cfg.cancel, crate::task::prepare_first_turn(
             hub.as_ref(),
             provider,
             &model,
@@ -723,8 +734,8 @@ pub async fn run<P: Provider>(
             &run_id,
             &history,
             sink,
-        )
-        .await
+        ))
+        .await.ok().flatten()
         {
             history.push(crate::vision::user_message(
                 &instr,
@@ -1304,6 +1315,9 @@ pub async fn run<P: Provider>(
             turn = 0;
             continue;
         }
+        if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
+            continue;
+        }
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
@@ -1339,7 +1353,7 @@ pub async fn run<P: Provider>(
                         );
                         break;
                     }
-                    if had_user {
+                    if had_user || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
                         break;
                     }
                 }
@@ -1378,7 +1392,7 @@ async fn task_inject<P: Provider>(
     let hub = cfg.task.as_ref()?;
     let (model, effort, send_reasoning, _) = live_knobs(cfg);
     if after_stop {
-        crate::task::after_natural_stop(
+        race_cancel(&cfg.cancel, crate::task::after_natural_stop(
             hub,
             provider,
             &model,
@@ -1388,10 +1402,10 @@ async fn task_inject<P: Provider>(
             history,
             last_text,
             sink,
-        )
-        .await
+        ))
+        .await.ok().flatten()
     } else {
-        crate::task::after_wait(
+        race_cancel(&cfg.cancel, crate::task::after_wait(
             hub,
             provider,
             &model,
@@ -1401,8 +1415,8 @@ async fn task_inject<P: Provider>(
             history,
             had_user,
             sink,
-        )
-        .await
+        ))
+        .await.ok().flatten()
     }
 }
 
@@ -1482,6 +1496,30 @@ mod tests {
             skills: None,
             task: None,
         }
+    }
+
+    #[test]
+    fn dispatcher_knob_appends_dispatcher_instructions() {
+        let mut c = cfg("go", 1);
+        assert!(!live_instructions(&c).contains("Dispatcher mode"));
+        c.knobs = Some(Arc::new(Mutex::new(SessionKnobs {
+            model: "grok-4.6".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            send_reasoning: true,
+            server_tools: vec![],
+            dispatcher: true,
+            child_model: String::new(),
+        })));
+        let text = live_instructions(&c);
+        assert!(text.starts_with("use tools"));
+        assert!(text.contains("Dispatcher mode"));
+        c.knobs
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dispatcher = false;
+        assert!(!live_instructions(&c).contains("Dispatcher mode"));
     }
 
     #[tokio::test]
@@ -3174,6 +3212,26 @@ mod tests {
             ),
             ..CompleteResponse::new("sup")
         }
+    }
+
+    #[tokio::test]
+    async fn task_supervisor_review_is_cancellable() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancelFlag::new();
+        let mut c = cfg("goal", 0);
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("goal");
+        c.task = Some(hub.clone());
+        c.cancel = Some(cancel.clone());
+        let provider = HangThenOk { entered: Mutex::new(Some(entered_tx)), calls: Mutex::new(0) };
+        let job = tokio::spawn(async move {
+            let rec = Rec(Mutex::new(Vec::new()));
+            task_inject(&c, &provider, &rec, "r", &[], "", true, false).await
+        });
+        entered_rx.await.unwrap();
+        cancel.trip();
+        assert!(tokio::time::timeout(Duration::from_secs(2), job).await.unwrap().unwrap().is_none());
+        assert_ne!(hub.snapshot().phase, crate::task::TaskPhase::Done);
     }
 
     #[tokio::test]

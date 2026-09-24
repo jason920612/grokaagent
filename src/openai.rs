@@ -3,6 +3,7 @@
 //! Translates the kernel's Responses-shaped history into chat messages so a
 //! custom base URL + model name can drive the same tool loop.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -22,6 +23,8 @@ pub struct OpenAiCompatProvider {
     api_key: String,
     model: String,
     client: reqwest::Client,
+    /// Cached `/health` probe: some vision gateways intercept tool calls.
+    gateway: Arc<OnceLock<bool>>,
 }
 
 impl OpenAiCompatProvider {
@@ -41,6 +44,7 @@ impl OpenAiCompatProvider {
             api_key: cfg.api_key.trim().to_string(),
             model,
             client,
+            gateway: Arc::new(OnceLock::new()),
         })
     }
 
@@ -115,6 +119,51 @@ impl OpenAiCompatProvider {
         }
         req
     }
+
+    async fn is_vision_gateway(&self) -> bool {
+        if let Some(v) = self.gateway.get() {
+            return *v;
+        }
+        let url = health_url(&self.base_url);
+        let mut req = self.client.get(&url).header("Accept", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let hit = match req.send().await {
+            Ok(resp) if resp.status().as_u16() == 200 => match resp.json::<Value>().await {
+                Ok(body) => {
+                    body.get("gateway").and_then(Value::as_bool).unwrap_or(false)
+                        && body.get("vision_tool").is_some()
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        let _ = self.gateway.set(hit);
+        *self.gateway.get().unwrap_or(&hit)
+    }
+}
+
+fn emit_parsed(
+    parsed: &CompleteResponse,
+    on_text: &(dyn Fn(&str) + Send + Sync),
+    on_server: &(dyn Fn(&str, &Value) + Send + Sync),
+    on_reasoning: &(dyn Fn(&str) + Send + Sync),
+) {
+    for item in &parsed.server_items {
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("server_tool");
+        on_server(kind, item);
+    }
+    let think = crate::provider::extract_reasoning_text(&parsed.output_items);
+    if !think.is_empty() {
+        on_reasoning(&think);
+    }
+    if !parsed.text.is_empty() {
+        on_text(&parsed.text);
+    }
 }
 
 impl Provider for OpenAiCompatProvider {
@@ -124,7 +173,11 @@ impl Provider for OpenAiCompatProvider {
         } else {
             req.model.as_str()
         };
-        let payload = chat_payload(model, &req);
+        let mut payload = chat_payload(model, &req);
+        if self.is_vision_gateway().await {
+            payload["chat_template_kwargs"] =
+                json!({"thinking": true, "enable_thinking": true});
+        }
         let resp = self
             .request("/chat/completions", "application/json")
             .json(&payload)
@@ -144,9 +197,14 @@ impl Provider for OpenAiCompatProvider {
         &'a self,
         req: CompleteRequest,
         on_text: &'a (dyn Fn(&str) + Send + Sync),
-        _on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
+        on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
         on_reasoning: &'a (dyn Fn(&str) + Send + Sync),
     ) -> Result<CompleteResponse> {
+        if self.is_vision_gateway().await {
+            let parsed = self.complete(req).await?;
+            emit_parsed(&parsed, on_text, on_server, on_reasoning);
+            return Ok(parsed);
+        }
         let model = if req.model.is_empty() {
             self.model.as_str()
         } else {
@@ -176,7 +234,9 @@ impl Provider for OpenAiCompatProvider {
             let text = resp.text().await?;
             let body: Value = serde_json::from_str(&text)
                 .map_err(|_| Error::Provider("endpoint returned non-JSON body".into()))?;
-            return parse_chat_body(&body);
+            let parsed = parse_chat_body(&body)?;
+            emit_parsed(&parsed, on_text, on_server, on_reasoning);
+            return Ok(parsed);
         }
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
@@ -219,6 +279,15 @@ pub fn normalize_base(url: &str) -> Result<String> {
         ));
     }
     Ok(u)
+}
+
+fn health_url(base: &str) -> String {
+    let u = base.trim_end_matches('/');
+    if let Some(origin) = u.strip_suffix("/v1") {
+        format!("{origin}/health")
+    } else {
+        format!("{u}/health")
+    }
 }
 
 fn http_error(status: u16, body: &str) -> Error {
@@ -435,11 +504,33 @@ pub fn parse_chat_body(body: &Value) -> Result<CompleteResponse> {
         .and_then(|a| a.first())
         .ok_or_else(|| Error::Provider("chat completion missing choices".into()))?;
     let message = choice.get("message").unwrap_or(choice);
-    parse_message(id, message, cache_usage(body))
+    let mut parsed = parse_message(id, message, cache_usage(body))?;
+    decorate_gateway(body, &mut parsed);
+    Ok(parsed)
+}
+
+fn decorate_gateway(body: &Value, parsed: &mut CompleteResponse) {
+    if !gateway_swallowed_tools(body) || !parsed.function_calls.is_empty() {
+        return;
+    }
+    parsed.server_items.push(json!({
+        "type": "gateway",
+        "error": "此端點前面的 vision gateway 會自己執行工具，而且只認 see_image。grokaagent 的 now / read_file 等工具在你這台電腦上，永遠跑不到。請改連 llama.cpp 上游（/health 裡的 flash_upstream），不要走這層 /v1 gateway。"
+    }));
+}
+
+fn gateway_swallowed_tools(body: &Value) -> bool {
+    body.get("gateway")
+        .and_then(|g| g.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|c| !c.is_empty())
 }
 
 fn parse_message(id: String, message: &Value, usage: CacheUsage) -> Result<CompleteResponse> {
-    let text = message_text(message);
+    let (mut text, mut reasoning) = split_think(&message_text(message));
+    if reasoning.is_empty() {
+        reasoning = message_reasoning(message);
+    }
     let mut function_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for (i, call) in calls.iter().enumerate() {
@@ -470,7 +561,14 @@ fn parse_message(id: String, message: &Value, usage: CacheUsage) -> Result<Compl
             });
         }
     }
-    Ok(complete_from_chat(id, text, function_calls, usage))
+    if function_calls.is_empty() {
+        let (rest, dsml) = parse_dsml_tools(&text);
+        if !dsml.is_empty() {
+            text = rest;
+            function_calls = dsml;
+        }
+    }
+    Ok(complete_from_chat(id, text, reasoning, function_calls, usage))
 }
 
 fn message_text(message: &Value) -> String {
@@ -487,13 +585,121 @@ fn message_text(message: &Value) -> String {
     String::new()
 }
 
+fn message_reasoning(message: &Value) -> String {
+    for key in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(s) = message.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+fn split_think(text: &str) -> (String, String) {
+    let start = match text.find("<think>") {
+        Some(i) => i,
+        None => return (text.to_string(), String::new()),
+    };
+    let Some(end) = text.find("</think>") else {
+        return (text.to_string(), String::new());
+    };
+    if end < start {
+        return (text.to_string(), String::new());
+    }
+    let reasoning = text[start + "<think>".len()..end].trim().to_string();
+    let mut rest = String::new();
+    rest.push_str(text[..start].trim());
+    let after = text[end + "</think>".len()..].trim();
+    if !rest.is_empty() && !after.is_empty() {
+        rest.push('\n');
+    }
+    rest.push_str(after);
+    (rest, reasoning)
+}
+
+fn parse_dsml_tools(text: &str) -> (String, Vec<FunctionCall>) {
+    const MARK: &str = "｜DSML｜";
+    let open = format!("<{MARK}tool_calls>");
+    let close = format!("</{MARK}tool_calls>");
+    let Some(start) = text.find(&open) else {
+        return (text.to_string(), Vec::new());
+    };
+    let Some(end_rel) = text[start..].find(&close) else {
+        return (text.to_string(), Vec::new());
+    };
+    let block_start = start + open.len();
+    let block_end = start + end_rel;
+    let block = &text[block_start..block_end];
+    let invoke_open = format!("<{MARK}invoke name=\"");
+    let mut calls = Vec::new();
+    let mut rest = block;
+    let mut i = 0;
+    while let Some(p) = rest.find(&invoke_open) {
+        let after = &rest[p + invoke_open.len()..];
+        let Some(q) = after.find('"') else {
+            break;
+        };
+        let name = after[..q].to_string();
+        let mut args = serde_json::Map::new();
+        let param_open = format!("<{MARK}parameter name=\"");
+        let inner_end = after.find(&format!("</{MARK}invoke>")).unwrap_or(after.len());
+        let inner = &after[..inner_end];
+        let mut scan = inner;
+        while let Some(pp) = scan.find(&param_open) {
+            let a = &scan[pp + param_open.len()..];
+            let Some(nq) = a.find('"') else { break };
+            let key = a[..nq].to_string();
+            let after_key = &a[nq + 1..];
+            let is_string = after_key.contains("string=\"true\"");
+            let Some(gt) = after_key.find('>') else { break };
+            let val_src = &after_key[gt + 1..];
+            let close_p = format!("</{MARK}parameter>");
+            let Some(vend) = val_src.find(&close_p) else { break };
+            let raw = val_src[..vend].to_string();
+            args.insert(
+                key,
+                if is_string {
+                    Value::String(raw)
+                } else {
+                    serde_json::from_str(&raw).unwrap_or(Value::String(raw))
+                },
+            );
+            scan = &val_src[vend + close_p.len()..];
+        }
+        calls.push(FunctionCall {
+            call_id: format!("call_{i}"),
+            name,
+            arguments: Value::Object(args).to_string(),
+        });
+        i += 1;
+        rest = &after[inner_end..];
+    }
+    if calls.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut kept = String::new();
+    kept.push_str(text[..start].trim());
+    let after = text[block_end + close.len()..].trim();
+    if !kept.is_empty() && !after.is_empty() {
+        kept.push('\n');
+    }
+    kept.push_str(after);
+    (kept, calls)
+}
+
 fn complete_from_chat(
     id: String,
     text: String,
+    reasoning: String,
     function_calls: Vec<FunctionCall>,
     usage: CacheUsage,
 ) -> CompleteResponse {
     let mut output_items = Vec::new();
+    if !reasoning.is_empty() {
+        output_items.push(json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }));
+    }
     if !text.is_empty() {
         output_items.push(json!({
             "type": "message",
@@ -544,6 +750,7 @@ fn cache_usage(body: &Value) -> CacheUsage {
 struct ChatStream {
     id: String,
     text: String,
+    reasoning: String,
     calls: Vec<StreamCall>,
     usage: CacheUsage,
 }
@@ -593,11 +800,8 @@ impl ChatStream {
             .or_else(|| choice.get("message"))
             .cloned()
             .unwrap_or(Value::Null);
-        if let Some(think) = delta
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(think) = delta_reasoning(&delta) {
+            self.reasoning.push_str(think);
             on_reasoning(think);
         }
         if let Some(piece) = delta.get("content").and_then(Value::as_str) {
@@ -652,7 +856,7 @@ impl ChatStream {
                 },
             });
         }
-        if self.text.is_empty() && function_calls.is_empty() {
+        if self.text.is_empty() && function_calls.is_empty() && self.reasoning.is_empty() {
             return Err(Error::Provider(
                 "stream ended without assistant text or tool calls".into(),
             ));
@@ -660,10 +864,20 @@ impl ChatStream {
         Ok(complete_from_chat(
             self.id,
             self.text,
+            self.reasoning,
             function_calls,
             self.usage,
         ))
     }
+}
+
+fn delta_reasoning(delta: &Value) -> Option<&str> {
+    for key in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(s) = delta.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return Some(s);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -824,6 +1038,59 @@ mod tests {
         assert_eq!(parsed.text, "PONG");
         assert_eq!(parsed.usage.input_tokens, 21);
         assert_eq!(parsed.usage.cached_tokens, 308);
+        assert_eq!(
+            crate::provider::extract_reasoning_text(&parsed.output_items),
+            "The user wants exactly PONG."
+        );
+    }
+
+    #[test]
+    fn gateway_swallowed_tools_surfaces_a_warning() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "unknown tool now",
+                    "reasoning_content": "let me call now"
+                }
+            }],
+            "gateway": {
+                "vision_tool": "see_image",
+                "tool_calls": [{"name": "now", "args_keys": []}]
+            }
+        });
+        let parsed = parse_chat_body(&body).unwrap();
+        assert!(parsed.function_calls.is_empty());
+        assert_eq!(parsed.server_items[0]["type"], "gateway");
+        assert!(parsed.server_items[0]["error"].as_str().unwrap().contains("see_image"));
+    }
+
+    #[test]
+    fn splits_think_tags_and_dsml_tool_block() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>plan</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"now\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                }
+            }]
+        });
+        let parsed = parse_chat_body(&body).unwrap();
+        assert_eq!(
+            crate::provider::extract_reasoning_text(&parsed.output_items),
+            "plan"
+        );
+        assert_eq!(parsed.function_calls.len(), 1);
+        assert_eq!(parsed.function_calls[0].name, "now");
+    }
+
+    #[test]
+    fn health_url_sits_beside_v1() {
+        assert_eq!(
+            health_url("http://127.0.0.1:40013/v1"),
+            "http://127.0.0.1:40013/health"
+        );
     }
 
     #[test]

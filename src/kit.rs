@@ -186,6 +186,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             spec.agent_name.clone(),
             spec.model.clone(),
             spec.child_mode.clone(),
+            spec.knobs.clone(),
         )?;
         tools.push(Box::new(SpawnAgentTool::new(n.clone(), tee.clone())));
         tools.push(Box::new(SendMessageTool::new(n.clone(), tee.clone())));

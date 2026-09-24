@@ -88,6 +88,11 @@ impl ProviderConfig {
         xai_logged_in
     }
 
+    /// Grok login and a custom endpoint can serve models side by side.
+    pub fn has_endpoint(&self) -> bool {
+        !self.base_url.trim().is_empty()
+    }
+
     pub fn effective_model(&self) -> &str {
         let m = self.model.trim();
         if !m.is_empty() {
@@ -113,17 +118,19 @@ impl ProviderConfig {
         self.route_for(self.effective_model())
     }
 
+    /// Routing is per model, not per settings panel: Grok ids go to the xAI
+    /// login and everything else goes to the custom endpoint. That lets a
+    /// session mix both, e.g. a custom main model with Grok child agents.
     pub fn route_for(&self, model: &str) -> ProviderKind {
-        if self.kind.is_openai() {
-            return ProviderKind::Openai;
-        }
         let m = model.trim();
         let m = if m.is_empty() {
             self.effective_model()
         } else {
             m
         };
-        if !self.base_url.trim().is_empty() && !Self::looks_like_grok(m) {
+        if Self::looks_like_grok(m) {
+            ProviderKind::Xai
+        } else if self.has_endpoint() || self.kind.is_openai() {
             ProviderKind::Openai
         } else {
             ProviderKind::Xai
@@ -135,12 +142,19 @@ impl ProviderConfig {
     }
 
     pub fn window_tokens(&self) -> u32 {
+        self.window_tokens_for(self.effective_model())
+    }
+
+    /// Context window for one model: the configured window only applies to the
+    /// custom endpoint; Grok models look their window up from the catalog (0).
+    pub fn window_tokens_for(&self, model: &str) -> u32 {
+        if !self.route_for(model).is_openai() {
+            return 0;
+        }
         if self.context_window > 0 {
             self.context_window
-        } else if self.route().is_openai() {
-            crate::compact::DEFAULT_WINDOW
         } else {
-            0
+            crate::compact::DEFAULT_WINDOW
         }
     }
 
@@ -324,5 +338,22 @@ mod tests {
         assert!(!no_url.ready(true), "xAI login must not send Qwen to Grok");
         assert!(ProviderConfig::looks_like_grok("grok-4.6"));
         assert!(!ProviderConfig::looks_like_grok("Qwen3.8-27B-ABLITERATED-Q8_0"));
+    }
+
+    #[test]
+    fn grok_model_routes_to_xai_even_when_kind_is_openai() {
+        let cfg = ProviderConfig {
+            kind: ProviderKind::Openai,
+            base_url: "http://127.0.0.1:40056/v1".into(),
+            model: "Qwen3.8-27B".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.route(), ProviderKind::Openai);
+        assert_eq!(
+            cfg.route_for("grok-4.6"),
+            ProviderKind::Xai,
+            "grok ids must reach the xAI login even from the custom-API panel"
+        );
+        assert_eq!(cfg.route_for("qwen-2"), ProviderKind::Openai);
     }
 }

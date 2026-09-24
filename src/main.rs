@@ -173,6 +173,8 @@ async fn real_main() -> grokaagent::Result<()> {
                 workspace: std::env::current_dir()?,
                 max_turns: 0,
                 web_search: cfg.kind != ProviderKind::Openai,
+                dispatcher: false,
+                child_model: String::new(),
                 reasoning_effort: ReasoningEffort::High,
             })
             .await?;
@@ -229,6 +231,8 @@ async fn real_main() -> grokaagent::Result<()> {
                 },
                 max_turns,
                 web_search: !no_web_search && cfg.kind != ProviderKind::Openai,
+                dispatcher: false,
+                child_model: String::new(),
                 reasoning_effort: reasoning,
             })
             .await?;
@@ -262,11 +266,12 @@ async fn real_main() -> grokaagent::Result<()> {
             let (cfg, model) = boot_provider(api, model, false)?;
             let sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
             let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
-            let server_tools = if cfg.route().is_openai() {
+            let server_tools = if cfg.route_for(&model).is_openai() {
                 vec![]
             } else {
                 kit::search_tools(web_search)
             };
+            let context_window = cfg.window_tokens_for(&model);
             let outcome = kit::run_with_nursery(
                 &provider,
                 sink,
@@ -289,7 +294,7 @@ async fn real_main() -> grokaagent::Result<()> {
                     inbox: None,
                     images: Vec::new(),
                     ask: None,
-                    context_window: cfg.window_tokens(),
+                    context_window,
                     cancel: None,
                     skills: None,
                     task: None,

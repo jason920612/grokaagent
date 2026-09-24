@@ -353,6 +353,9 @@ pub fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf
 }
 
 /// Resolve a path that may not exist yet (write/create).
+///
+/// Existing path components are canonicalized so a symlink/junction that points
+/// outside the workspace cannot be used as a write escape hatch.
 pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf> {
     if requested.is_empty() {
         return Err(Error::Tool("path is required".into()));
@@ -382,17 +385,44 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
                 if !out.pop() || !out.starts_with(&workspace) {
                     return Err(Error::Tool("path escapes workspace".into()));
                 }
+                if out.exists() {
+                    out = canonicalize_in_workspace(&workspace, &out)?;
+                }
             }
-            Component::Normal(s) => out.push(s),
+            Component::Normal(s) => {
+                out.push(s);
+                if out.exists() {
+                    out = canonicalize_in_workspace(&workspace, &out)?;
+                }
+            }
             Component::Prefix(_) | Component::RootDir => {
                 return Err(Error::Tool("path escapes workspace".into()));
             }
+        }
+    }
+    if out.exists() {
+        return canonicalize_in_workspace(&workspace, &out);
+    }
+    if let Some(parent) = out.parent() {
+        if parent.exists() {
+            let parent = canonicalize_in_workspace(&workspace, parent)?;
+            return Ok(parent.join(out.file_name().unwrap_or_default()));
         }
     }
     if !out.starts_with(&workspace) {
         return Err(Error::Tool("path escapes workspace".into()));
     }
     Ok(out)
+}
+
+fn canonicalize_in_workspace(workspace: &Path, path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| Error::Tool("path escapes workspace".into()))?;
+    if !canonical.starts_with(workspace) {
+        return Err(Error::Tool("path escapes workspace".into()));
+    }
+    Ok(canonical)
 }
 
 fn read_utf8_capped(path: &Path) -> Result<String> {
@@ -1436,6 +1466,34 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let err = resolve_in_workspace(&workspace, "../secret.txt").unwrap_err();
         assert!(err.to_string().contains("escapes"), "{}", err);
+    }
+
+    #[test]
+    fn write_target_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let link = workspace.join("leak");
+        let linked = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside, &link).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&outside, &link).is_ok()
+            }
+        };
+        if !linked {
+            // Symlink creation needs privileges on some Windows setups.
+            return;
+        }
+        let err = resolve_target_in_workspace(&workspace, "leak/evil.txt").unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        let ok = resolve_target_in_workspace(&workspace, "safe.txt").unwrap();
+        assert!(ok.starts_with(workspace.canonicalize().unwrap()));
     }
 
     #[test]

@@ -420,11 +420,18 @@ fn grok_client_mode() -> String {
     std::env::var("GROKA_CLIENT_MODE").unwrap_or_else(|_| "interactive".into())
 }
 
-/// Grok OAuth Responses API, or an OpenAI-compatible Chat Completions endpoint.
+/// Grok OAuth Responses API, an OpenAI-compatible Chat Completions endpoint,
+/// or both at once. With both connected, every request is routed by its model
+/// id (`grok-…` → xAI, anything else → the endpoint), so the main model and
+/// child agents can come from different backends and switch live.
 #[derive(Clone)]
 pub enum AnyProvider {
     Xai(XaiOauthProvider),
     Openai(crate::openai::OpenAiCompatProvider),
+    Both {
+        xai: XaiOauthProvider,
+        openai: crate::openai::OpenAiCompatProvider,
+    },
 }
 
 impl AnyProvider {
@@ -442,6 +449,24 @@ impl AnyProvider {
         let resolved = model
             .clone()
             .unwrap_or_else(|| cfg.effective_model().to_string());
+        if cfg.has_endpoint() {
+            let openai = crate::openai::OpenAiCompatProvider::new(
+                cfg,
+                Some(if resolved.is_empty() {
+                    "unset".into()
+                } else {
+                    resolved.clone()
+                }),
+            )?;
+            // The xAI side never rejects here; a Grok request without a login
+            // fails at call time with the auth error, which is the right hint.
+            return match auth::default_auth_path()
+                .and_then(|p| XaiOauthProvider::new(p, model.clone()))
+            {
+                Ok(xai) => Ok(Self::Both { xai, openai }),
+                Err(_) => Ok(Self::Openai(openai)),
+            };
+        }
         match cfg.route_for(&resolved) {
             crate::config::ProviderKind::Xai => {
                 if !resolved.is_empty()
@@ -454,16 +479,9 @@ impl AnyProvider {
                 let auth_path = auth::default_auth_path()?;
                 Ok(Self::Xai(XaiOauthProvider::new(auth_path, model)?))
             }
-            crate::config::ProviderKind::Openai => {
-                if cfg.base_url.trim().is_empty() {
-                    return Err(Error::Provider(
-                        crate::config::ProviderConfig::missing_endpoint_error(&resolved),
-                    ));
-                }
-                Ok(Self::Openai(crate::openai::OpenAiCompatProvider::new(
-                    cfg, model,
-                )?))
-            }
+            crate::config::ProviderKind::Openai => Err(Error::Provider(
+                crate::config::ProviderConfig::missing_endpoint_error(&resolved),
+            )),
         }
     }
 
@@ -471,13 +489,24 @@ impl AnyProvider {
         match self {
             Self::Xai(p) => p.model(),
             Self::Openai(p) => p.model(),
+            Self::Both { openai, .. } => openai.model(),
         }
+    }
+
+    /// Route a per-request model id when both backends are connected.
+    fn grok_request(&self, req_model: &str) -> bool {
+        let m = req_model.trim();
+        let m = if m.is_empty() { self.model() } else { m };
+        crate::config::ProviderConfig::looks_like_grok(m)
     }
 
     pub async fn list_models(&self) -> Result<crate::catalog::ModelCatalog> {
         match self {
             Self::Xai(p) => p.list_models().await,
             Self::Openai(p) => p.list_models().await,
+            // The TUI fetches the endpoint's catalog separately; this path
+            // serves the Grok catalog refresh.
+            Self::Both { xai, .. } => xai.list_models().await,
         }
     }
 
@@ -485,6 +514,13 @@ impl AnyProvider {
         match self {
             Self::Xai(p) => p.generate_session_title(user_message).await,
             Self::Openai(p) => p.generate_session_title(user_message).await,
+            Self::Both { xai, openai } => {
+                if self.grok_request("") {
+                    xai.generate_session_title(user_message).await
+                } else {
+                    openai.generate_session_title(user_message).await
+                }
+            }
         }
     }
 }
@@ -494,6 +530,13 @@ impl Provider for AnyProvider {
         match self {
             Self::Xai(p) => p.complete(req).await,
             Self::Openai(p) => p.complete(req).await,
+            Self::Both { xai, openai } => {
+                if self.grok_request(&req.model) {
+                    xai.complete(req).await
+                } else {
+                    openai.complete(req).await
+                }
+            }
         }
     }
 
@@ -507,6 +550,13 @@ impl Provider for AnyProvider {
         match self {
             Self::Xai(p) => p.complete_stream(req, on_text, on_server, on_reasoning).await,
             Self::Openai(p) => p.complete_stream(req, on_text, on_server, on_reasoning).await,
+            Self::Both { xai, openai } => {
+                if self.grok_request(&req.model) {
+                    xai.complete_stream(req, on_text, on_server, on_reasoning).await
+                } else {
+                    openai.complete_stream(req, on_text, on_server, on_reasoning).await
+                }
+            }
         }
     }
 
@@ -514,6 +564,13 @@ impl Provider for AnyProvider {
         match self {
             Self::Xai(p) => p.compact(req).await,
             Self::Openai(p) => p.compact(req).await,
+            Self::Both { xai, openai } => {
+                if self.grok_request("") {
+                    xai.compact(req).await
+                } else {
+                    openai.compact(req).await
+                }
+            }
         }
     }
 }
@@ -1495,7 +1552,38 @@ mod tests {
         };
         match AnyProvider::connect(&cfg, None).unwrap() {
             AnyProvider::Openai(p) => assert_eq!(p.model(), "Qwen3.8-27B-ABLITERATED-Q8_0"),
+            AnyProvider::Both { openai, .. } => {
+                assert_eq!(openai.model(), "Qwen3.8-27B-ABLITERATED-Q8_0");
+            }
             AnyProvider::Xai(_) => panic!("must not send Qwen to xAI"),
         }
+    }
+
+    #[test]
+    fn endpoint_config_still_routes_grok_requests_to_xai() {
+        let cfg = crate::config::ProviderConfig {
+            kind: crate::config::ProviderKind::Openai,
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "Qwen3.8-27B".into(),
+            ..Default::default()
+        };
+        let p = AnyProvider::connect(&cfg, None).unwrap();
+        match &p {
+            AnyProvider::Both { .. } => {}
+            other => panic!(
+                "endpoint + home dir must connect both backends, got {}",
+                match other {
+                    AnyProvider::Xai(_) => "xai",
+                    AnyProvider::Openai(_) => "openai",
+                    AnyProvider::Both { .. } => unreachable!(),
+                }
+            ),
+        }
+        assert!(p.grok_request("grok-4.6"), "grok ids go to the login");
+        assert!(!p.grok_request("qwen-2"), "custom ids go to the endpoint");
+        assert!(
+            !p.grok_request(""),
+            "empty request model follows the main model (Qwen)"
+        );
     }
 }

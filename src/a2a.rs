@@ -208,6 +208,37 @@ pub fn failed_task(message: &str, context_id: &str) -> Value {
     })
 }
 
+pub fn working_task(context_id: &str) -> Value {
+    json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "contextId": context_id,
+        "status": {"state": TASK_WORKING},
+        "artifacts": []
+    })
+}
+
+pub fn canceled_task(context_id: &str) -> Value {
+    json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "contextId": context_id,
+        "status": {"state": TASK_CANCELED},
+        "artifacts": []
+    })
+}
+
+/// Keep id/contextId; replace status/artifacts.
+pub fn finish_task(task: &mut Value, done: Value) {
+    let id = task.get("id").cloned();
+    let ctx = task.get("contextId").cloned();
+    *task = done;
+    if let Some(id) = id {
+        task["id"] = id;
+    }
+    if let Some(ctx) = ctx {
+        task["contextId"] = ctx;
+    }
+}
+
 pub fn is_terminal(state: &str) -> bool {
     matches!(state, "TASK_STATE_COMPLETED" | "TASK_STATE_FAILED" | "TASK_STATE_CANCELED")
 }

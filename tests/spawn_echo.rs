@@ -64,6 +64,7 @@ async fn binary_echo_worker_handshake_and_spawn_agent() {
         "root".into(),
         "grok-4.6".into(),
         "echo".into(),
+        None,
     )
     .unwrap();
     let sink: std::sync::Arc<dyn EventSink> = std::sync::Arc::new(FanoutSink { sinks: vec![] });

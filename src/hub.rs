@@ -83,6 +83,8 @@ pub struct UiSnapshot {
     pub send_mode: String,
     pub rail: UiRail,
     pub settings: Option<UiSettings>,
+    #[serde(default)]
+    pub settings_data: Option<UiSettings>,
     pub ask: Option<UiAsk>,
     pub picker: Option<UiPicker>,
     pub inspector: Option<UiInspector>,
@@ -91,6 +93,10 @@ pub struct UiSnapshot {
     pub skill_view: Option<UiSkillView>,
     pub rename: Option<UiRename>,
     pub task: Option<UiTask>,
+    #[serde(default)]
+    pub task_summary: UiTask,
+    #[serde(default)]
+    pub receipts: Vec<(String, String)>,
     pub web_url: String,
 }
 
@@ -109,6 +115,9 @@ pub struct UiHeader {
     pub workspace: String,
     #[serde(default)]
     pub task_live: bool,
+    /// `xai` or `openai` — which connection mode Settings last chose.
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -160,6 +169,7 @@ pub struct UiFileChange {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiSession {
+    pub status: String,
     pub id: String,
     pub name: String,
     pub short_id: String,
@@ -229,6 +239,14 @@ pub struct UiSettings {
     pub models: Vec<(String, String)>,
     pub efforts: Vec<(String, String)>,
     pub web_search: bool,
+    #[serde(default)]
+    pub dispatcher: bool,
+    /// Default model for child agents; empty follows the main model.
+    #[serde(default)]
+    pub child_model: String,
+    /// The custom endpoint listed its models, so pickers can be dropdowns.
+    #[serde(default)]
+    pub custom_models: bool,
     pub import_claude: bool,
     pub import_codex: bool,
     #[serde(default)]
@@ -312,8 +330,10 @@ pub struct UiTaskItem {
     pub done: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UiTask {
+    #[serde(default)]
+    pub note: String,
     pub mode: String,
     pub goal: String,
     pub draft: String,
@@ -324,6 +344,11 @@ pub struct UiTask {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiCommand {
+    RefreshSettings,
+    StartTask { session_id: String, goal: String },
+    Rename { id: String, text: String },
+    UpdateQueue { session_id: String, request_id: String, index: usize, expected: String, text: String },
+    SubmitText { session_id: String, request_id: String, text: String, insert: bool },
     SetComposer { text: String, caret: usize, seq: u64 },
     Submit { insert: bool },
     Interrupt,
@@ -348,8 +373,10 @@ pub enum UiCommand {
     SetApiKey { text: String },
     SetContext { text: String },
     SetModel { id: String },
+    SetChildModel { id: String },
     SetEffort { id: String },
     ToggleSearch,
+    ToggleDispatcher,
     ToggleImportClaude,
     ToggleImportCodex,
     ToggleSkill { index: usize },

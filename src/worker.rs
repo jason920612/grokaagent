@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::a2a::{self, Handshake};
+use crate::agent::CancelFlag;
 use crate::error::{Error, Result};
 use crate::events::JsonlSink;
 use crate::provider::AnyProvider;
@@ -46,6 +47,11 @@ pub struct WorkerConfig {
     pub reasoning_effort: crate::provider::ReasoningEffort,
 }
 
+struct ActiveRun {
+    task_id: String,
+    cancel: CancelFlag,
+}
+
 struct WorkerState {
     name: String,
     origin: String,
@@ -53,6 +59,7 @@ struct WorkerState {
     cfg: WorkerConfigView,
     tasks: Mutex<HashMap<String, Value>>,
     run_lock: Mutex<()>,
+    active: Mutex<Option<ActiveRun>>,
 }
 
 #[derive(Clone)]
@@ -97,6 +104,7 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
         },
         tasks: Mutex::new(HashMap::new()),
         run_lock: Mutex::new(()),
+        active: Mutex::new(None),
     });
     let app = Router::new()
         .route("/.well-known/agent-card.json", get(agent_card))
@@ -144,20 +152,101 @@ async fn message_send(
         let task = a2a::failed_task("empty message", &context_id);
         return (StatusCode::OK, Json(json!({"task": task})));
     }
-    let task = match st.mode {
-        WorkerMode::Echo => a2a::completed_task(&format!("echo:{text}"), &context_id),
+    match st.mode {
+        WorkerMode::Echo => {
+            let task = a2a::completed_task(&format!("echo:{text}"), &context_id);
+            if let Some(id) = task.get("id").and_then(Value::as_str) {
+                st.tasks.lock().await.insert(id.to_string(), task.clone());
+            }
+            (StatusCode::OK, Json(json!({"task": task})))
+        }
         WorkerMode::Grok => {
-            let _g = st.run_lock.lock().await;
-            match run_grok(&st, &text).await {
-                Ok(reply) => a2a::completed_task(&reply, &context_id),
-                Err(e) => a2a::failed_task(&e.to_string(), &context_id),
+            let task = a2a::working_task(&context_id);
+            let task_id = task
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let cancel = CancelFlag::new();
+            st.tasks
+                .lock()
+                .await
+                .insert(task_id.clone(), task.clone());
+            *st.active.lock().await = Some(ActiveRun {
+                task_id: task_id.clone(),
+                cancel: cancel.clone(),
+            });
+            let st_bg = st.clone();
+            let text = text.to_string();
+            tokio::spawn(async move {
+                run_grok_task(st_bg, task_id, text, cancel).await;
+            });
+            (StatusCode::OK, Json(json!({"task": task})))
+        }
+    }
+}
+
+async fn run_grok_task(st: Arc<WorkerState>, task_id: String, text: String, cancel: CancelFlag) {
+    let _g = st.run_lock.lock().await;
+    if cancel.is_set() {
+        finalize_canceled(&st, &task_id).await;
+        return;
+    }
+    let result = run_grok(&st, &text, cancel.clone()).await;
+    let mut tasks = st.tasks.lock().await;
+    let Some(task) = tasks.get_mut(&task_id) else {
+        *st.active.lock().await = None;
+        return;
+    };
+    if cancel.is_set() || a2a::task_state(task) == a2a::TASK_CANCELED {
+        let ctx = task
+            .get("contextId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        a2a::finish_task(task, a2a::canceled_task(&ctx));
+    } else {
+        match result {
+            Ok(reply) => {
+                let ctx = task
+                    .get("contextId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                a2a::finish_task(task, a2a::completed_task(&reply, &ctx));
+            }
+            Err(e) => {
+                let ctx = task
+                    .get("contextId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                a2a::finish_task(task, a2a::failed_task(&e.to_string(), &ctx));
             }
         }
-    };
-    if let Some(id) = task.get("id").and_then(Value::as_str) {
-        st.tasks.lock().await.insert(id.to_string(), task.clone());
     }
-    (StatusCode::OK, Json(json!({"task": task})))
+    drop(tasks);
+    let mut active = st.active.lock().await;
+    if active.as_ref().is_some_and(|a| a.task_id == task_id) {
+        *active = None;
+    }
+}
+
+async fn finalize_canceled(st: &WorkerState, task_id: &str) {
+    let mut tasks = st.tasks.lock().await;
+    if let Some(task) = tasks.get_mut(task_id) {
+        let ctx = task
+            .get("contextId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        a2a::finish_task(task, a2a::canceled_task(&ctx));
+    }
+    drop(tasks);
+    let mut active = st.active.lock().await;
+    if active.as_ref().is_some_and(|a| a.task_id == task_id) {
+        *active = None;
+    }
 }
 
 async fn get_task(
@@ -177,9 +266,22 @@ async fn cancel_task(
     State(st): State<Arc<WorkerState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
+    {
+        let active = st.active.lock().await;
+        if let Some(a) = active.as_ref() {
+            if a.task_id == id {
+                a.cancel.trip();
+            }
+        }
+    }
     let mut tasks = st.tasks.lock().await;
     if let Some(t) = tasks.get_mut(&id) {
-        t["status"]["state"] = json!(a2a::TASK_CANCELED);
+        let ctx = t
+            .get("contextId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        a2a::finish_task(t, a2a::canceled_task(&ctx));
         return (StatusCode::OK, Json(t.clone()));
     }
     (
@@ -188,7 +290,7 @@ async fn cancel_task(
     )
 }
 
-async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
+async fn run_grok(st: &WorkerState, prompt: &str, cancel: CancelFlag) -> Result<String> {
     let sink: std::sync::Arc<dyn crate::events::EventSink> =
         std::sync::Arc::new(JsonlSink::create(&st.cfg.events)?);
     let cfg = crate::config::ProviderConfig::load();
@@ -214,8 +316,8 @@ async fn run_grok(st: &WorkerState, prompt: &str) -> Result<String> {
             inbox: None,
             images: Vec::new(),
             ask: None,
-            context_window: cfg.window_tokens(),
-            cancel: None,
+            context_window: cfg.window_tokens_for(&st.cfg.model),
+            cancel: Some(cancel),
             skills: None,
             task: None,
         },

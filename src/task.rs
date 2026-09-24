@@ -36,6 +36,7 @@ Rules:
 - checklist: 3–12 concrete, verifiable items. Keep stable wording across reviews; mark done when the conversation shows the item is actually finished.
 - next: one short instruction for the worker agent in the user's language. Empty when complete or impossible.
 - reason: empty on continue; on complete say what was achieved; on impossible name the unchangeable constraint.
+- On complete, reason must identify concrete artifacts or verification results visible in the conversation. Never invent evidence.
 - If the worker claimed impossibility, accept only when the claim is actually unchangeable. Otherwise status=continue and tell them why they must keep going.
 "#;
 
@@ -85,6 +86,8 @@ impl TaskPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskState {
+    #[serde(default)]
+    pub review_note: String,
     #[serde(default)]
     pub goal: String,
     #[serde(default)]
@@ -349,7 +352,7 @@ fn parse_verdict_inner(raw: &str) -> Result<Verdict> {
         v.get("reason").and_then(Value::as_str).unwrap_or(""),
         800,
     );
-    if matches!(status, Status::Continue) && next.trim().is_empty() && checklist.iter().all(|i| i.done)
+    if matches!(status, Status::Continue) && next.trim().is_empty() && !checklist.is_empty() && checklist.iter().all(|i| i.done)
     {
         return Ok(Verdict {
             status: Status::Complete,
@@ -751,9 +754,18 @@ async fn review_and_steer<P: Provider>(
         Ok(v) => v,
         Err(e) => {
             emit_notice(sink, run_id, format!("任務系統檢查失敗：{e}。先停下等你。"));
+            let mut state = hub.snapshot();
+            if state.goal == snap.goal && state.phase == snap.phase {
+                state.review_note = format!("任務檢查失敗：{e}，等待你的下一個指示");
+                state.skip_steer = true;
+                hub.replace(state);
+            }
             return None;
         }
     };
+    // Do not restore a goal the user ended or replaced while the review ran.
+    let current = hub.snapshot();
+    if current.goal != snap.goal || current.phase != snap.phase || current.skip_steer != snap.skip_steer { return None; }
     apply_verdict(hub, run_id, snap, verdict, sink)
 }
 
@@ -766,6 +778,7 @@ fn apply_verdict(
 ) -> Option<String> {
     emit_spawn(sink, run_id, &snap.goal, hub);
     snap.spawned = true;
+    let has_checklist = !verdict.checklist.is_empty();
     if !verdict.checklist.is_empty() {
         snap.checklist = verdict.checklist;
     } else if snap.checklist.is_empty() {
@@ -776,11 +789,17 @@ fn apply_verdict(
     }
     snap.claim = None;
     snap.skip_steer = false;
-    match verdict.status {
+    // A completion claim cannot manufacture evidence or check unfinished items.
+    let status = if verdict.status == Status::Complete
+        && (!has_checklist || snap.checklist.iter().any(|i| !i.done))
+    {
+        Status::Continue
+    } else {
+        verdict.status
+    };
+    match status {
         Status::Complete => {
-            for i in &mut snap.checklist {
-                i.done = true;
-            }
+            snap.review_note = verdict.reason.clone();
             snap.phase = TaskPhase::Done;
             snap.fail_reason.clear();
             hub.replace(snap.clone());
@@ -801,6 +820,7 @@ fn apply_verdict(
                 verdict.reason
             };
             snap.phase = TaskPhase::ExplainingFail;
+            snap.review_note = reason.clone();
             snap.fail_reason = reason.clone();
             hub.replace(snap.clone());
             let msg = format!("無法完成。\n目標：{}\n原因：{reason}", snap.goal);
@@ -813,6 +833,7 @@ fn apply_verdict(
             Some(explain_fail_instruction(&snap.goal, &reason))
         }
         Status::Continue => {
+            snap.review_note.clear();
             snap.phase = TaskPhase::Active;
             let next = if verdict.next.trim().is_empty() {
                 "繼續完成尚未勾選的檢查項，做完再停下。".into()
@@ -889,6 +910,27 @@ mod tests {
         let raw = r#"{"status":"continue","checklist":[{"text":"a","done":true}],"next":"","reason":""}"#;
         let v = parse_verdict_inner(raw).unwrap();
         assert_eq!(v.status, Status::Complete);
+    }
+
+    #[test]
+    fn empty_checklist_does_not_complete() {
+        let v = parse_verdict_inner(r#"{"status":"continue","checklist":[],"next":""}"#).unwrap();
+        assert_eq!(v.status, Status::Continue);
+    }
+
+    #[test]
+    fn completion_cannot_check_unfinished_items_or_reuse_an_empty_verdict() {
+        for checklist in [vec![], vec![CheckItem { text: "驗證成果".into(), done: false }]] {
+            let hub = TaskHub::new("");
+            hub.start_goal("完成成果");
+            let rec = Rec(Mutex::new(Vec::new()));
+            let next = apply_verdict(&hub, "r", hub.snapshot(), Verdict {
+                status: Status::Complete, checklist, next: String::new(), reason: "done".into(),
+            }, &rec);
+            assert!(next.is_some());
+            assert_eq!(hub.snapshot().phase, TaskPhase::Active);
+            assert!(hub.snapshot().checklist.iter().any(|item| !item.done));
+        }
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub struct Nursery {
     agent_name: String,
     model: String,
     mode: String,
+    /// Live session knobs; `child_model` there overrides [`Self::model`] as
+    /// the default for new children. `None` for workers and one-shot runs.
+    knobs: Option<Arc<std::sync::Mutex<crate::agent::SessionKnobs>>>,
     timeout: Duration,
     client: A2aClient,
     children: Mutex<HashMap<String, Child>>,
@@ -44,6 +47,16 @@ struct Child {
     stop_tail: Option<oneshot::Sender<()>>,
 }
 
+/// The per-child model override from spawn args, or the parent's model.
+fn child_model(args: &Value, parent_model: &str) -> String {
+    args.get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| parent_model.to_string())
+}
+
 impl Nursery {
     pub fn new(
         worker_bin: PathBuf,
@@ -54,6 +67,7 @@ impl Nursery {
         agent_name: String,
         model: String,
         mode: String,
+        knobs: Option<Arc<std::sync::Mutex<crate::agent::SessionKnobs>>>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             worker_bin,
@@ -66,10 +80,26 @@ impl Nursery {
             agent_name,
             model,
             mode,
+            knobs,
             timeout: DEFAULT_TASK_TIMEOUT,
             client: A2aClient::new()?,
             children: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// The session's configured child model, or this nursery's parent model.
+    fn default_child_model(&self) -> String {
+        self.knobs
+            .as_ref()
+            .map(|k| {
+                k.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .child_model
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.model.clone())
     }
 
     pub async fn child_names(&self) -> Vec<String> {
@@ -105,6 +135,7 @@ impl Nursery {
             .get("prompt")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Tool("spawn_agent requires prompt".into()))?;
+        let model = child_model(args, &self.default_child_model());
         {
             let kids = self.children.lock().await;
             if kids.contains_key(&name) {
@@ -136,7 +167,7 @@ impl Nursery {
             .arg("--workspace")
             .arg(&self.workspace)
             .arg("--model")
-            .arg(&self.model)
+            .arg(&model)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -177,20 +208,51 @@ impl Nursery {
             tail_jsonl(events_path, tail_sink, stop_rx).await;
         });
 
-        let task = self
-            .client
-            .send_text(&origin, prompt, None)
-            .await?;
-        let task = self.client.wait_task(&origin, task, self.timeout).await?;
+        // Kick the first task but do not block the parent tool call on completion.
+        let task = self.client.send_text(&origin, prompt, None).await?;
         let context_id = task
             .get("contextId")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let artifact = a2a::artifact_text(&task);
-        let state = a2a::task_state(&task);
+        let task_id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let state = a2a::task_state(&task).to_string();
+        let artifact = if a2a::is_terminal(&state) {
+            a2a::artifact_text(&task)
+        } else {
+            String::new()
+        };
         if !artifact.is_empty() {
             self.emit_message(sink.as_ref(), &name, &self.agent_name, &artifact);
+        } else if !a2a::is_terminal(&state) {
+            let client = self.client.clone();
+            let origin_bg = origin.clone();
+            let task_bg = task.clone();
+            let timeout = self.timeout;
+            let sink_bg = sink.clone();
+            let child_name = name.clone();
+            let parent_name = self.agent_name.clone();
+            let meta = self.meta();
+            tokio::spawn(async move {
+                match client.wait_task(&origin_bg, task_bg, timeout).await {
+                    Ok(done) => {
+                        let text = a2a::artifact_text(&done);
+                        if !text.is_empty() {
+                            sink_bg.emit(&AgentEvent::AgentMessage {
+                                meta,
+                                from: child_name,
+                                to: parent_name,
+                                text,
+                            });
+                        }
+                    }
+                    Err(_) => {}
+                }
+            });
         }
 
         self.children.lock().await.insert(
@@ -206,8 +268,11 @@ impl Nursery {
         Ok(json!({
             "name": name,
             "state": state,
+            "model": model,
             "context_id": context_id,
+            "task_id": task_id,
             "artifact": artifact,
+            "note": "Child started. First task may still be running; use send_message for follow-ups or watch child events for the artifact.",
         })
         .to_string())
     }
@@ -290,12 +355,13 @@ impl ClientTool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "spawn_agent".into(),
-            description: "Start a child agent subprocess over A2A. Use for a separable subtask with a verifiable done condition. Returns the child's artifact.".into(),
+            description: "Start a child agent subprocess over A2A. Use for a separable subtask with a verifiable done condition. Returns immediately after the child starts; the first task may still be running. Use send_message for follow-ups, or watch child events for the artifact.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Short unique child name"},
-                    "prompt": {"type": "string", "description": "Full goal, paths, and done-criteria. The child has no parent context."}
+                    "prompt": {"type": "string", "description": "Full goal, paths, and done-criteria. The child has no parent context."},
+                    "model": {"type": "string", "description": "Optional model id for this child (e.g. grok-4.6). Defaults to the parent's model."}
                 },
                 "required": ["name", "prompt"],
                 "additionalProperties": false
@@ -389,6 +455,69 @@ mod tests {
     use super::*;
     use crate::events::FanoutSink;
 
+    #[test]
+    fn child_model_prefers_spawn_arg_and_falls_back_to_parent() {
+        let args = json!({"name": "a", "prompt": "b", "model": " grok-3-mini "});
+        assert_eq!(child_model(&args, "grok-4.6"), "grok-3-mini");
+        let args = json!({"name": "a", "prompt": "b", "model": ""});
+        assert_eq!(child_model(&args, "grok-4.6"), "grok-4.6");
+        let args = json!({"name": "a", "prompt": "b"});
+        assert_eq!(child_model(&args, "grok-4.6"), "grok-4.6");
+    }
+
+    #[test]
+    fn default_child_model_reads_session_knobs() {
+        let dir = std::env::temp_dir();
+        let knobs = Arc::new(std::sync::Mutex::new(crate::agent::SessionKnobs {
+            model: "grok-4.6".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            send_reasoning: true,
+            server_tools: vec![],
+            dispatcher: false,
+            child_model: "grok-3-mini".into(),
+        }));
+        let n = Nursery::new(
+            PathBuf::from("grokaagent"),
+            dir.clone(),
+            dir,
+            0,
+            "r".into(),
+            "root".into(),
+            "grok-4.6".into(),
+            "echo".into(),
+            Some(knobs.clone()),
+        )
+        .unwrap();
+        assert_eq!(n.default_child_model(), "grok-3-mini");
+        knobs.lock().unwrap().child_model = "  ".into();
+        assert_eq!(n.default_child_model(), "grok-4.6", "blank must follow the parent model");
+    }
+
+    #[test]
+    fn spawn_spec_offers_optional_model() {
+        let dir = std::env::temp_dir();
+        let n = Nursery::new(
+            PathBuf::from("grokaagent"),
+            dir.clone(),
+            dir,
+            0,
+            "r".into(),
+            "root".into(),
+            "grok-4.6".into(),
+            "echo".into(),
+            None,
+        )
+        .unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(FanoutSink { sinks: vec![] });
+        let spec = SpawnAgentTool::new(n, sink).spec();
+        assert!(spec.parameters["properties"]["model"].is_object());
+        assert!(!spec.parameters["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "model"));
+    }
+
     #[tokio::test]
     async fn spawn_blocked_at_max_depth() {
         let dir = tempfile::tempdir().unwrap();
@@ -401,6 +530,7 @@ mod tests {
             "root".into(),
             "grok-4.6".into(),
             "echo".into(),
+            None,
         )
         .unwrap();
         let sink: Arc<dyn EventSink> = Arc::new(FanoutSink { sinks: vec![] });
