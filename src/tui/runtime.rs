@@ -274,7 +274,6 @@ struct Painter {
     content: bool,
     composer: bool,
     cursor_shown: bool,
-    cursor_at: Option<Position>,
     started: bool,
 }
 
@@ -312,7 +311,6 @@ impl Painter {
         if self.cursor_shown {
             terminal.hide_cursor().map_err(Error::Io)?;
             self.cursor_shown = false;
-            self.cursor_at = None;
         }
         Ok(())
     }
@@ -330,10 +328,10 @@ impl Painter {
         app.ui.last_clock_cells = ui::clock_cells(app);
         flush_blits(app, caret)?;
         let want = ui::wants_cursor(app);
-        if self.cursor_at != Some(caret) {
-            execute!(terminal.backend_mut(), MoveTo(caret.x, caret.y)).map_err(Error::Io)?;
-            self.cursor_at = Some(caret);
-        }
+        // Always: writing the diff left the terminal cursor on the last
+        // changed cell, even when the caret itself did not move (switching
+        // to a session whose empty composer sits in the same place).
+        execute!(terminal.backend_mut(), MoveTo(caret.x, caret.y)).map_err(Error::Io)?;
         if want != self.cursor_shown {
             if want {
                 terminal.show_cursor().map_err(Error::Io)?;
