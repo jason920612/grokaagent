@@ -43,35 +43,50 @@ pub(crate) fn activity_bar(f: &mut Frame, app: &mut App, area: Rect) {
             _ => String::new(),
         })
         .collect();
-    let mut y = area.y;
+    // Icon + label per view (3 rows) when there is room, else icon + badge (2).
+    let items = SideView::ALL.len() as u16;
+    let labelled = area.height >= items * 3 + 3;
+    let stride = if labelled { 3 } else { 2 };
+    let mut y = area.y + u16::from(labelled);
     for (i, view) in SideView::ALL.iter().enumerate() {
         if y + 1 >= area.bottom() {
             break;
         }
         let on = app.ui.side_open && app.ui.side_view == *view;
+        let fg = if on { TEXT } else { DIM };
+        let bold = if on { Modifier::BOLD } else { Modifier::empty() };
+        let bar = Span::styled(if on { "▎" } else { " " }, Style::default().fg(ACCENT).bg(ACTIVITY_BG));
+        let badge = if badges[i].chars().count() > 2 { "9+".to_string() } else { badges[i].clone() };
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(if on { "▎" } else { " " }, Style::default().fg(ACCENT).bg(ACTIVITY_BG)),
-                Span::styled(
-                    view.icon(),
-                    Style::default()
-                        .fg(if on { TEXT } else { DIM })
-                        .bg(ACTIVITY_BG)
-                        .add_modifier(if on { Modifier::BOLD } else { Modifier::empty() }),
-                ),
+                bar.clone(),
+                Span::styled(" ", Style::default().bg(ACTIVITY_BG)),
+                // Two cells, so ambiguous-width icons never push the badge.
+                Span::styled(format!("{:<2}", view.icon()), Style::default().fg(fg).bg(ACTIVITY_BG).add_modifier(bold)),
+                Span::styled(format!("{badge:<2}"), Style::default().fg(ACCENT).bg(ACTIVITY_BG).add_modifier(Modifier::BOLD)),
             ])),
             Rect::new(area.x, y, area.width, 1),
         );
-        if !badges[i].is_empty() {
-            line(f, Rect::new(area.x, y + 1, area.width, 1), format!(" {}", badges[i]), Style::default().fg(ACCENT).bg(ACTIVITY_BG));
+        if labelled {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    bar,
+                    Span::styled(view.short(), Style::default().fg(fg).bg(ACTIVITY_BG).add_modifier(bold)),
+                ])),
+                Rect::new(area.x, y + 1, area.width, 1),
+            );
         }
-        app.ui.hits.push((Rect::new(area.x, y, area.width, 2), Hit::Activity(i as u8)));
-        y += 2;
+        app.ui.hits.push((Rect::new(area.x, y, area.width, stride.min(area.bottom() - y)), Hit::Activity(i as u8)));
+        y += stride;
     }
     if area.height >= 2 {
-        let gear = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-        line(f, gear, " ⚙", Style::default().fg(DIM).bg(ACTIVITY_BG));
-        app.ui.hits.push((gear, Hit::ActivitySettings));
+        let rows = if labelled && area.height >= 2 { 2 } else { 1 };
+        let top = area.bottom() - rows;
+        line(f, Rect::new(area.x, top, area.width, 1), "  ⚙", Style::default().fg(DIM).bg(ACTIVITY_BG));
+        if rows == 2 {
+            line(f, Rect::new(area.x, top + 1, area.width, 1), " 設定", Style::default().fg(DIM).bg(ACTIVITY_BG));
+        }
+        app.ui.hits.push((Rect::new(area.x, top, area.width, rows), Hit::ActivitySettings));
     }
 }
 

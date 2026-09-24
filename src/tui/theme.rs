@@ -26,6 +26,6 @@ pub(crate) const SIDEBAR_MIN_TERM: u16 = 100;
 pub(crate) const SIDEBAR_W: u16 = 30;
 /// Below this width the activity bar is hidden (side views stay on F3 / Ctrl+B).
 pub(crate) const ACTIVITY_MIN_TERM: u16 = 60;
-pub(crate) const ACTIVITY_W: u16 = 3;
+pub(crate) const ACTIVITY_W: u16 = 6;
 /// Rows a settings dropdown shows before scrolling.
 pub(crate) const DROP_VISIBLE: usize = 8;

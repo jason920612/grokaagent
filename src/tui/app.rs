@@ -87,6 +87,17 @@ impl SideView {
         }
     }
 
+    /// Two-character label under the activity-bar icon.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Sessions => "對話",
+            Self::Agents => "代理",
+            Self::Changes => "變更",
+            Self::Background => "背景",
+            Self::Task => "任務",
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Sessions => "對話",

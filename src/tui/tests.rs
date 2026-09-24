@@ -983,3 +983,18 @@ fn halfblock_previews_without_graphics_support() {
     assert!(out.contains('▀'));
     assert!(fx.app.images.blits.is_empty());
 }
+
+#[test]
+fn activity_bar_shows_labels_when_tall_and_stays_clickable_when_short() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let out = render(app, 120, 30);
+    for label in ["對話", "代理", "變更", "背景", "任務", "設定"] {
+        assert!(out.contains(label), "missing {label}");
+    }
+    let agents = hit_rect(app, Hit::Activity(1));
+    assert_eq!((agents.width, agents.height), (6, 3), "icon + label + gap is one target");
+    render(app, 120, 14);
+    let agents = hit_rect(app, Hit::Activity(1));
+    assert_eq!(agents.height, 2, "short terminals fall back to the compact bar");
+}

@@ -1,5 +1,6 @@
 /* VS Code-style workbench: activity bar | side bar | editor (tabs, chat,
-   composer, panel) with a status bar. Dark by default, light on request. */
+   composer, panel) with a status bar. Dark by default; the theme button (or the system, in
+   auto) sets data-theme="light" on <html>. */
 :root {
   --bg: #1e1e1e;
   --bg-side: #252526;
@@ -35,32 +36,30 @@
   color-scheme: dark;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #ffffff;
-    --bg-side: #f3f3f3;
-    --bg-activity: #2c2c2c;
-    --bg-tabs: #ececec;
-    --bg-tab-on: #ffffff;
-    --bg-input: #ffffff;
-    --bg-hover: #e8e8e8;
-    --bg-select: #dcdcdc;
-    --ink: #1f1f1f;
-    --muted: #6a6a6a;
-    --line: #d4d4d4;
-    --accent: #005fb8;
-    --user-bg: #dbe9f8;
-    --user-fg: #10263d;
-    --agent: #2f7a45;
-    --think: #6b5a8a;
-    --tool: #8a6a2f;
-    --warn: #b54a2f;
-    --add: #1a7f37;
-    --del: #cf222e;
-    --hunk: #0969da;
-    --shadow: 0 10px 40px rgba(0, 0, 0, 0.18);
-    color-scheme: light;
-  }
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-side: #f3f3f3;
+  --bg-activity: #2c2c2c;
+  --bg-tabs: #ececec;
+  --bg-tab-on: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: #e8e8e8;
+  --bg-select: #dcdcdc;
+  --ink: #1f1f1f;
+  --muted: #6a6a6a;
+  --line: #d4d4d4;
+  --accent: #005fb8;
+  --user-bg: #dbe9f8;
+  --user-fg: #10263d;
+  --agent: #2f7a45;
+  --think: #6b5a8a;
+  --tool: #8a6a2f;
+  --warn: #b54a2f;
+  --add: #1a7f37;
+  --del: #cf222e;
+  --hunk: #0969da;
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.18);
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -621,3 +620,8 @@ button.sb:hover { background: rgba(255, 255, 255, 0.12); }
   .act svg { width: 20px; height: 20px; }
   #status-left .sb.wide, #status-right .sb.wide { display: none; }
 }
+
+#act-theme .theme-icon { display: none; }
+:root[data-theme-pref="auto"] #act-theme .ti-auto,
+:root[data-theme-pref="dark"] #act-theme .ti-dark,
+:root[data-theme-pref="light"] #act-theme .ti-light { display: block; }

@@ -1226,4 +1226,31 @@
     };
   }
   connect();
+
+  // —— Theme: auto (follow the system) → dark → light ——
+  const THEME_KEY = "groka.theme";
+  const THEME_NAMES = { auto: "自動", dark: "深色", light: "淺色" };
+  function applyTheme(pref) {
+    const root = document.documentElement;
+    const light = pref === "light" || (pref === "auto" && matchMedia("(prefers-color-scheme: light)").matches);
+    root.dataset.themePref = pref;
+    root.dataset.theme = light ? "light" : "dark";
+    const btn = $("act-theme");
+    if (btn) btn.title = `主題：${THEME_NAMES[pref]}（點擊切換）`;
+  }
+  function initTheme() {
+    let pref = document.documentElement.dataset.themePref || "auto";
+    if (!THEME_NAMES[pref]) pref = "auto";
+    applyTheme(pref);
+    $("act-theme").addEventListener("click", () => {
+      const order = ["auto", "dark", "light"];
+      pref = order[(order.indexOf(pref) + 1) % order.length];
+      try { localStorage.setItem(THEME_KEY, pref); } catch (e) {}
+      applyTheme(pref);
+    });
+    matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+      if (pref === "auto") applyTheme("auto");
+    });
+  }
+  initTheme();
 })();
