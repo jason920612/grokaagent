@@ -228,6 +228,8 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=2, help="concurrent runs per model")
     ap.add_argument("--bin", type=Path, default=default_bin())
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--rerun-invalid", action="store_true",
+                    help="with --out: rerun only runs that died on provider errors, in place")
     args = ap.parse_args()
 
     models = load_models()
@@ -250,6 +252,17 @@ def main() -> None:
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"{len(aliases)} model(s) x {len(tasks)} task(s) x {args.trials} trial(s) -> {out_root}")
 
+    only: set | None = None
+    if args.rerun_invalid:
+        sys.path.insert(0, str(ROOT))
+        from report import infra_failure
+        only = set()
+        for rf in out_root.glob("*/*/t*/result.json"):
+            r = json.loads(rf.read_text(encoding="utf-8"))
+            if infra_failure(r):
+                only.add((r["model"], r["task"], r["trial"]))
+        log(f"rerunning {len(only)} invalid run(s)")
+
     # One pool per model so a slow model never starves the other.
     results: list[dict] = []
     pools = {a: cf.ThreadPoolExecutor(max_workers=args.jobs) for a in aliases}
@@ -257,6 +270,8 @@ def main() -> None:
     for trial in range(1, args.trials + 1):
         for t in tasks:
             for a in aliases:
+                if only is not None and (a, t["id"], trial) not in only:
+                    continue
                 futures.append(pools[a].submit(run_one, args.bin, a, models[a], t, trial, out_root))
     for f in cf.as_completed(futures):
         try:
@@ -265,6 +280,8 @@ def main() -> None:
             log(f"run crashed: {e!r}")
     for p in pools.values():
         p.shutdown()
+    # Rebuild from every run on disk, so partial reruns merge with the rest.
+    results = [json.loads(p.read_text(encoding="utf-8")) for p in out_root.glob("*/*/t*/result.json")]
     with open(out_root / "results.jsonl", "w", encoding="utf-8") as fh:
         for r in sorted(results, key=lambda r: (r["model"], r["task"], r["trial"])):
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")

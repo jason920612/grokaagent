@@ -576,6 +576,26 @@ impl Provider for AnyProvider {
 }
 
 /// Server refused to hydrate `previous_response_id` (ZDR org, or it was never stored).
+/// Worth resending unchanged after a wait: rate limits, overload, 5xx,
+/// OpenRouter's in-flight credit check, and dropped connections or streams.
+/// A plain 402 (out of credits) or a 4xx about the request is not.
+pub fn transient_error(err: &Error) -> bool {
+    if matches!(err, Error::Http(_)) {
+        return true;
+    }
+    let s = err.to_string().to_ascii_lowercase();
+    [
+        "http 408", "http 409", "http 425", "http 429", "http 500", "http 502", "http 503",
+        "http 504", "http 520", "http 522", "http 524", "http 529",
+        "in_flight_budget", "rate limit", "rate_limit", "overloaded", "temporarily unavailable",
+        "availability is currently degraded", "try again", "error decoding response body",
+        "stream idle", "stream ended", "connection reset", "connection closed", "timed out",
+        "error sending request",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
+}
+
 pub fn previous_response_unusable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
     s.contains("zero data retention") || s.contains("previous response cannot be used")
@@ -1306,6 +1326,18 @@ mod tests {
         assert_eq!(ReasoningEffort::High.cycle(), ReasoningEffort::Xhigh);
         assert_eq!(ReasoningEffort::Xhigh.cycle(), ReasoningEffort::Low);
         assert_eq!(ReasoningEffort::Low.cycle_back(), ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn transient_errors_are_the_ones_worth_resending() {
+        let p = |m: &str| transient_error(&Error::Provider(m.into()));
+        assert!(p("HTTP 429: rate limit"));
+        assert!(p("HTTP 402: {\"metadata\":{\"reason\":\"in_flight_budget_exhausted\"}}"));
+        assert!(p("Service temporarily unavailable. The model's availability is currently degraded."));
+        assert!(p("error decoding response body"));
+        assert!(p("xAI HTTP 503: overloaded"));
+        assert!(!p("HTTP 402: insufficient credits"));
+        assert!(!p("HTTP 400: invalid tool schema"));
     }
 
     #[test]

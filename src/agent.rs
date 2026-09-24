@@ -520,6 +520,17 @@ fn emit_cancelled_tool(
     pending.push(item);
 }
 
+/// Resends of one request after a transient provider error (about two
+/// minutes of backoff in total) before it counts as a real failure.
+const MAX_TRANSIENT_RETRIES: u32 = 6;
+
+fn transient_backoff(attempt: u32) -> Duration {
+    if cfg!(test) {
+        return Duration::from_millis(5);
+    }
+    Duration::from_secs((2u64 << attempt.min(5)).min(60))
+}
+
 /// Stop retrying the same failing request so we do not hammer the API.
 const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
 /// Lived fold is retried until it succeeds. Wait so a 400 does not spin.
@@ -1098,12 +1109,42 @@ pub async fn run<P: Provider>(
             });
         };
 
-        let response = match race_cancel(
-            &cfg.cancel,
-            provider.complete_stream(req, &on_text, &on_server, &on_reasoning),
-        )
-        .await
-        {
+        // Transient provider trouble (rate limits, 5xx, a dropped stream)
+        // resends the same request after a backoff instead of spending one
+        // of the model-visible recoveries below.
+        let mut transient_attempt = 0u32;
+        let attempt = loop {
+            let r = race_cancel(
+                &cfg.cancel,
+                provider.complete_stream(req.clone(), &on_text, &on_server, &on_reasoning),
+            )
+            .await;
+            match r {
+                Ok(Err(e))
+                    if transient_attempt < MAX_TRANSIENT_RETRIES
+                        && crate::provider::transient_error(&e) =>
+                {
+                    let wait = transient_backoff(transient_attempt);
+                    transient_attempt += 1;
+                    let reason: String = e.to_string().chars().take(120).collect();
+                    notice(
+                        sink,
+                        &cfg.agent_name,
+                        &run_id,
+                        cfg.parent_run_id.as_deref(),
+                        format!(
+                            "模型服務暫時出錯，{} 秒後重送（{transient_attempt}/{MAX_TRANSIENT_RETRIES}）：{reason}",
+                            wait.as_secs().max(1)
+                        ),
+                    );
+                    if race_cancel(&cfg.cancel, tokio::time::sleep(wait)).await.is_err() {
+                        break Err(());
+                    }
+                }
+                other => break other,
+            }
+        };
+        let response = match attempt {
             Err(()) => {
                 if !take_interrupt(
                     &mut cfg,
@@ -2821,6 +2862,53 @@ mod tests {
             e,
             AgentEvent::Notice { message, .. } if message.contains("壓縮連續失敗")
         )));
+    }
+
+    #[tokio::test]
+    async fn transient_provider_errors_are_resent_without_touching_history() {
+        struct Flaky {
+            fails: Mutex<u32>,
+            calls: Mutex<Vec<usize>>,
+        }
+        impl Provider for Flaky {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                self.calls.lock().unwrap().push(req.input.len());
+                let mut f = self.fails.lock().unwrap();
+                if *f > 0 {
+                    *f -= 1;
+                    return Err(Error::Provider(
+                        "HTTP 402: in_flight_budget_exhausted, retry after in-flight requests settle".into(),
+                    ));
+                }
+                Ok(CompleteResponse {
+                    text: "done".into(),
+                    ..CompleteResponse::new("1")
+                })
+            }
+            async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+                Err(Error::Provider("no".into()))
+            }
+        }
+        let provider = Flaky {
+            fails: Mutex::new(4),
+            calls: Mutex::new(Vec::new()),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = run(&provider, &tools, &rec, cfg("go", 4)).await.unwrap();
+        assert_eq!(out.text, "done");
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 5, "4 transient failures, then the same request succeeds");
+        assert!(calls.iter().all(|&n| n == calls[0]), "resends do not add recovery notes: {calls:?}");
+        let events = rec.0.lock().unwrap().clone();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("重送")))
+                .count(),
+            4
+        );
     }
 
     #[tokio::test]

@@ -16,6 +16,18 @@ from pathlib import Path
 CATS = [("short", "短任務"), ("long", "長任務"), ("domain", "專業領域")]
 
 
+INFRA_MARKERS = ("http 402", "http 429", "http 5", "in_flight_budget", "temporarily unavailable",
+                 "degraded", "overloaded", "rate limit", "error decoding response body", "error sending request")
+
+
+def infra_failure(r: dict) -> bool:
+    """The run died on the provider (credits, rate limit, outage), not the model."""
+    m = r["metrics"]
+    errs = " ".join(m.get("errors", [])).lower()
+    hit = any(k in errs for k in INFRA_MARKERS)
+    return hit and (m.get("finish") in ("error", "") or r.get("timed_out"))
+
+
 def tier(x: float) -> str:
     for cut, name in ((0.95, "S"), (0.85, "A"), (0.70, "B"), (0.50, "C")):
         if x >= cut:
@@ -41,7 +53,9 @@ def load(out: Path) -> list[dict]:
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     out = Path(sys.argv[1])
-    rows = load(out)
+    all_rows = load(out)
+    invalid = [r for r in all_rows if infra_failure(r)]
+    rows = [r for r in all_rows if not infra_failure(r)]
     models = sorted({r["model"] for r in rows})
     tasks = sorted({r["task"] for r in rows})
     by = defaultdict(list)
