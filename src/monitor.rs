@@ -63,6 +63,7 @@ impl MonitorHub {
             agent_name: self.agent_name.clone(),
             run_id: self.run_id.clone(),
             parent_run_id: self.parent_run_id.clone(),
+            path: String::new(),
         }
     }
 
@@ -380,6 +381,7 @@ mod tests {
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         }
     }
 

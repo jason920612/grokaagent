@@ -636,6 +636,7 @@ fn spawn_title(
                 agent_name: "root".into(),
                 run_id: session_id,
                 parent_run_id: None,
+                path: String::new(),
             },
             name,
         });

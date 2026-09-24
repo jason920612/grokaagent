@@ -85,6 +85,10 @@ enum Command {
         depth: u32,
         #[arg(long)]
         parent_run: Option<String>,
+        /// Stable run id for the worker's session (the parent picks it so it can
+        /// tell the child's own events from its descendants').
+        #[arg(long, default_value = "")]
+        run_id: String,
         #[arg(long, default_value = "127.0.0.1:0")]
         listen: String,
         #[arg(long, default_value = "groka-events.jsonl")]
@@ -95,7 +99,8 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        /// Turn budget per message; hitting it pauses the child (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
         max_turns: u32,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
@@ -325,6 +330,7 @@ async fn real_main() -> grokaagent::Result<()> {
             name,
             depth,
             parent_run,
+            run_id,
             listen,
             events,
             mode,
@@ -339,6 +345,7 @@ async fn real_main() -> grokaagent::Result<()> {
                 name,
                 depth,
                 parent_run_id: parent_run,
+                run_id,
                 listen,
                 events,
                 mode: WorkerMode::parse(&mode),

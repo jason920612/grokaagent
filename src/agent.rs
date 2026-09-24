@@ -71,6 +71,9 @@ pub struct RunConfig {
 pub struct CancelFlag {
     inner: Arc<AtomicBool>,
     notify: Arc<Notify>,
+    /// Counts trips so observers (the nursery) see every Esc even after the
+    /// loop has already `take()`n the flag.
+    trips: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CancelFlag {
@@ -78,12 +81,32 @@ impl CancelFlag {
         Self {
             inner: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
+            trips: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     pub fn trip(&self) {
         self.inner.store(true, Ordering::SeqCst);
+        self.trips.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_waiters();
+    }
+
+    pub fn trips(&self) -> u64 {
+        self.trips.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the flag has been tripped more than `seen` times; returns the new count.
+    pub async fn wait_trip(&self, seen: u64) -> u64 {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let now = self.trips();
+            if now > seen {
+                return now;
+            }
+            notified.await;
+        }
     }
 
     pub fn take(&self) -> bool {
@@ -96,10 +119,15 @@ impl CancelFlag {
 
     async fn wait(&self) {
         loop {
+            // Register before checking so a trip between the check and the
+            // await is not lost.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_set() {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -187,6 +215,7 @@ fn meta(agent_name: &str, run_id: &str, parent_run_id: Option<&str>) -> EventMet
         agent_name: agent_name.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: parent_run_id.map(str::to_string),
+        path: String::new(),
     }
 }
 
@@ -491,7 +520,17 @@ fn emit_cancelled_tool(
 /// Stop retrying the same failing request so we do not hammer the API.
 const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
 /// Lived fold is retried until it succeeds. Wait so a 400 does not spin.
-const COMPACT_RETRY: Duration = Duration::from_secs(2);
+const COMPACT_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(5)
+} else {
+    Duration::from_secs(2)
+};
+/// Give up on this compaction after this many failed folds. Compaction starts
+/// at half the window, so the turn can still go out uncompacted.
+const MAX_COMPACT_ATTEMPTS: u32 = 5;
+/// Turns to skip compaction after giving up, so a persistent failure does not
+/// cost `MAX_COMPACT_ATTEMPTS` requests on every turn.
+const COMPACT_BACKOFF_TURNS: u32 = 3;
 
 /// Tell the model why the request failed and keep the loop going.
 /// Do not pause for the user: the model should enlarge/regenerate and continue.
@@ -773,6 +812,7 @@ pub async fn run<P: Provider>(
     let mut seen_model = false;
     let mut consecutive_provider_errors: u32 = 0;
     let mut image_turns: u32 = 0;
+    let mut compact_backoff: u32 = 0;
     let mut images_known: usize = 0;
 
     'run: loop {
@@ -870,9 +910,27 @@ pub async fn run<P: Provider>(
         let used = last_usage
             .input_tokens
             .max(compact::estimate_tokens(&live_instructions(&cfg), &history));
-        if compact::should_compact(used, window, &history, keep_recent) {
+        let want_compact = compact::should_compact(used, window, &history, keep_recent);
+        if want_compact && compact_backoff > 0 {
+            compact_backoff -= 1;
+        } else if want_compact {
             let head = compact::split_head_tail(&history, keep_recent).0.to_vec();
+            let mut attempts: u32 = 0;
             loop {
+                attempts += 1;
+                if attempts > MAX_COMPACT_ATTEMPTS {
+                    compact_backoff = COMPACT_BACKOFF_TURNS;
+                    notice(
+                        sink,
+                        &cfg.agent_name,
+                        &run_id,
+                        cfg.parent_run_id.as_deref(),
+                        format!(
+                            "壓縮連續失敗 {MAX_COMPACT_ATTEMPTS} 次，先不壓縮送出；{COMPACT_BACKOFF_TURNS} 輪後再試"
+                        ),
+                    );
+                    break;
+                }
                 match race_cancel(
                     &cfg.cancel,
                     ask_lived_memory(
@@ -2683,6 +2741,82 @@ mod tests {
             i.get("type").and_then(Value::as_str) == Some("function_call_output")
                 && i.get("call_id").and_then(Value::as_str) == Some("orphan")
         }));
+    }
+
+    #[tokio::test]
+    async fn lived_fold_gives_up_after_the_cap_and_still_answers() {
+        struct FoldAlwaysFails {
+            inner: Scripted,
+            fold_attempts: Mutex<u32>,
+        }
+        impl Provider for FoldAlwaysFails {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                let fold = req.input.iter().any(|i| {
+                    i.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(MEMORY_FOLD_MARK))
+                });
+                if fold {
+                    *self.fold_attempts.lock().unwrap() += 1;
+                    return Err(Error::Provider("auth expired".into()));
+                }
+                self.inner.complete(req).await
+            }
+            async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+                self.inner.compact(req).await
+            }
+        }
+        let first = CompleteResponse {
+            function_calls: vec![FunctionCall {
+                call_id: "c1".into(),
+                name: "now".into(),
+                arguments: "{}".into(),
+            }],
+            usage: CacheUsage {
+                input_tokens: 60,
+                cached_tokens: 0,
+            },
+            output_items: vec![
+                json!({"role":"user","content":"pad-1"}),
+                json!({"role":"user","content":"pad-2"}),
+                json!({"role":"user","content":"pad-3"}),
+                json!({"role":"user","content":"pad-4"}),
+                json!({"role":"user","content":"pad-5"}),
+                json!({"type":"function_call","call_id":"c1","name":"now","arguments":"{}"}),
+            ],
+            ..CompleteResponse::new("1")
+        };
+        let provider = FoldAlwaysFails {
+            inner: Scripted {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(pop_front(vec![
+                    first,
+                    CompleteResponse {
+                        text: "done".into(),
+                        ..CompleteResponse::new("2")
+                    },
+                ])),
+                compact_calls: Mutex::new(Vec::new()),
+                compact_ok: false,
+            },
+            fold_attempts: Mutex::new(0),
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut config = cfg("ship the kernel", 4);
+        config.context_window = 100;
+        config.compact_keep_recent = 2;
+        let out = tokio::time::timeout(Duration::from_secs(10), run(&provider, &tools, &rec, config))
+            .await
+            .expect("a failing fold must not spin forever")
+            .unwrap();
+        assert_eq!(out.text, "done");
+        assert_eq!(out.compacted, 0);
+        assert_eq!(*provider.fold_attempts.lock().unwrap(), MAX_COMPACT_ATTEMPTS);
+        assert!(rec.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice { message, .. } if message.contains("壓縮連續失敗")
+        )));
     }
 
     #[tokio::test]

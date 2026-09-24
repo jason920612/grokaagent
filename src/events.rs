@@ -16,6 +16,11 @@ pub struct EventMeta {
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
+    /// Agent tree path relative to the process that reads the event:
+    /// empty = this process's own agent, `coder` = its child, `coder/lint` = grandchild.
+    /// Each relay hop prefixes the child's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +86,8 @@ pub enum AgentEvent {
         agent_card_url: String,
         #[serde(default)]
         prompt: String,
+        #[serde(default)]
+        model: String,
     },
     ChildExited {
         #[serde(flatten)]
@@ -232,6 +239,56 @@ impl AgentEvent {
         }
     }
 
+    pub fn meta_mut(&mut self) -> &mut EventMeta {
+        match self {
+            Self::RunStarted { meta, .. }
+            | Self::TurnStarted { meta, .. }
+            | Self::ModelFinished { meta, .. }
+            | Self::ToolStarted { meta, .. }
+            | Self::ToolFinished { meta, .. }
+            | Self::ServerToolObserved { meta, .. }
+            | Self::ContextCompacted { meta, .. }
+            | Self::Error { meta, .. }
+            | Self::ChildSpawned { meta, .. }
+            | Self::ChildExited { meta, .. }
+            | Self::RunFinished { meta, .. }
+            | Self::AwaitingInput { meta, .. }
+            | Self::ModelDelta { meta, .. }
+            | Self::ReasoningDelta { meta, .. }
+            | Self::FileChanged { meta, .. }
+            | Self::MonitorAttached { meta, .. }
+            | Self::MonitorExited { meta, .. }
+            | Self::BackgroundStarted { meta, .. }
+            | Self::BackgroundOutput { meta, .. }
+            | Self::BackgroundExited { meta, .. }
+            | Self::TimerStarted { meta, .. }
+            | Self::TimerFired { meta, .. }
+            | Self::TimerCancelled { meta, .. }
+            | Self::Notice { meta, .. }
+            | Self::SessionNamed { meta, .. }
+            | Self::AgentMessage { meta, .. }
+            | Self::AskUser { meta, .. } => meta,
+        }
+    }
+
+    /// Re-emit a child's event in this process's frame: prefix the tree path with
+    /// the child's name and file it under this process's run.
+    pub fn relayed(mut self, child: &str, parent_run_id: &str) -> Self {
+        let m = self.meta_mut();
+        m.path = if m.path.is_empty() {
+            child.to_string()
+        } else {
+            format!("{child}/{}", m.path)
+        };
+        m.parent_run_id = Some(parent_run_id.to_string());
+        self
+    }
+
+    /// Agent tree path; empty = the reading process's own agent.
+    pub fn path(&self) -> &str {
+        &self.meta().path
+    }
+
     pub fn run_id(&self) -> &str {
         &self.meta().run_id
     }
@@ -336,6 +393,7 @@ mod tests {
             agent_name: "root".into(),
             run_id: "run-1".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         sink.emit(&AgentEvent::RunStarted {
             meta: meta.clone(),
@@ -366,6 +424,7 @@ mod tests {
             agent_name: "root".into(),
             run_id: "sess-9".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         let named = AgentEvent::SessionNamed {
             meta: meta.clone(),
@@ -384,6 +443,7 @@ mod tests {
                 agent_name: "coder".into(),
                 run_id: "child-1".into(),
                 parent_run_id: Some("sess-9".into()),
+                path: String::new(),
             },
             text: "x".into(),
         };

@@ -326,11 +326,9 @@ impl A2aClient {
             if is_terminal(state) {
                 return Ok(task);
             }
+            // Timing out only stops waiting; the child keeps working.
             if tokio::time::Instant::now() >= deadline {
-                if let Some(id) = task.get("id").and_then(Value::as_str) {
-                    let _ = self.cancel_task(origin, id).await;
-                }
-                return Err(Error::A2a("child task timed out".into()));
+                return Err(Error::A2a("timed out waiting for child task".into()));
             }
             let id = task
                 .get("id")

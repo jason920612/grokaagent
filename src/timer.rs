@@ -72,6 +72,7 @@ impl TimerHub {
             agent_name: self.agent_name.clone(),
             run_id: self.run_id.clone(),
             parent_run_id: self.parent_run_id.clone(),
+            path: String::new(),
         }
     }
 

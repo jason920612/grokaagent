@@ -119,6 +119,7 @@
             name: "coder".into(),
             agent_card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
             prompt: "fix src/a.rs".into(),
+            model: String::new(),
         });
         app.route_event(AgentEvent::AgentMessage {
             meta: meta.clone(),
@@ -145,6 +146,7 @@
             agent_name: "coder".into(),
             run_id: "child-run".into(),
             parent_run_id: Some("r".into()),
+            path: String::new(),
         };
         let before = app.rows.len();
         app.route_event(AgentEvent::ModelDelta {
@@ -178,6 +180,7 @@
             name: "coder".into(),
             agent_card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
             prompt: "fix".into(),
+            model: String::new(),
         });
         assert!(app.has_side());
         let opts = test_opts("grok-4.6", ReasoningEffort::High);
@@ -793,6 +796,7 @@
                 agent_name: "root".into(),
                 run_id: "parked".into(),
                 parent_run_id: None,
+                path: String::new(),
             },
             text: "bg".into(),
         });
@@ -836,6 +840,7 @@
                 agent_name: "root".into(),
                 run_id: "parked".into(),
                 parent_run_id: None,
+                path: String::new(),
             },
             question: "那邊".into(),
             allow_multiple: false,
@@ -1670,6 +1675,7 @@
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.apply_event(AgentEvent::ModelDelta {
             meta: meta.clone(),
@@ -1705,6 +1711,7 @@
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.apply_event(AgentEvent::ModelDelta {
             meta: meta.clone(),
@@ -1742,6 +1749,7 @@
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.apply_event(AgentEvent::ModelFinished {
             meta: meta.clone(),
@@ -1789,6 +1797,7 @@
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.apply_event(AgentEvent::ModelDelta {
             meta: meta.clone(),
@@ -1992,6 +2001,7 @@
             agent_name: "root".into(),
             run_id: "r".into(),
             parent_run_id: None,
+            path: String::new(),
         }
     }
 
@@ -2686,6 +2696,7 @@
             agent_name: "root".into(),
             run_id: "bbb".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.route_event(AgentEvent::ModelDelta {
             meta: other,
@@ -2704,6 +2715,7 @@
             agent_name: "root".into(),
             run_id: "aaa".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.route_event(AgentEvent::ModelDelta {
             meta,
@@ -2757,6 +2769,7 @@
             agent_name: "root".into(),
             run_id: "parked".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.route_event(AgentEvent::ModelDelta {
             meta,
@@ -2776,6 +2789,7 @@
             agent_name: "root".into(),
             run_id: "s".into(),
             parent_run_id: None,
+            path: String::new(),
         };
         app.route_event(AgentEvent::SessionNamed {
             meta,

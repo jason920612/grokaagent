@@ -502,6 +502,7 @@ fn meta(run_id: &str) -> EventMeta {
         agent_name: "root".into(),
         run_id: run_id.to_string(),
         parent_run_id: None,
+        path: String::new(),
     }
 }
 
@@ -514,6 +515,7 @@ fn emit_spawn(sink: &dyn EventSink, run_id: &str, goal: &str, hub: &TaskHub) {
         name: AGENT_NAME.into(),
         agent_card_url: String::new(),
         prompt: goal.to_string(),
+        model: String::new(),
     });
     hub.lock().spawned = true;
 }

@@ -13,7 +13,7 @@ use crate::events::EventSink;
 use crate::instructions::STATIC_INSTRUCTIONS;
 use crate::memory::ProjectMemoryTool;
 use crate::monitor::{AttachMonitorTool, MonitorHub, MonitorSink};
-use crate::nursery::{Nursery, SendMessageTool, SpawnAgentTool, DEFAULT_MAX_DEPTH};
+use crate::nursery::{AgentTool, Nursery, DEFAULT_MAX_DEPTH};
 use crate::provider::Provider;
 use crate::shellguard::{CommandReviewer, ProviderGuard};
 use crate::skills::{SkillStore, SkillTool};
@@ -89,7 +89,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         spec.agent_name.clone(),
         run_id.clone(),
         spec.parent_run_id.clone(),
-        Some(bg_tx),
+        Some(bg_tx.clone()),
     );
     let tee: Arc<dyn EventSink> = Arc::new(MonitorSink {
         inner: sink,
@@ -188,8 +188,12 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             spec.child_mode.clone(),
             spec.knobs.clone(),
         )?;
-        tools.push(Box::new(SpawnAgentTool::new(n.clone(), tee.clone())));
-        tools.push(Box::new(SendMessageTool::new(n.clone(), tee.clone())));
+        // Finished children wake this session like a background exit does.
+        n.set_notify(bg_tx.clone());
+        if let Some(cancel) = &spec.cancel {
+            n.follow_cancel(cancel.clone());
+        }
+        tools.extend(AgentTool::all(n.clone(), tee.clone()));
         Some(n)
     } else {
         None
