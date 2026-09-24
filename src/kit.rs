@@ -121,7 +121,7 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         Box::new(NowTool),
         Box::new(ReadFileTool::with_views(spec.workspace.clone(), views.clone())),
         Box::new(ListDirTool::new(spec.workspace.clone())),
-        Box::new(WriteFileTool::new(spec.workspace.clone())),
+        Box::new(WriteFileTool::with_views(spec.workspace.clone(), views.clone())),
         Box::new(EditFileTool::new(spec.workspace.clone(), views)),
         Box::new(DeleteFileTool::new(spec.workspace.clone())),
         Box::new(RunCommandTool::with_guard(

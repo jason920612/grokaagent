@@ -65,20 +65,39 @@ fn join_text(file: &TextLines) -> String {
     out
 }
 
+enum Op {
+    Ctx(String),
+    Del(String),
+    Add(String),
+}
+
+/// One `@@` hunk. Header numbers are only a location hint: models often
+/// miscount, so the old/new line counts come from the body.
 struct Hunk {
-    old_start: usize,
-    old_count: usize,
-    old_lines: Vec<String>,
-    new_lines: Vec<String>,
+    /// 1-based old start line from the header, when it had one.
+    hint: Option<usize>,
+    ops: Vec<Op>,
+}
+
+impl Hunk {
+    fn old_lines(&self) -> Vec<&str> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Ctx(s) | Op::Del(s) => Some(s.as_str()),
+                Op::Add(_) => None,
+            })
+            .collect()
+    }
 }
 
 fn strip_fences(patch: &str) -> String {
-    let s = patch.trim();
-    if !s.starts_with("```") {
+    let s = patch.trim_matches('\n');
+    if !s.trim_start().starts_with("```") {
         return s.to_string();
     }
     let mut lines: Vec<&str> = s.lines().collect();
-    if lines.first().is_some_and(|l| l.starts_with("```")) {
+    if lines.first().is_some_and(|l| l.trim_start().starts_with("```")) {
         lines.remove(0);
     }
     if lines.last().is_some_and(|l| l.trim() == "```") {
@@ -87,64 +106,23 @@ fn strip_fences(patch: &str) -> String {
     lines.join("\n")
 }
 
+/// Lines that only make sense outside a hunk (git headers).
 fn is_file_header(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("diff --git ")
-        || t.starts_with("index ")
-        || t.starts_with("--- ")
-        || t.starts_with("+++ ")
-        || t.starts_with("new file mode ")
-        || t.starts_with("deleted file mode ")
-        || t.starts_with("old mode ")
-        || t.starts_with("new mode ")
-        || t.starts_with("similarity index ")
-        || t.starts_with("rename from ")
-        || t.starts_with("rename to ")
-        || t.starts_with("copy from ")
-        || t.starts_with("copy to ")
-        || t.starts_with("Binary files ")
+    [
+        "diff --git ", "index ", "--- ", "+++ ", "new file mode ", "deleted file mode ",
+        "old mode ", "new mode ", "similarity index ", "rename from ", "rename to ",
+        "copy from ", "copy to ", "Binary files ",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
 }
 
-fn parse_hunk_range(s: &str) -> Result<((usize, usize), &str)> {
-    let s = s.trim_start();
-    let s = s
-        .strip_prefix(['-', '+'])
-        .ok_or_else(|| Error::Tool("hunk header missing +/- range".into()))?;
-    let digits = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
-    if digits == 0 {
-        return Err(Error::Tool("hunk header has no line number".into()));
-    }
-    let start: usize = s[..digits]
-        .parse()
-        .map_err(|_| Error::Tool("hunk header line is not an integer".into()))?;
-    let rest = &s[digits..];
-    if let Some(rest) = rest.strip_prefix(',') {
-        let digits = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if digits == 0 {
-            return Err(Error::Tool("hunk header count is empty".into()));
-        }
-        let count: usize = rest[..digits]
-            .parse()
-            .map_err(|_| Error::Tool("hunk header count is not an integer".into()))?;
-        Ok(((start, count), &rest[digits..]))
-    } else {
-        Ok(((start, 1), rest))
-    }
-}
-
-fn parse_hunk_header(line: &str) -> Result<(usize, usize, usize, usize)> {
-    let s = line.trim();
-    let s = s
-        .strip_prefix("@@")
-        .ok_or_else(|| Error::Tool("expected @@ hunk header".into()))?
-        .trim();
-    let (old, s) = parse_hunk_range(s)?;
-    let (new, _) = parse_hunk_range(s)?;
-    Ok((old.0, old.1, new.0, new.1))
+/// First number after `-` in `@@ -12,5 +12,6 @@`; `None` for a bare `@@`.
+fn header_hint(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix("@@")?.trim_start();
+    let rest = rest.strip_prefix('-')?;
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 fn parse_hunks(patch: &str) -> Result<Vec<Hunk>> {
@@ -153,131 +131,244 @@ fn parse_hunks(patch: &str) -> Result<Vec<Hunk>> {
     let mut hunks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i];
-        if !line.starts_with("@@") {
+        if !lines[i].trim_start().starts_with("@@") {
             i += 1;
             continue;
         }
-        let (old_start, old_count, new_start, new_count) = parse_hunk_header(line)?;
-        let _ = (new_start, new_count);
+        let hint = header_hint(lines[i]);
         i += 1;
-        let mut old_lines = Vec::new();
-        let mut new_lines = Vec::new();
+        let mut ops = Vec::new();
         while i < lines.len() {
             let body = lines[i];
-            if body.starts_with("@@") {
+            if body.trim_start().starts_with("@@") {
                 break;
             }
-            if body.is_empty() || is_file_header(body) {
-                i += 1;
-                continue;
+            // A new file section ends the hunk: `diff --git`, or a `---` line
+            // directly followed by `+++` (a deleted "-- comment" line is not).
+            if body.starts_with("diff --git ")
+                || (body.starts_with("--- ") && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ ")))
+            {
+                break;
             }
-            if body.starts_with('\\') {
-                i += 1;
-                continue;
-            }
-            match body.as_bytes().first().copied() {
-                Some(b' ') => {
-                    let t = &body[1..];
-                    old_lines.push(t.to_string());
-                    new_lines.push(t.to_string());
+            let op = match body.as_bytes().first().copied() {
+                Some(b' ') => Op::Ctx(body[1..].to_string()),
+                Some(b'-') => Op::Del(body[1..].to_string()),
+                Some(b'+') => Op::Add(body[1..].to_string()),
+                Some(b'\\') => {
+                    i += 1;
+                    continue;
                 }
-                Some(b'-') => old_lines.push(body[1..].to_string()),
-                Some(b'+') => new_lines.push(body[1..].to_string()),
-                _ => {
-                    return Err(Error::Tool(format!(
-                        "diff line must start with space, + or -: {body}"
-                    )));
-                }
-            }
+                // Blank line, or a context line whose leading space got lost.
+                _ => Op::Ctx(body.to_string()),
+            };
+            ops.push(op);
             i += 1;
         }
-        if old_lines.len() != old_count {
-            return Err(Error::Tool(format!(
-                "hunk @@ -{old_start},{old_count} has {} old lines (space or -)",
-                old_lines.len()
-            )));
+        while matches!(ops.last(), Some(Op::Ctx(s)) if s.trim().is_empty()) {
+            ops.pop();
         }
-        if new_lines.len() != new_count {
-            return Err(Error::Tool(format!(
-                "hunk @@ +{new_start},{new_count} has {} new lines (space or +)",
-                new_lines.len()
-            )));
+        if !ops.is_empty() {
+            hunks.push(Hunk { hint, ops });
         }
-        hunks.push(Hunk {
-            old_start,
-            old_count,
-            old_lines,
-            new_lines,
-        });
     }
     if hunks.is_empty() {
-        return Err(Error::Tool(
-            "edit_file diff needs at least one @@ hunk with - deleted lines and + added lines".into(),
-        ));
+        let only_headers = stripped.lines().all(|l| l.trim().is_empty() || is_file_header(l));
+        return Err(Error::Tool(if only_headers {
+            "edit_file diff has no @@ hunk. Start each hunk with a line beginning with @@, then ' ' context, '-' deleted and '+' added lines (or use old_string/new_string)".into()
+        } else {
+            "edit_file diff needs at least one @@ hunk with context, - deleted and + added lines (or use old_string/new_string)".into()
+        }));
     }
     Ok(hunks)
 }
 
-fn hunk_insert_at(h: &Hunk) -> Result<usize> {
-    if h.old_count == 0 {
-        return Ok(h.old_start);
-    }
-    if h.old_start == 0 {
-        return Err(Error::Tool("hunk old start is 0 but count is not 0".into()));
-    }
-    Ok(h.old_start - 1)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Match {
+    Exact,
+    TrailingSpace,
+    Indent,
 }
 
-/// Apply a git unified diff (`---`/`+++`/`@@`, context, `-` deletes, `+` adds).
-pub fn apply_unified(original: &str, patch: &str) -> Result<String> {
+impl Match {
+    fn eq(self, file: &str, want: &str) -> bool {
+        match self {
+            Match::Exact => file == want,
+            Match::TrailingSpace => file.trim_end() == want.trim_end(),
+            Match::Indent => file.trim() == want.trim(),
+        }
+    }
+}
+
+/// Where `old` sits in `file`: 0-based start. Closest to the hint wins; with
+/// no hint the block must be unique.
+fn locate(file: &[String], old: &[&str], hint: Option<usize>, level: Match) -> std::result::Result<usize, Vec<usize>> {
+    if old.len() > file.len() {
+        return Err(Vec::new());
+    }
+    let hits: Vec<usize> = (0..=file.len() - old.len())
+        .filter(|&p| old.iter().enumerate().all(|(k, w)| level.eq(&file[p + k], w)))
+        .collect();
+    match (hits.len(), hint) {
+        (0, _) => Err(Vec::new()),
+        (1, _) => Ok(hits[0]),
+        (_, Some(h)) => {
+            let want = h.saturating_sub(1);
+            let best = *hits.iter().min_by_key(|&&p| p.abs_diff(want)).unwrap();
+            let tied = hits.iter().filter(|&&p| p.abs_diff(want) == best.abs_diff(want)).count();
+            if tied > 1 {
+                Err(hits)
+            } else {
+                Ok(best)
+            }
+        }
+        (_, None) => Err(hits),
+    }
+}
+
+/// Numbered excerpt of the file around the line most like the hunk's first
+/// old line, so a failed edit can be fixed without another read_file.
+fn closest_excerpt(file: &[String], old: &[&str], hint: Option<usize>) -> String {
+    let probe = old.iter().find(|l| !l.trim().is_empty()).map(|l| l.trim());
+    let want = hint.unwrap_or(1).saturating_sub(1);
+    let at = probe
+        .and_then(|p| {
+            file.iter()
+                .enumerate()
+                .filter(|(_, l)| l.trim() == p)
+                .map(|(i, _)| i)
+                .min_by_key(|i| i.abs_diff(want))
+        })
+        .or(hint.map(|_| want.min(file.len().saturating_sub(1))));
+    let Some(at) = at else {
+        return match probe {
+            Some(p) => format!("the line `{}` does not occur in the file", clip_line(p)),
+            None => String::new(),
+        };
+    };
+    let from = at.saturating_sub(2);
+    let to = (at + old.len().max(3) + 2).min(file.len());
+    let mut out = format!("closest text in the file (lines {}-{}):", from + 1, to);
+    for (i, line) in file[from..to].iter().enumerate() {
+        out.push_str(&format!("\n{}|{}", from + i + 1, clip_line(line)));
+    }
+    out
+}
+
+fn clip_line(s: &str) -> String {
+    if s.chars().count() > 160 {
+        format!("{}…", s.chars().take(160).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Result of applying an edit: the new text plus notes worth telling the model
+/// (hunks that moved or matched loosely).
+pub struct Applied {
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
+/// Apply a unified diff. Hunks are located by their context and deleted
+/// lines; header line numbers only break ties. With `loose`, lines may also
+/// match ignoring trailing whitespace, then indentation.
+pub fn apply_patch(original: &str, patch: &str, loose: bool) -> Result<Applied> {
     if patch.len() > MAX_DIFF_BYTES * 8 {
         return Err(Error::Tool("diff is larger than 256KiB".into()));
     }
     let mut file = split_text(original);
-    let mut hunks = parse_hunks(patch)?;
-    hunks.sort_by_key(|h| h.old_start);
-    for pair in hunks.windows(2) {
-        let a_end = if pair[0].old_count == 0 {
-            pair[0].old_start
-        } else {
-            pair[0].old_start.saturating_add(pair[0].old_count)
-        };
-        if pair[1].old_start < a_end && pair[1].old_count > 0 {
-            return Err(Error::Tool("diff hunks overlap".into()));
-        }
-    }
-    hunks.reverse();
-    for h in &hunks {
-        let at = hunk_insert_at(h)?;
-        if h.old_count == 0 {
-            if at > file.lines.len() {
+    let hunks = parse_hunks(patch)?;
+    let levels: &[Match] = if loose {
+        &[Match::Exact, Match::TrailingSpace, Match::Indent]
+    } else {
+        &[Match::Exact]
+    };
+    let mut notes = Vec::new();
+    // (start, old len, replacement lines)
+    let mut plan: Vec<(usize, usize, Vec<String>)> = Vec::new();
+    for (n, h) in hunks.iter().enumerate() {
+        let old = h.old_lines();
+        let label = format!("hunk {}{}", n + 1, h.hint.map(|l| format!(" (@@ -{l})")).unwrap_or_default());
+        if old.is_empty() {
+            let Some(line) = h.hint else {
                 return Err(Error::Tool(format!(
-                    "hunk inserts past end of file ({} lines)",
-                    file.lines.len()
+                    "{label} only adds lines; give its position with @@ -N (insert after line N) or include a context line"
                 )));
-            }
-            for (i, line) in h.new_lines.iter().enumerate() {
-                file.lines.insert(at + i, line.clone());
-            }
+            };
+            let at = line.min(file.lines.len());
+            let adds = h.ops.iter().filter_map(|op| match op {
+                Op::Add(s) => Some(s.clone()),
+                _ => None,
+            });
+            plan.push((at, 0, adds.collect()));
             continue;
         }
-        let end = at.saturating_add(h.old_count);
-        if end > file.lines.len() {
+        let mut found = None;
+        let mut ambiguous = Vec::new();
+        for &level in levels {
+            match locate(&file.lines, &old, h.hint, level) {
+                Ok(p) => {
+                    found = Some((p, level));
+                    break;
+                }
+                Err(hits) if !hits.is_empty() => {
+                    ambiguous = hits;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        let Some((start, level)) = found else {
+            if !ambiguous.is_empty() {
+                let at: Vec<String> = ambiguous.iter().take(8).map(|p| (p + 1).to_string()).collect();
+                return Err(Error::Tool(format!(
+                    "{label} matches {} places (lines {}); add more context lines or a correct @@ -N line number",
+                    ambiguous.len(),
+                    at.join(", ")
+                )));
+            }
             return Err(Error::Tool(format!(
-                "hunk @@ -{},{} is past end of file ({} lines)",
-                h.old_start,
-                h.old_count,
-                file.lines.len()
+                "{label} does not match the file: its context and '-' lines must be copied exactly. {}",
+                closest_excerpt(&file.lines, &old, h.hint)
+            )));
+        };
+        if let Some(line) = h.hint {
+            if line != start + 1 {
+                notes.push(format!("{label} applied at line {} (header said {line})", start + 1));
+            }
+        }
+        if level != Match::Exact {
+            notes.push(format!(
+                "{label} matched ignoring {}",
+                if level == Match::TrailingSpace { "trailing whitespace" } else { "indentation" }
+            ));
+        }
+        // Context keeps the file's own text; only '+' lines come from the model.
+        let mut k = start;
+        let mut replacement = Vec::new();
+        for op in &h.ops {
+            match op {
+                Op::Ctx(_) => {
+                    replacement.push(file.lines[k].clone());
+                    k += 1;
+                }
+                Op::Del(_) => k += 1,
+                Op::Add(s) => replacement.push(s.clone()),
+            }
+        }
+        plan.push((start, old.len(), replacement));
+    }
+    plan.sort_by_key(|p| p.0);
+    for pair in plan.windows(2) {
+        if pair[1].0 < pair[0].0 + pair[0].1 {
+            return Err(Error::Tool(format!(
+                "diff hunks overlap near line {}; merge them into one hunk",
+                pair[1].0 + 1
             )));
         }
-        if file.lines[at..end] != h.old_lines {
-            return Err(Error::Tool(format!(
-                "hunk @@ -{},{} does not match the file. read_file again and copy context lines exactly",
-                h.old_start, h.old_count
-            )));
-        }
-        file.lines.splice(at..end, h.new_lines.iter().cloned());
+    }
+    for (start, len, replacement) in plan.into_iter().rev() {
+        file.lines.splice(start..start + len, replacement);
     }
     let no_nl = patch.lines().any(|l| l.trim_start().starts_with('\\'));
     if no_nl {
@@ -285,7 +376,53 @@ pub fn apply_unified(original: &str, patch: &str) -> Result<String> {
     } else if original.is_empty() && !file.lines.is_empty() {
         file.trailing_nl = true;
     }
-    Ok(join_text(&file))
+    Ok(Applied { text: join_text(&file), notes })
+}
+
+/// Strict entry point kept for callers that want plain text back.
+pub fn apply_unified(original: &str, patch: &str) -> Result<String> {
+    apply_patch(original, patch, true).map(|a| a.text)
+}
+
+/// Exact text replacement (`old_string` → `new_string`). Line endings in the
+/// strings follow the file's.
+pub fn apply_replace(original: &str, old: &str, new: &str, replace_all: bool) -> Result<Applied> {
+    if old.is_empty() {
+        return Err(Error::Tool("old_string is empty; copy the exact text to replace".into()));
+    }
+    let crlf = original.contains("\r\n");
+    let fix = |s: &str| {
+        let s = s.replace("\r\n", "\n");
+        if crlf { s.replace('\n', "\r\n") } else { s }
+    };
+    let (old, new) = (fix(old), fix(new));
+    if old == new {
+        return Err(Error::Tool("old_string and new_string are the same; nothing to change".into()));
+    }
+    let hits: Vec<usize> = original.match_indices(&old).map(|(i, _)| i).collect();
+    let line_of = |byte: usize| original[..byte].matches('\n').count() + 1;
+    match hits.len() {
+        0 => {
+            let file = split_text(original);
+            let want: Vec<&str> = old.lines().collect();
+            Err(Error::Tool(format!(
+                "old_string not found in the file (it must match exactly, including indentation). {}",
+                closest_excerpt(&file.lines, &want, None)
+            )))
+        }
+        n if n > 1 && !replace_all => {
+            let at: Vec<String> = hits.iter().take(8).map(|&b| line_of(b).to_string()).collect();
+            Err(Error::Tool(format!(
+                "old_string occurs {n} times (lines {}); include more surrounding text to make it unique, or set replace_all",
+                at.join(", ")
+            )))
+        }
+        n => {
+            let text = if replace_all { original.replace(&old, &new) } else { original.replacen(&old, &new, 1) };
+            let notes = if n > 1 { vec![format!("replaced {n} occurrences")] } else { Vec::new() };
+            Ok(Applied { text, notes })
+        }
+    }
 }
 
 pub fn kind_for(before: Option<&str>, after: Option<&str>) -> &'static str {
@@ -503,6 +640,55 @@ mod tests {
         let patch = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n";
         let err = apply_unified("a\nx\n", patch).unwrap_err();
         assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn wrong_header_counts_and_numbers_are_only_hints() {
+        let before = "fn a() {\n    1\n}\n\nfn b() {\n    2\n}\n";
+        // Counts are wrong (-3,9 / +3,1) and the start line is off by two.
+        let patch = "@@ -3,9 +3,1 @@\n fn b() {\n-    2\n+    20\n }\n";
+        let a = apply_patch(before, patch, true).unwrap();
+        assert_eq!(a.text, "fn a() {\n    1\n}\n\nfn b() {\n    20\n}\n");
+        assert!(a.notes.iter().any(|n| n.contains("applied at line 5")), "{:?}", a.notes);
+    }
+
+    #[test]
+    fn blank_context_lines_without_a_space_still_match() {
+        let before = "a\n\nb\n";
+        let patch = "@@ -1,3 +1,3 @@\n a\n\n-b\n+B\n";
+        assert_eq!(apply_unified(before, patch).unwrap(), "a\n\nB\n");
+    }
+
+    #[test]
+    fn loose_matching_keeps_the_files_own_context() {
+        let before = "if x:\n    y = 1   \n    z = 2\n";
+        let patch = "@@\n if x:\n     y = 1\n-    z = 2\n+    z = 3\n";
+        let a = apply_patch(before, patch, true).unwrap();
+        assert_eq!(a.text, "if x:\n    y = 1   \n    z = 3\n");
+        assert!(a.notes.iter().any(|n| n.contains("trailing whitespace")), "{:?}", a.notes);
+        assert!(apply_patch(before, patch, false).is_err(), "strict mode wants exact text");
+    }
+
+    #[test]
+    fn ambiguous_hunk_without_a_hint_is_refused() {
+        let before = "x\ny\nx\ny\n";
+        let err = apply_unified(before, "@@\n-x\n+X\n").unwrap_err().to_string();
+        assert!(err.contains("matches 2 places (lines 1, 3)"), "{err}");
+        assert_eq!(apply_unified(before, "@@ -3 @@\n-x\n+X\n").unwrap(), "x\ny\nX\ny\n");
+    }
+
+    #[test]
+    fn deleting_a_sql_comment_is_not_a_file_header() {
+        let before = "-- old note\nSELECT 1;\n";
+        let patch = "@@ -1,2 +1,1 @@\n--- old note\n SELECT 1;\n";
+        assert_eq!(apply_unified(before, patch).unwrap(), "SELECT 1;\n");
+    }
+
+    #[test]
+    fn mismatch_error_shows_the_nearby_lines() {
+        let before = "alpha\nbeta\ngamma\n";
+        let err = apply_unified(before, "@@ -2 @@\n beta\n-GAMMA\n+g\n").unwrap_err().to_string();
+        assert!(err.contains("2|beta") && err.contains("3|gamma"), "{err}");
     }
 
     #[test]
