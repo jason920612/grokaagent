@@ -11,5 +11,13 @@
     "key_env": "OPENROUTER_API_KEY",
     "context": "1M",
     "reasoning": "high"
+  },
+  "deepseek-flash-official": {
+    "model": "deepseek-flash",
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com/v1",
+    "key_env": "DEEPSEEK_API_KEY",
+    "context": "1M",
+    "reasoning": "high"
   }
 }

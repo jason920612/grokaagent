@@ -178,19 +178,39 @@ impl Provider for OpenAiCompatProvider {
             payload["chat_template_kwargs"] =
                 json!({"thinking": true, "enable_thinking": true});
         }
-        let resp = self
-            .request("/chat/completions", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await?;
-        if status != 200 {
-            return Err(http_error(status, &text));
+        // Some endpoints (DeepSeek thinking mode) reject a forced function
+        // choice: fall back to "required", then to the model's own choice.
+        let mut fallbacks = if payload.get("tool_choice").is_some_and(Value::is_object) {
+            vec![None, Some(json!("required"))]
+        } else {
+            Vec::new()
+        };
+        loop {
+            let resp = self
+                .request("/chat/completions", "application/json")
+                .json(&payload)
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            if status != 200 {
+                if status == 400 && text.contains("tool_choice") {
+                    if let Some(next) = fallbacks.pop() {
+                        match next {
+                            Some(choice) => payload["tool_choice"] = choice,
+                            None => {
+                                payload.as_object_mut().map(|o| o.remove("tool_choice"));
+                            }
+                        }
+                        continue;
+                    }
+                }
+                return Err(http_error(status, &text));
+            }
+            let body: Value = serde_json::from_str(&text)
+                .map_err(|_| Error::Provider("endpoint returned non-JSON body".into()))?;
+            return parse_chat_body(&body);
         }
-        let body: Value = serde_json::from_str(&text)
-            .map_err(|_| Error::Provider("endpoint returned non-JSON body".into()))?;
-        parse_chat_body(&body)
     }
 
     async fn complete_stream<'a>(
@@ -334,16 +354,69 @@ fn chat_tools(client_tools: &[ToolSpec]) -> Vec<Value> {
 }
 
 pub fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
-    let mut msgs = Vec::new();
+    let mut msgs: Vec<Value> = Vec::new();
     if !instructions.trim().is_empty() {
         msgs.push(json!({"role": "system", "content": instructions}));
     }
+    // Reasoning of the response being rebuilt; it rides on its tool-call message.
+    let mut reasoning = String::new();
     for item in input {
-        if let Some(msg) = item_to_chat(item) {
-            msgs.push(msg);
+        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+            reasoning = reasoning_text(item);
+            continue;
+        }
+        let Some(msg) = item_to_chat(item) else {
+            continue;
+        };
+        let is_call = msg.get("tool_calls").is_some();
+        // One response = one assistant message: its text and every parallel
+        // tool call together. Strict endpoints (DeepSeek) reject an assistant
+        // tool call that is not directly followed by its tool results.
+        if is_call {
+            if let Some(prev) = msgs.last_mut().filter(|m| m["role"] == "assistant") {
+                let calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+                match prev.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    Some(list) => list.extend(calls),
+                    None => prev["tool_calls"] = Value::Array(calls),
+                }
+                if !reasoning.is_empty() && prev.get("reasoning_content").is_none() {
+                    prev["reasoning_content"] = json!(std::mem::take(&mut reasoning));
+                }
+                continue;
+            }
+        }
+        let mut msg = msg;
+        if msg["role"] == "assistant" {
+            if is_call && !reasoning.is_empty() {
+                msg["reasoning_content"] = json!(std::mem::take(&mut reasoning));
+            }
+        } else {
+            reasoning.clear();
+        }
+        msgs.push(msg);
+    }
+    // Reasoning only matters while its tool calls are in play.
+    for m in msgs.iter_mut() {
+        if m.get("tool_calls").is_none() {
+            if let Some(o) = m.as_object_mut() {
+                o.remove("reasoning_content");
+            }
         }
     }
     msgs
+}
+
+fn reasoning_text(item: &Value) -> String {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn item_to_chat(item: &Value) -> Option<Value> {
@@ -911,6 +984,29 @@ mod tests {
         let u = normalize_base("http://127.0.0.1:8080/v1/chat/completions/").unwrap();
         assert_eq!(u, "http://127.0.0.1:8080/v1");
         assert!(normalize_base("ftp://x").is_err());
+    }
+
+    #[test]
+    fn parallel_tool_calls_share_one_assistant_message() {
+        let input = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "list then test"}]}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "checking"}]}),
+            json!({"type": "function_call", "call_id": "a", "name": "list_dir", "arguments": "{}"}),
+            json!({"type": "function_call", "call_id": "b", "name": "run_command", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "x"}),
+            json!({"type": "function_call_output", "call_id": "b", "output": "y"}),
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "done now"}]}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "all good"}]}),
+        ];
+        let msgs = chat_messages("", &input);
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "assistant"]);
+        assert_eq!(msgs[1]["content"], "checking");
+        let ids: Vec<&str> = msgs[1]["tool_calls"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(msgs[1]["reasoning_content"], "list then test");
+        assert!(msgs[4].get("reasoning_content").is_none(), "final answers drop their reasoning");
     }
 
     #[test]
