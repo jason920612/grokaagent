@@ -18,8 +18,9 @@ pub struct EventMeta {
     pub parent_run_id: Option<String>,
     /// Agent tree path relative to the process that reads the event:
     /// empty = this process's own agent, `coder` = its child, `coder/lint` = grandchild.
-    /// Each relay hop prefixes the child's name.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Each relay hop prefixes the child's name. Serialized as `agent_path`
+    /// so it never collides with an event's own `path` (a file path).
+    #[serde(rename = "agent_path", default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 }
 
@@ -415,6 +416,34 @@ mod tests {
         let second: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["type"], "run_finished");
         assert_eq!(second["text"], "hi");
+    }
+
+    #[test]
+    fn relayed_file_change_keeps_both_paths() {
+        let ev = AgentEvent::FileChanged {
+            meta: EventMeta {
+                ts: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                agent_name: "lint".into(),
+                run_id: "g".into(),
+                parent_run_id: Some("c".into()),
+                path: String::new(),
+            },
+            path: "notes/a.txt".into(),
+            kind: "create".into(),
+            diff: "+x".into(),
+        }
+        .relayed("lint", "c")
+        .relayed("coder", "root");
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(line.matches("\"path\"").count(), 1, "{line}");
+        let back: AgentEvent = serde_json::from_str(&line).expect("relayed events must parse");
+        match back {
+            AgentEvent::FileChanged { meta, path, .. } => {
+                assert_eq!(meta.path, "coder/lint");
+                assert_eq!(path, "notes/a.txt");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

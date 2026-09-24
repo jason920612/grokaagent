@@ -266,6 +266,17 @@ fn workbench_keys_toggle_views_panels_and_tabs() {
     app.show_chat(Some("b".into()));
     key(app, KeyCode::Char('w'), KeyModifiers::CONTROL);
     assert_eq!(app.cur().open_tabs, ["a"]);
+
+    // Alt+↓/↑ walk the agent tree, opening tabs.
+    app.show_chat(None);
+    key(app, KeyCode::Down, KeyModifiers::ALT);
+    assert_eq!(app.active_tab(), Tab::Agent("a".into()));
+    key(app, KeyCode::Down, KeyModifiers::ALT);
+    assert_eq!(app.active_tab(), Tab::Agent("b".into()));
+    key(app, KeyCode::Down, KeyModifiers::ALT);
+    assert_eq!(app.active_tab(), Tab::Chat, "wraps back to the main chat");
+    key(app, KeyCode::Up, KeyModifiers::ALT);
+    assert_eq!(app.active_tab(), Tab::Agent("b".into()));
 }
 
 #[test]

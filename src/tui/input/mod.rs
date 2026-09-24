@@ -185,6 +185,8 @@ fn workbench_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('0') if alt => app.show_chat(None),
         KeyCode::Char(c @ '1'..='5') if alt => toggle_side(app, SideView::ALL[c as usize - '1' as usize]),
         KeyCode::Left if alt => app.cycle_tab(-1),
+        KeyCode::Up if alt => app.step_agent(-1),
+        KeyCode::Down if alt => app.step_agent(1),
         KeyCode::Right if alt => app.cycle_tab(1),
         KeyCode::PageUp if ctrl => app.cycle_tab(-1),
         KeyCode::PageDown if ctrl => app.cycle_tab(1),

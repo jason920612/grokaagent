@@ -1248,6 +1248,26 @@ impl App {
         }
     }
 
+    /// Alt+↑/↓: open the previous / next agent in tree order (the main chat
+    /// sits before the first agent).
+    pub fn step_agent(&mut self, delta: i32) {
+        let paths: Vec<String> = self.cur().agents.nodes.iter().map(|a| a.path.clone()).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let cur = match self.active_tab() {
+            Tab::Agent(p) => paths.iter().position(|x| *x == p).map(|i| i as i32 + 1).unwrap_or(0),
+            _ => 0,
+        };
+        let n = paths.len() as i32 + 1;
+        let next = (cur + delta).rem_euclid(n);
+        if next == 0 {
+            self.show_chat(None);
+        } else {
+            self.show_chat(Some(paths[next as usize - 1].clone()));
+        }
+    }
+
     pub fn cycle_tab(&mut self, delta: i32) {
         let tabs = self.tabs();
         let cur = self.active_tab();

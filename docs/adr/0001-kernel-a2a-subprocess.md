@@ -25,7 +25,7 @@ A2A 是適配層，不是核心。每個 agent 行程都是一個 A2A server（l
 內部不發明第二套「對話物件」。委派與輪流發言都是 `Message` + `Task` + `contextId`。
 
 - 樹：新子行程，裡面是**一個長壽 session**。`spawn_agent` **立即回傳**；每則 A2A `Message` 都進同一個 session 的 inbox（保留歷史、孫代理與背景），每則對應一個 `Task`，在子 session 下一次閒置時完成。
-- 回報：父端 tail 子的事件檔，從子自己的事件（`run_id` 相符、`path` 為空）追蹤狀態。子閒置時，回覆以 `[child agent \`name\` replied]` 推進父 session（與背景結束通知同一條通道，會喚醒等待中的父）；若父正以 `wait_agents` 等這個子，改由該呼叫收下，不重複推送。
+- 回報：父端 tail 子的事件檔，從子自己的事件（`run_id` 相符、`agent_path` 為空）追蹤狀態。子閒置時，回覆以 `[child agent \`name\` replied]` 推進父 session（與背景結束通知同一條通道，會喚醒等待中的父）；若父正以 `wait_agents` 等這個子，改由該呼叫收下，不重複推送。
 - 管理工具：`spawn_agent`、`send_message`（立即回傳）、`wait_agents`、`list_agents`、`stop_agent`（中斷目前回合，或 `kill=true` 結束行程並釋放名額）。父按 Esc 時，正在工作的子也會被中斷（保留 session，不喚醒父）。
 - Session：共用 `contextId`，父把 `Message` 轉給指定子行程。子進入 `INPUT_REQUIRED` 時暫停、由父模型決定回覆或轉給另一個 agent——**尚未實作**（見缺口）。
 - 沒有內建議長。要議長就再 spawn 一個名叫 moderator 的 agent。
@@ -57,7 +57,7 @@ A2A 是適配層，不是核心。每個 agent 行程都是一個 A2A server（l
 
 ## 事件
 
-每筆事件必帶 `ts`、`agent_name`、`run_id`，子事件再帶 `parent_run_id`。轉發時每一層把 `path` 前綴上子名稱（`coder`、`coder/lint`），並把 `parent_run_id` 改成轉發者自己的 run，所以最上層看到的每筆後代事件都掛在根 session 下、用 `path` 表示樹。管道是 JSONL 檔（run 目錄）與可選的 stdout/named pipe。Hook 是外部行程讀這個流；核心不解釋腳本內容。
+每筆事件必帶 `ts`、`agent_name`、`run_id`，子事件再帶 `parent_run_id`。轉發時每一層把 `agent_path` 前綴上子名稱（`coder`、`coder/lint`），並把 `parent_run_id` 改成轉發者自己的 run，所以最上層看到的每筆後代事件都掛在根 session 下、用 `agent_path` 表示樹。管道是 JSONL 檔（run 目錄）與可選的 stdout/named pipe。Hook 是外部行程讀這個流；核心不解釋腳本內容。
 
 ## 假設（未反對就照此做）
 
