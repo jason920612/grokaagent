@@ -1,0 +1,9 @@
+{
+  "id": "L2-refactor-feature",
+  "category": "long",
+  "title": "修兩個 bug 並加入折扣與優惠券功能",
+  "prompt": "這是我們商店後端的小專案（shop/ 套件，金額單位都是整數「分」）。請看 ISSUES.md：修好 BUG-1、BUG-2，並完整實作 FEATURE-1（數量階梯折扣、優惠券規則、稅的計算順序，以及 place_order 傳優惠券與失敗時不留預留量）。規則請完全照 ISSUES.md，邊界條件也要處理。不要修改 tests/ 底下現有的測試檔（可以另外新增測試檔）。完成前請用 `python -m unittest discover -s tests -t .` 確認所有測試都通過。",
+  "timeout_s": 1500,
+  "max_turns": 60,
+  "tags": ["python", "bugfix", "feature", "business-rules", "existing-codebase"]
+}

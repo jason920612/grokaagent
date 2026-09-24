@@ -1,0 +1,9 @@
+{
+  "id": "S4-log-count",
+  "category": "short",
+  "title": "統計日誌裡的錯誤",
+  "prompt": "幫我統計 logs/ 底下的錯誤：只看副檔名剛好是小寫 .log 的檔案（包含所有子資料夾，但排除 logs/archive/ 整個資料夾），一行只要包含大寫字串 ERROR（區分大小寫，ERRORS 也算，因為包含 ERROR）就算一行錯誤。請算出「至少有一行錯誤的 .log 檔案數」和「錯誤行總數」，寫到 result.txt，內容只有一行：files=N lines=M",
+  "timeout_s": 420,
+  "max_turns": 20,
+  "tags": ["shell", "files", "short"]
+}

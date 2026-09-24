@@ -1,0 +1,9 @@
+{
+  "id": "D4-log-security",
+  "category": "domain",
+  "title": "Nginx 日誌資安事件分析",
+  "prompt": "logs/ 目錄裡是網站兩天的 nginx access log（combined 格式），包含 access.log、access.log.1 和壓縮過的 access.log.2.gz，三個都要分析。請找出資安事件並寫成 incident_report.json。可以寫 Python 腳本執行（只用標準函式庫）。\n\n解析規則：\n- 每行格式：IP - - [dd/Mon/YYYY:HH:MM:SS +0000] \"METHOD TARGET PROTOCOL\" STATUS SIZE \"REFERER\" \"USER_AGENT\"。\n- 不符合這個格式、或時間無法解析的行一律略過，不計入任何統計。\n- 時間一律用 UTC。\n- 「解碼後的 target」= 把 TARGET 用 URL percent-decoding 解碼「剛好一次」（等同 Python urllib.parse.unquote，'+' 不轉空白），再轉成小寫。\n\n偵測規則：\n1. total_requests：有效行的總數。\n2. brute_force_ips：METHOD 為 POST、TARGET 剛好是 /login、STATUS 為 401 的請求中，同一 IP 在任意 5 分鐘內（第一筆與最後一筆時間差 ≤ 300 秒）達到 10 次以上。輸出 IP 字串陣列，依字串遞增排序。\n3. traversal_ips：解碼後的 target 含有 \"../\" 或 \"..\\\"（反斜線）的來源 IP，依字串排序。\n4. sqli_ips：解碼後的 target 含有下列任一字串的來源 IP：\"' or '\"、\"union select\"、\"sleep(\"、\"information_schema\"，依字串排序。\n5. top_404_user_agents：STATUS 為 404 的請求中出現次數最多的前 3 個 User-Agent，輸出 [{\"user_agent\": 字串, \"count\": 整數}, ...]，次數多的在前，同次數依 User-Agent 字串排序。\n6. peak_5xx_minute / peak_5xx_count：STATUS 500–599 的請求最多的那一分鐘，格式 \"YYYY-MM-DDTHH:MM\"（UTC），同數量取最早；以及該分鐘的次數。\n\nincident_report.json 的 key：total_requests、brute_force_ips、traversal_ips、sqli_ips、top_404_user_agents、peak_5xx_minute、peak_5xx_count。\n\n最後用條列說明你看到的攻擊行為與建議的處置。",
+  "timeout_s": 900,
+  "max_turns": 40,
+  "tags": ["security", "logs", "blue-team", "python"]
+}

@@ -9,3 +9,7 @@
 xai-auth.json
 groka-events.jsonl
 groka-children/
+
+# eval run outputs
+evals/results/
+__pycache__/

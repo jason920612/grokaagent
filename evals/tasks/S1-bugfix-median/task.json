@@ -1,0 +1,9 @@
+{
+  "id": "S1-bugfix-median",
+  "category": "short",
+  "title": "修一個統計函式的 bug",
+  "prompt": "這個專案跑 `python -m unittest` 會有測試失敗。請找出 stats.py 裡的 bug 並修好，不要修改或刪除 tests/ 底下的測試。改完自己跑一次測試確認全部通過。",
+  "timeout_s": 420,
+  "max_turns": 20,
+  "tags": ["python", "debug", "short"]
+}

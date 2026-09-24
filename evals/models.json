@@ -1,0 +1,15 @@
+{
+  "grok-4.7": {
+    "model": "grok-4.7",
+    "provider": "xai",
+    "reasoning": "high"
+  },
+  "deepseek-v4.1-flash": {
+    "model": "deepseek/deepseek-v4.1-flash",
+    "provider": "openai",
+    "base_url": "https://openrouter.ai/api/v1",
+    "key_env": "OPENROUTER_API_KEY",
+    "context": "1M",
+    "reasoning": "high"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "D2-sql-analytics",
+  "category": "domain",
+  "title": "電商資料庫 SQL 分析",
+  "prompt": "工作目錄有一個 SQLite 資料庫 shop.db（資料表 customers、products、orders、order_items、refunds，請自己查 schema）。老闆要六個營運數字，請用 SQL 算出來（可以用 Python 的 sqlite3 執行），把答案寫進 answers.json，並把你實際用到的 SQL 存成 queries.sql。\n\n共同定義：\n- 只計算 status = 'paid' 的訂單；cancelled 訂單完全忽略。\n- 明細金額 line = quantity × unit_price；訂單金額 = 該訂單所有明細金額加總。\n- 退款在 refunds 表（只會出現在 paid 訂單），一筆訂單可能有退款也可能沒有。\n- 日期欄位都是 'YYYY-MM-DD' 字串；「月份」指 'YYYY-MM'。\n\n問題與 answers.json 的格式（key 名稱必須完全一致）：\n1. q1_monthly_net_revenue_2025：2025 年每個月的淨營收。營收依 order_date 所在月份計入，退款依 refund_date 所在月份扣除。輸出物件，key 為 \"2025-01\" 到 \"2025-12\" 全部 12 個月，value 為淨營收（四捨五入到小數兩位）。\n2. q2_top5_customers：全期間淨消費（該客戶 paid 訂單金額總和 − 這些訂單的退款總和）最高的 5 位客戶。同額時 customer_id 小的在前。輸出陣列，每項 {\"customer_id\": 整數, \"net_spend\": 兩位小數}，由高到低。\n3. q3_repeat_purchase_rate：至少有 1 筆 paid 訂單的客戶中，有 2 筆以上 paid 訂單的比例，四捨五入到小數 4 位（例如 0.3125）。\n4. q4_highest_refund_rate_category：各商品類別（products.category）的退款率最高者。一筆訂單的退款金額要依明細金額比例分攤到該訂單的每一個明細（分攤額 = 退款 × line / 訂單金額）；類別退款率 = 類別分攤退款總額 / 類別明細金額總額。輸出 {\"category\": 類別名稱, \"rate\": 小數 4 位}。\n5. q5_avg_days_first_to_second：有 2 筆以上 paid 訂單的客戶，第一筆與第二筆 paid 訂單相隔的天數（依 order_date 排序，同日再依 orders.id）的平均值，四捨五入到小數 2 位。\n6. q6_cohort_2025_03：第一筆 paid 訂單落在 2025-03 的客戶為一個 cohort。輸出 {\"cohort_size\": 人數, \"2025-04\": 比例, \"2025-05\": 比例, \"2025-06\": 比例}，比例 = cohort 中在該月有至少一筆 paid 訂單的人數 / cohort_size，小數 4 位。\n\n完成後用幾句話摘要主要發現。",
+  "timeout_s": 900,
+  "max_turns": 40,
+  "tags": ["sql", "sqlite", "analytics", "data"]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "D3-bioinfo-fasta",
+  "category": "domain",
+  "title": "FASTA 序列分析（GC、ORF、反向互補）",
+  "prompt": "工作目錄的 samples.fasta 是一批 DNA 定序結果（多行換行、部分小寫軟遮罩、部分含 N）。請分析後產生兩個檔案，可以自己寫 Python 腳本執行（只能用標準函式庫）。\n\n規則：\n- 序列 id = 標頭行 '>' 之後到第一個空白為止（例如 '>seq01 sample=leaf run=123' 的 id 是 seq01）。序列內容是標頭後所有行串接起來（去掉換行）。\n- 大小寫不分，一律視為大寫處理。\n- length：序列總長度（包含 N）。\n- gc_percent：(G 數 + C 數) / (A+C+G+T 的總數) × 100，N 不算進分母；四捨五入（half up）到小數兩位，輸出一定是兩位小數（例如 48.00）。\n- longest_orf_nt：最長開放讀框長度（核苷酸數）。ORF 定義：從 ATG 開始，每 3 個鹼基一個密碼子往後讀，直到遇到第一個同框的終止密碼子 TAA、TAG 或 TGA；長度包含 ATG 與終止密碼子。要檢查正股與反向互補股，共 6 個讀框；沒遇到終止密碼子就結束的不算 ORF；含 N 的密碼子當作普通（非終止）密碼子。沒有任何 ORF 時填 0。\n- 反向互補：A↔T、C↔G、N 保持 N，然後整條反轉，輸出一律大寫。\n\n交付：\n1. report.tsv：Tab 分隔，第一列標題剛好是 id\\tlength\\tgc_percent\\tlongest_orf_nt，之後依 FASTA 原本的順序每條序列一列。\n2. revcomp.fasta：長度最短的 3 條序列（長度相同時 id 字典序小的優先），依長度由短到長輸出它們的反向互補序列；標頭為 '>' + id + '_rc'（例如 >seq07_rc），序列每 60 個字元換行。\n\n完成後回報 GC 最高的序列與最長 ORF 的長度。",
+  "timeout_s": 900,
+  "max_turns": 40,
+  "tags": ["bioinformatics", "fasta", "python", "algorithm"]
+}

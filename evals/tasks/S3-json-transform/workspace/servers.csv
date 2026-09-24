@@ -1,0 +1,12 @@
+name,region,cpu,mem_gb,tags,status
+web-01, TPE ,8,32,web;prod,active
+web-02,tpe,8,32,web; prod ;prod,active
+db-01,TPE,32,256.5,db;prod;backup,Active
+cache-01,khh,4,16,cache;;prod,active
+batch-01,KHH,16,64,batch,maintenance
+old-web-01,tpe,4,8,web;legacy,retired
+edge-01,sgp,2,4.25,edge;CDN,active
+edge-02,SGP,2,4.25,edge;cdn,ACTIVE
+ml-01,sgp,64,512,gpu;ml;prod,maintenance
+old-db-01,khh,16,128,db;legacy,Retired
+bastion,tpe,1,2,,active

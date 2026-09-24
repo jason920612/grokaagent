@@ -1,0 +1,9 @@
+{
+  "id": "L3-delegate-modules",
+  "category": "long",
+  "title": "用子代理平行實作三個模組再整合",
+  "prompt": "請依照工作目錄裡的 SPEC.md 完成 roman.py、luhn.py、rle.py 三個模組和整合用的 main.py。這三個模組彼此獨立，請務必用子代理平行處理：用 spawn_agent 開至少兩個子代理（例如每個模組一個），各自實作並自我測試負責的模組，你再用 wait_agents 等它們完成、檢查它們的結果，最後由你寫 main.py 並整合驗證。完成前請實際執行程式確認 SPEC.md 裡的例子與錯誤情況都正確。",
+  "timeout_s": 1800,
+  "max_turns": 60,
+  "tags": ["python", "delegation", "child-agents", "parsing"]
+}

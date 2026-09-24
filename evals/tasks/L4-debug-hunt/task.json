@@ -1,0 +1,9 @@
+{
+  "id": "L4-debug-hunt",
+  "category": "long",
+  "title": "追查快取與算式計算的多個 bug",
+  "prompt": "使用者回報 calc 這個小函式庫（calc/cache.py 的 LRUCache、calc/expr.py 的 evaluate）有好幾個結果不對的問題，目前 tests/test_visible.py 也有測試失敗。README.md 是正確行為的規格。請找出並修好所有與 README 不符的 bug（不只是現有測試抓到的那些），不要刪除或放寬現有測試；建議你為每個找到的 bug 補上測試。完成前請用 `python -m unittest discover -s tests -t .` 確認全部通過，並簡短說明你修了哪些 bug。",
+  "timeout_s": 1500,
+  "max_turns": 60,
+  "tags": ["python", "debugging", "spec-reading", "existing-codebase"]
+}

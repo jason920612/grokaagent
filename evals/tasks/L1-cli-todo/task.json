@@ -1,0 +1,9 @@
+{
+  "id": "L1-cli-todo",
+  "category": "long",
+  "title": "依規格實作待辦清單 CLI",
+  "prompt": "請依照工作目錄裡的 SPEC.md，用 Python 3（只能用標準函式庫）實作單一檔案 todo.py 的命令列待辦清單工具。規格裡的輸出格式、exit code、錯誤處理都要完全照做。另外請自己寫一份測試檔 test_todo.py（unittest 即可），用子行程實際呼叫 todo.py 並使用暫存的 --db 路徑，涵蓋主要指令與錯誤情況；完成前請實際執行你的測試確認全部通過。",
+  "timeout_s": 1500,
+  "max_turns": 60,
+  "tags": ["python", "cli", "spec-following", "testing"]
+}

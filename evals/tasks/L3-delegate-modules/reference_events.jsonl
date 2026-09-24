@@ -1,0 +1,5 @@
+{"type":"run_started","agent_name":"root","run_id":"r0","model":"reference"}
+{"type":"child_spawned","agent_name":"root","run_id":"r0","name":"roman","agent_card_url":"http://127.0.0.1/","prompt":"roman.py","model":"reference"}
+{"type":"child_spawned","agent_name":"root","run_id":"r0","name":"luhn","agent_card_url":"http://127.0.0.1/","prompt":"luhn.py","model":"reference"}
+{"type":"tool_started","agent_name":"root","run_id":"r0","call_id":"c1","name":"wait_agents","args":{},"kind":"client"}
+{"type":"tool_finished","agent_name":"root","run_id":"r0","call_id":"c1","name":"wait_agents","output":"roman: idle; luhn: idle"}

@@ -1,0 +1,9 @@
+{
+  "id": "D1-finance-amortization",
+  "category": "domain",
+  "title": "房貸攤還表（提前還款＋利率調整）",
+  "prompt": "我需要一份精確的房貸攤還表，請在工作目錄產生兩個檔案。你可以自己寫 Python 腳本並執行來計算。\n\n貸款條件：\n- 本金 350000.00，原始期數 360 個月，按月計息，月利率 = 年利率 / 12。\n- 第 1～60 期年利率 6.00%。\n- 每月付款額 = P × r / (1 − (1 + r)^(−n))，四捨五入（half up）到分。第 1 期起 P = 350000.00、r = 0.06/12、n = 360。\n- 第 24 期除了正常月付外，另外一次性提前償還本金 20000.00（extra 欄位）。提前還款後月付額不變。\n- 從第 61 期起年利率改為 7.25%。以第 60 期期末餘額為 P、新月利率為 r、剩餘期數 n = 300 重新計算月付額（同樣 half up 到分），之後一直使用這個月付額。\n\n每一期的計算規則（所有金額都以分為單位精確計算，不可累積浮點誤差，建議用 decimal）：\n- interest = 前期餘額 × 當期月利率，四捨五入（half up）到分。\n- 一般情況：payment = 當期月付額，principal = payment − interest。\n- 若 前期餘額 + interest ≤ 當期月付額，或已經是第 360 期：這一期是最後一期，payment = 前期餘額 + interest，principal = 前期餘額。\n- balance = 前期餘額 − principal − extra（extra 只有第 24 期是 20000.00，其他期是 0.00）。\n- 餘額歸零後就結束，不要再輸出之後的期數。\n\n交付檔案：\n1. schedule.csv：第一列標題必須剛好是 month,payment,interest,principal,extra,balance，之後每期一列，month 從 1 開始，金額一律輸出兩位小數（例如 2098.43、0.00），不要千分位。\n2. summary.json：{\"total_interest\": 所有期 interest 加總（兩位小數的數字）, \"payoff_month\": 最後一期的 month（整數）, \"payment_before_rate_change\": 第 1 期月付額, \"payment_after_rate_change\": 第 61 期起的月付額}。\n\n完成後簡短回報最後一期的期數與總利息。",
+  "timeout_s": 900,
+  "max_turns": 40,
+  "tags": ["finance", "decimal", "python", "precision"]
+}

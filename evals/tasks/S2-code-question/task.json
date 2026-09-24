@@ -1,0 +1,13 @@
+{
+  "id": "S2-code-question",
+  "category": "short",
+  "title": "讀懂程式碼回答運費問題",
+  "prompt": "這是我們網店的程式碼。請搞清楚結帳時實際收的運費是哪個函式算的，然後算出：一個 12.5 公斤的包裹寄到 B 區、會員等級 gold，運費是多少（新台幣整數）。把答案寫成 answer.json，格式：{\"function\": \"<模組路徑.函式名，例如 a.b.func>\", \"file\": \"<相對路徑，例如 a/b.py>\", \"fee\": <整數>}。不要修改任何原始碼。",
+  "timeout_s": 420,
+  "max_turns": 20,
+  "tags": [
+    "python",
+    "code-reading",
+    "short"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "S3-json-transform",
+  "category": "short",
+  "title": "把雜亂的 CSV 整理成 JSON 清單",
+  "prompt": "servers.csv 是機器清單，資料有點髒（欄位前後有空白、大小寫不一致、tags 有空的或重複的）。請產生 inventory.json，規則：\n1. 所有欄位先去掉前後空白；region 一律轉小寫；status 不分大小寫。\n2. status 為 retired 的機器只列在 \"retired\"（名稱排序後的陣列），不算進其他統計。\n3. 其餘機器依 region 分組放在 \"regions\"：{\"<region>\": {\"servers\": [名稱排序], \"total_cpu\": 整數加總, \"total_mem_gb\": 加總後四捨五入到小數 1 位}}。\n4. \"maintenance\"：status 為 maintenance 的機器名稱（排序），這些機器仍要算進 regions。\n5. \"by_tag\"：非 retired 機器的標籤計數 {\"<tag>\": 台數}；tags 以分號分隔，去空白、轉小寫，忽略空標籤，同一台機器重複的標籤只算一次。\n只要產出 inventory.json，不要修改 servers.csv。",
+  "timeout_s": 420,
+  "max_turns": 20,
+  "tags": ["data", "json", "short"]
+}
