@@ -773,6 +773,28 @@ fn catalog_failure_keeps_only_the_current_selection() {
 }
 
 #[test]
+fn a_rejected_login_offers_a_real_login_again() {
+    use super::settings::LoginUi;
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let dead = crate::auth::TokenSet {
+        access_token: "expired".into(),
+        refresh_token: "spent".into(),
+        id_token: None,
+    };
+    crate::auth::save_tokens(&app.settings.auth_path, &dead).unwrap();
+    app.settings.xai_ready = true;
+    app.ingest_catalog(Err(crate::error::Error::Auth(crate::auth::LOGIN_EXPIRED.into())));
+    assert!(!app.settings.xai_ready, "a dead token file is not a login");
+    // The account button now logs in instead of logging out, and a dead file
+    // must not short-circuit the device flow.
+    app.activate_account();
+    assert_eq!(app.settings.login, LoginUi::Starting);
+    assert!(app.settings.want_login);
+    assert!(app.settings.auth_path.exists(), "nothing was logged out");
+}
+
+#[test]
 fn login_events_from_a_stale_attempt_are_ignored() {
     use super::settings::{LoginEvent, LoginUi};
     let mut fx = fixture();

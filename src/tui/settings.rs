@@ -127,8 +127,10 @@ pub(crate) struct Settings {
     pub login: LoginUi,
     pub login_gen: u64,
     pub want_login: bool,
-    /// xAI OAuth tokens exist on disk.
+    /// xAI OAuth tokens exist on disk and have not been rejected.
     pub xai_ready: bool,
+    /// xAI rejected the saved refresh token; only a new login helps.
+    pub xai_stale: bool,
     /// The route of the current model is usable.
     pub logged_in: bool,
     pub skill_list: Vec<Skill>,
@@ -168,6 +170,7 @@ impl Settings {
             login_gen: 0,
             want_login: false,
             xai_ready,
+            xai_stale: false,
             logged_in,
             skill_list: Vec::new(),
             skill_cursor: 0,
@@ -198,7 +201,7 @@ impl Settings {
 impl App {
     fn refresh_ready(&mut self) {
         let st = &mut self.settings;
-        st.xai_ready = auth::load_tokens(&st.auth_path).is_ok();
+        st.xai_ready = !st.xai_stale && auth::load_tokens(&st.auth_path).is_ok();
         st.logged_in = st.conn.ready(st.xai_ready);
         // Logging in or out turns `grok_search` on or off for custom models.
         self.sync_knobs();
@@ -441,6 +444,14 @@ impl App {
                 self.opts.reasoning_effort = choice.effort;
                 self.sync_knobs();
             }
+            Err(e) if auth::login_expired(&e) => {
+                // The tokens on disk are dead: show the login button again.
+                self.settings.xai_stale = true;
+                self.refresh_ready();
+                self.rebuild_catalog();
+                self.settings.catalog_status = CatalogStatus::Failed("Grok 登入已失效，請重新登入".into());
+                self.flash("Grok 登入已失效，請在設定（F2）重新登入");
+            }
             Err(e) => {
                 self.rebuild_catalog();
                 self.settings.catalog_status = CatalogStatus::Failed(e.to_string().chars().take(80).collect());
@@ -610,7 +621,11 @@ impl App {
         if self.settings.login.in_flight() {
             return;
         }
-        if auth::load_tokens(&self.settings.auth_path).is_ok() {
+        // Only a live access token skips the browser; an old or rejected
+        // file must go through a real device login.
+        let live = auth::load_tokens(&self.settings.auth_path)
+            .is_ok_and(|t| auth::access_token_valid_at(&t.access_token, std::time::SystemTime::now()));
+        if live && !self.settings.xai_stale {
             self.login_success();
             return;
         }
@@ -655,6 +670,7 @@ impl App {
         st.login = LoginUi::Idle;
         st.want_login = false;
         st.want_catalog = true;
+        st.xai_stale = false;
         self.refresh_ready();
         self.flash("已登入 Grok");
     }
@@ -668,6 +684,11 @@ impl App {
         }
         match ev {
             LoginEvent::Waiting { url, user_code, .. } => {
+                // The browser may not open (remote shell, no default browser):
+                // keep the link in the chat where it can be selected.
+                self.cur_mut().chat.push(super::model::rows::Row::meta(format!(
+                    "Grok 登入：在瀏覽器開啟 {url} ，確認代碼 {user_code} 後核准"
+                )));
                 self.settings.login = LoginUi::Waiting { url, user_code };
                 self.flash("請在瀏覽器核准 Grok 登入");
             }

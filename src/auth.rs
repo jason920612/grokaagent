@@ -23,6 +23,58 @@ const EXPIRY_SKEW_SECS: u64 = 300;
 
 static REFRESH_LOCK: Mutex<()> = Mutex::const_new(());
 
+pub const LOGIN_EXPIRED: &str = "xAI refresh rejected; run `grokaagent login` again";
+const FILE_LOCK_WAIT: Duration = Duration::from_secs(20);
+const FILE_LOCK_STALE: Duration = Duration::from_secs(60);
+
+/// True when the saved login can no longer be refreshed: only a new device
+/// login helps.
+pub fn login_expired(err: &Error) -> bool {
+    matches!(err, Error::Auth(m) if m == LOGIN_EXPIRED)
+}
+
+/// `<auth file>.lock`, held across processes while one of them refreshes.
+struct RefreshFileLock(Option<PathBuf>);
+
+impl RefreshFileLock {
+    async fn acquire(auth: &Path) -> Self {
+        let mut name = auth.as_os_str().to_owned();
+        name.push(".lock");
+        let lock = PathBuf::from(name);
+        let deadline = SystemTime::now() + FILE_LOCK_WAIT;
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => return Self(Some(lock)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > FILE_LOCK_STALE);
+                    if stale {
+                        let _ = fs::remove_file(&lock);
+                        continue;
+                    }
+                    if SystemTime::now() >= deadline {
+                        return Self(None);
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                // Read-only dir or similar: refresh without the lock.
+                Err(_) => return Self(None),
+            }
+        }
+    }
+}
+
+impl Drop for RefreshFileLock {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
@@ -384,6 +436,10 @@ pub async fn valid_access_token(path: &Path) -> Result<String> {
     }
 
     let _guard = REFRESH_LOCK.lock().await;
+    // Child agents are separate processes sharing this file. xAI rotates the
+    // refresh token on every use, so two processes refreshing at once would
+    // spend the same token and get the login rejected.
+    let _file_lock = RefreshFileLock::acquire(path).await;
     let tokens = load_tokens(path)?;
     if access_token_valid_at(&tokens.access_token, SystemTime::now()) {
         return Ok(tokens.access_token);
@@ -408,9 +464,15 @@ pub async fn valid_access_token(path: &Path) -> Result<String> {
         ));
     }
     if status.as_u16() == 400 || status.as_u16() == 401 {
-        return Err(Error::Auth(
-            "xAI refresh rejected; run `grokaagent login` again".into(),
-        ));
+        // Someone else (e.g. a process without the lock) may have rotated it.
+        if let Ok(now) = load_tokens(path) {
+            if now.refresh_token != tokens.refresh_token
+                && access_token_valid_at(&now.access_token, SystemTime::now())
+            {
+                return Ok(now.access_token);
+            }
+        }
+        return Err(Error::Auth(LOGIN_EXPIRED.into()));
     }
     if !status.is_success() {
         return Err(Error::Auth(format!("token refresh failed HTTP {status}")));
@@ -439,6 +501,30 @@ pub fn map_device_poll_error(error: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refresh_file_lock_is_exclusive_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("xai-auth.json");
+        let first = RefreshFileLock::acquire(&auth).await;
+        assert!(first.0.is_some());
+        let lock = first.0.clone().unwrap();
+        let waiter = tokio::spawn({
+            let auth = auth.clone();
+            async move { RefreshFileLock::acquire(&auth).await.0.is_some() }
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished(), "a second process must wait");
+        drop(first);
+        assert!(waiter.await.unwrap());
+        assert!(!lock.exists(), "the lock file is removed on release");
+    }
+
+    #[test]
+    fn only_a_rejected_refresh_counts_as_expired() {
+        assert!(login_expired(&Error::Auth(LOGIN_EXPIRED.into())));
+        assert!(!login_expired(&Error::Auth("token refresh failed HTTP 500".into())));
+    }
 
     fn jwt_with_exp(exp: u64) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
