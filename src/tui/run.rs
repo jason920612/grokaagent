@@ -58,6 +58,11 @@ async fn tui_loop(
         .as_ref()
         .and_then(|s| s.load_task::<crate::task::TaskState>(&session_id))
         .unwrap_or_default();
+    let boot_bench = store
+        .as_ref()
+        .and_then(|s| s.load_agents::<Vec<SavedAgent>>(&session_id))
+        .map(Workbench::restore)
+        .unwrap_or_default();
     if !listed.iter().any(|m| m.id == session.id) {
         listed.insert(0, session.clone());
     }
@@ -65,8 +70,19 @@ async fn tui_loop(
     let skills_fallback = launch_workspace.clone();
     let mut app = App {
         web_receipts: Vec::new(),
-        panel: 0,
-        panel_scroll: 0,
+        side_view: SideView::Sessions,
+        // Dock the side bar only where it fits; narrow terminals open it on demand.
+        side_open: terminal
+            .size()
+            .map(|s| s.width >= SIDEBAR_MIN_TERM)
+            .unwrap_or(true),
+        side_scroll: 0,
+        bottom: None,
+        bottom_scroll: 0,
+        side_area: Rect::default(),
+        bottom_area: Rect::default(),
+        web_sent: HashMap::new(),
+        web_cache: HashMap::new(),
         rows: boot.rows,
         edit: Edit::default(),
         status: "待命".into(),
@@ -153,7 +169,7 @@ async fn tui_loop(
             last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
             image_view: None,
-            children: Vec::new(),
+            bench: boot_bench,
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
@@ -423,6 +439,8 @@ async fn tui_loop(
         }
     }
     app.persist_transcript();
+    app.bench.dirty = true;
+    app.persist_agents();
     app.inbox_tx = None;
     Ok(())
 }
@@ -850,7 +868,7 @@ fn handle_key(
         return true;
     }
     if matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL) {
-        if app.copy_selection() {
+        if app.with_active_view(|app| app.copy_selection()) {
             return false;
         }
         app.cancel_ask();
@@ -900,20 +918,11 @@ fn handle_key(
         return false;
     }
 
+    if handle_workbench_key(app, code, mods) {
+        return false;
+    }
+
     match (code, mods) {
-        (KeyCode::F(3), _) => { app.panel = if app.panel == 1 { 0 } else { 1 }; }
-        (KeyCode::F(4), _) => { app.panel = if app.panel == 2 { 0 } else { 2 }; }
-        (KeyCode::Esc, _) if app.panel != 0 => { app.panel = 0; }
-        (KeyCode::Enter, _) if app.panel != 0 => { app.panel = 0; }
-        (KeyCode::Up, _) if app.panel == 2 => { app.panel_scroll = app.panel_scroll.saturating_sub(1); }
-        (KeyCode::Down, _) if app.panel == 2 => { app.panel_scroll = app.panel_scroll.saturating_add(1); }
-        (KeyCode::Up | KeyCode::Down, _) if app.panel == 1 => {
-            if let Some(i) = app.sessions.iter().position(|s| s.id == app.current_id) {
-                let next = if code == KeyCode::Up { i.saturating_sub(1) } else { (i + 1).min(app.sessions.len() - 1) };
-                let id = app.sessions[next].id.clone();
-                app.switch_to(&id);
-            }
-        }
         (KeyCode::Esc, _) => {
             if app.image_view.is_some() {
                 app.close_image_view();
@@ -991,10 +1000,10 @@ fn handle_key(
             }
         }
         (KeyCode::PageUp, _) => {
-            scroll_chat(app, page_scroll_step(app) as i32);
+            app.with_active_view(|app| scroll_chat(app, page_scroll_step(app) as i32));
         }
         (KeyCode::PageDown, _) => {
-            scroll_chat(app, -(page_scroll_step(app) as i32));
+            app.with_active_view(|app| scroll_chat(app, -(page_scroll_step(app) as i32)));
         }
         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
             if app.queue_edit.is_some() {
@@ -1612,6 +1621,17 @@ fn handle_mouse(
                 }
                 return;
             }
+            if hit.is_some_and(is_chat_hit) {
+                let hit = hit.unwrap();
+                app.commit_rename();
+                app.with_active_view(|app| handle_chat_click(app, hit, col, row, shift));
+                return;
+            }
+            if let Some(hit) = hit {
+                if handle_workbench_click(app, hit) {
+                    return;
+                }
+            }
             match hit {
                 Some(Hit::TaskChip) => open_task(app),
                 Some(Hit::Gear) | Some(Hit::ModelChip) => open_settings(app),
@@ -1636,13 +1656,6 @@ fn handle_mouse(
                     app.cancel_queue_edit();
                     app.focus = Focus::Chat;
                 }
-                Some(Hit::RailChild(i)) => {
-                    if let Some(c) = app.children.get(i as usize) {
-                        app.inspector = Some(Inspector::Child(c.name.clone()));
-                        app.inspector_scroll = 0;
-                        app.focus = Focus::Inspector;
-                    }
-                }
                 Some(Hit::RailMon(i)) => {
                     if let Some(m) = app.monitors.get(i as usize) {
                         app.inspector = Some(Inspector::Monitor(m.name.clone()));
@@ -1652,9 +1665,10 @@ fn handle_mouse(
                 }
                 Some(Hit::RailBg(i)) => {
                     if let Some(b) = app.backgrounds.get(i as usize) {
-                        app.inspector = Some(Inspector::Background(b.name.clone()));
-                        app.inspector_scroll = 0;
-                        app.focus = Focus::Inspector;
+                        app.bench.output = Some(b.name.clone());
+                        app.bottom = Some(BottomTab::Output);
+                        app.bottom_scroll = 0;
+                        app.focus = Focus::Chat;
                     }
                 }
                 Some(Hit::InspectorClose) => {
@@ -1670,31 +1684,6 @@ fn handle_mouse(
                     }
                     app.focus = Focus::Chat;
                 }
-                Some(Hit::ChatRow(_)) => {
-                    app.commit_rename();
-                    app.focus = Focus::Chat;
-                    let _ = app.dismiss_tool_ui();
-                    if let Some(pos) = chat_pos_at(&app.chat_glyphs, col, row) {
-                        app.edit.clear_sel();
-                        let anchor = if shift {
-                            match app.chat_sel {
-                                ChatSel::Text { anchor, .. } => anchor,
-                                _ => pos,
-                            }
-                        } else {
-                            pos
-                        };
-                        app.chat_sel = ChatSel::Text { anchor, caret: pos };
-                        app.chat_dragging = true;
-                    }
-                }
-                Some(Hit::ChatImage(i)) => {
-                    app.commit_rename();
-                    app.focus = Focus::Chat;
-                    if let Some(path) = app.image_hits.get(i as usize).cloned() {
-                        app.open_image_view(path);
-                    }
-                }
                 Some(Hit::Composer) => {
                     app.commit_rename();
                     app.focus = Focus::Chat;
@@ -1708,48 +1697,6 @@ fn handle_mouse(
                     );
                     app.edit.click(idx, shift);
                     app.input_dragging = true;
-                }
-                Some(Hit::ToolGroup(i)) => {
-                    app.focus = Focus::Chat;
-                    if let Some(Row::Tools(g)) = app.rows.get_mut(i) {
-                        g.expanded = !g.expanded;
-                        if !g.expanded && app.open_tool.map(|(r, _)| r) == Some(i) {
-                            app.open_tool = None;
-                        }
-                    }
-                }
-                Some(Hit::Think(i)) => {
-                    app.focus = Focus::Chat;
-                    if let Some(Row::Think(t)) = app.rows.get_mut(i) {
-                        t.expanded = !t.expanded;
-                    }
-                }
-                Some(Hit::ToolItem(r, c)) => {
-                    app.panel = 0;
-                    app.focus = Focus::Chat;
-                    app.open_tool = Some((r, c));
-                }
-                Some(Hit::ToolPanel) => {}
-                Some(Hit::ToolPanelClose) => {
-                    app.open_tool = None;
-                }
-                Some(Hit::JumpBottom) => {
-                    app.focus = Focus::Chat;
-                    jump_chat_bottom(app);
-                }
-                Some(Hit::ScrollThumb) => {
-                    app.focus = Focus::Chat;
-                    begin_scroll_drag(app, row, true);
-                }
-                Some(Hit::ScrollBar) => {
-                    app.focus = Focus::Chat;
-                    begin_scroll_drag(app, row, false);
-                }
-                Some(Hit::DismissTool) | Some(Hit::Chat) => {
-                    app.commit_rename();
-                    app.focus = Focus::Chat;
-                    app.chat_sel = ChatSel::None;
-                    let _ = app.dismiss_tool_ui();
                 }
                 Some(Hit::NewChat) => {
                     app.cancel_rename();
@@ -1767,8 +1714,10 @@ fn handle_mouse(
                     }
                 }
                 Some(Hit::Session(i)) => {
-                    app.panel = 0;
                     app.focus = Focus::Chat;
+                    if app.area.width < SIDEBAR_MIN_TERM {
+                        app.side_open = false;
+                    }
                     if let Some(id) = app.sidebar_ids.get(i as usize).cloned() {
                         if app.rename.as_ref().is_some_and(|(rid, _)| rid == &id) {
                             // stay in rename
@@ -1926,30 +1875,12 @@ fn handle_mouse(
                         }
                     }
                 }
-                None | Some(Hit::AskOption(_)) | Some(Hit::AskConfirm) | Some(Hit::AskCancel)
-                | Some(Hit::AskFill) | Some(Hit::AskPanel)
-                | Some(Hit::WsPanel)
-                | Some(Hit::WsPath)
-                | Some(Hit::WsEntry(_))
-                | Some(Hit::WsConfirm)
-                | Some(Hit::WsCreate)
-                | Some(Hit::WsCancel)
-                | Some(Hit::ImageView)
-                | Some(Hit::ImageViewClose)
-                | Some(Hit::ImageViewDismiss)
-                | Some(Hit::SkillView)
-                | Some(Hit::SkillViewClose)
-                | Some(Hit::SkillViewDismiss)
-                | Some(Hit::TaskConfirm)
-                | Some(Hit::TaskCancel)
-                | Some(Hit::TaskEnd)
-                | Some(Hit::TaskPanel)
-                | Some(Hit::TaskDraft) => {}
+                _ => {}
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if app.scroll_grab.is_some() {
-                apply_scroll_from_row(app, row);
+                app.with_active_view(|app| apply_scroll_from_row(app, row));
             } else if let (Some((dx, dy)), Some(w)) = (app.drag, app.settings.as_mut()) {
                 if !w.maximized {
                     w.x = (col as i16 - dx).max(0) as u16;
@@ -1962,9 +1893,11 @@ fn handle_mouse(
                 }
             } else if app.chat_dragging {
                 if let Some(pos) = chat_pos_at(&app.chat_glyphs, col, row) {
-                    if let ChatSel::Text { anchor, .. } = app.chat_sel {
-                        app.chat_sel = ChatSel::Text { anchor, caret: pos };
-                    }
+                    app.with_active_view(|app| {
+                        if let ChatSel::Text { anchor, .. } = app.chat_sel {
+                            app.chat_sel = ChatSel::Text { anchor, caret: pos };
+                        }
+                    });
                 }
             } else if app.input_dragging {
                 let idx = click_to_index(
@@ -1987,8 +1920,8 @@ fn handle_mouse(
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.panel == 2 || (app.area.width >= RAIL_MIN_TERM && col >= app.area.right().saturating_sub(RAIL_W) && app.inspector.is_none()) {
-                app.panel_scroll = app.panel_scroll.saturating_sub(3); return;
+            if wheel_workbench(app, col, row, -3) {
+                return;
             }
             if app.image_view.is_some() {
                 return;
@@ -2012,12 +1945,12 @@ fn handle_mouse(
             } else if app.focus == Focus::Inspector {
                 app.inspector_scroll = app.inspector_scroll.saturating_add(1);
             } else {
-                scroll_chat(app, chat_scroll_step(app) as i32);
+                app.with_active_view(|app| scroll_chat(app, chat_scroll_step(app) as i32));
             }
         }
         MouseEventKind::ScrollDown => {
-            if app.panel == 2 || (app.area.width >= RAIL_MIN_TERM && col >= app.area.right().saturating_sub(RAIL_W) && app.inspector.is_none()) {
-                app.panel_scroll = app.panel_scroll.saturating_add(3); return;
+            if wheel_workbench(app, col, row, 3) {
+                return;
             }
             if app.image_view.is_some() {
                 return;
@@ -2046,7 +1979,7 @@ fn handle_mouse(
             } else if app.focus == Focus::Inspector {
                 app.inspector_scroll = app.inspector_scroll.saturating_sub(1);
             } else {
-                scroll_chat(app, -(chat_scroll_step(app) as i32));
+                app.with_active_view(|app| scroll_chat(app, -(chat_scroll_step(app) as i32)));
             }
         }
         _ => {}

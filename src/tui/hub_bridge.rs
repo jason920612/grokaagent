@@ -75,7 +75,6 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
             echo_seq: app.web_composer_seq,
             queue_edit: app.queue_edit,
         },
-        rows: app.rows.iter().map(ui_row).collect(),
         sessions: app
             .sessions
             .iter()
@@ -104,55 +103,6 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
         send_mode: match app.send_mode {
             SendMode::Queue => "queue".into(),
             SendMode::Insert => "insert".into(),
-        },
-        rail: hub::UiRail {
-            children: app
-                .children
-                .iter()
-                .map(|c| hub::UiChild {
-                    name: c.name.clone(),
-                    prompt: c.prompt.clone(),
-                    status: c.status.clone(),
-                    activity: c.activity.clone(),
-                    alive: c.alive,
-                    card_url: c.card_url.clone(),
-                    log: c.log.clone(),
-                    messages: c
-                        .messages
-                        .iter()
-                        .map(|m| hub::UiSideMsg {
-                            from: m.from.clone(),
-                            to: m.to.clone(),
-                            text: m.text.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            monitors: app
-                .monitors
-                .iter()
-                .map(|m| hub::UiMon {
-                    name: m.name.clone(),
-                    command: m.command.clone(),
-                    pid: m.pid,
-                    status: m.status.clone(),
-                    alive: m.alive,
-                    detail: m.detail.clone(),
-                })
-                .collect(),
-            backgrounds: app
-                .backgrounds
-                .iter()
-                .map(|b| hub::UiBg {
-                    name: b.name.clone(),
-                    command: b.command.clone(),
-                    pid: b.pid,
-                    status: b.status.clone(),
-                    alive: b.alive,
-                    detail: b.detail.clone(),
-                    log: b.log.clone(),
-                })
-                .collect(),
         },
         settings_data: settings.clone(),
         settings: settings.filter(|_| app.settings.as_ref().is_some_and(|w| !w.minimized)),
@@ -189,10 +139,6 @@ fn ui_snapshot(app: &App, opts: &TuiOptions) -> UiSnapshot {
                 .collect(),
         }),
         inspector: app.inspector.as_ref().map(|i| match i {
-            Inspector::Child(n) => hub::UiInspector {
-                kind: "child".into(),
-                name: n.clone(),
-            },
             Inspector::Monitor(n) => hub::UiInspector {
                 kind: "monitor".into(),
                 name: n.clone(),
@@ -307,6 +253,7 @@ fn ui_row(row: &Row) -> hub::UiRow {
                 .calls
                 .iter()
                 .map(|c| hub::UiToolCall {
+                    call_id: c.call_id.clone(),
                     name: c.name.clone(),
                     phase: c.phase.clone(),
                     done: c.done,
@@ -582,10 +529,6 @@ fn apply_ui_command(
             let idx = app.workspace_pick.as_ref().map(|p| p.cursor).unwrap_or(0);
             app.activate_ws_entry(idx);
         }
-        UiCommand::OpenChild { name } => {
-            app.inspector = Some(Inspector::Child(name));
-            app.focus = Focus::Inspector;
-        }
         UiCommand::OpenMonitor { name } => {
             app.inspector = Some(Inspector::Monitor(name));
             app.focus = Focus::Inspector;
@@ -605,15 +548,212 @@ fn apply_ui_command(
     }
 }
 
+fn ui_logs(app: &App) -> hub::UiLogs {
+    const WEB_LOG: usize = 200;
+    let tail = |n: usize| n.saturating_sub(WEB_LOG);
+    hub::UiLogs {
+        agents: app
+            .bench
+            .agents
+            .iter()
+            .map(|a| hub::UiAgent {
+                path: a.path.clone(),
+                name: a.name.clone(),
+                depth: a.depth(),
+                model: a.model.clone(),
+                state: a.state.as_key().into(),
+                label: a.state.label().into(),
+                activity: a.view.activity.clone(),
+                alive: a.alive,
+                turn: a.turn,
+                tools: a.tools,
+                prompt: a.prompt.clone(),
+            })
+            .collect(),
+        tools: app
+            .bench
+            .tool_log
+            .iter()
+            .skip(tail(app.bench.tool_log.len()))
+            .map(|t| hub::UiToolEntry {
+                path: t.path.clone(),
+                call_id: t.call_id.clone(),
+                name: t.name.clone(),
+                line: t.line.clone(),
+                phase: t.phase.clone(),
+                done: t.done,
+                ms: t.ms,
+            })
+            .collect(),
+        events: app
+            .bench
+            .event_log
+            .iter()
+            .skip(tail(app.bench.event_log.len()))
+            .map(|e| hub::UiEventEntry {
+                at: e.at.clone(),
+                path: e.path.clone(),
+                kind: e.kind.into(),
+                text: e.text.clone(),
+            })
+            .collect(),
+        rail: hub::UiRail {
+            monitors: app
+                .monitors
+                .iter()
+                .map(|m| hub::UiMon {
+                    name: m.name.clone(),
+                    command: m.command.clone(),
+                    pid: m.pid,
+                    status: m.status.clone(),
+                    alive: m.alive,
+                    detail: m.detail.clone(),
+                })
+                .collect(),
+            backgrounds: app
+                .backgrounds
+                .iter()
+                .map(|b| hub::UiBg {
+                    name: b.name.clone(),
+                    command: b.command.clone(),
+                    pid: b.pid,
+                    status: b.status.clone(),
+                    alive: b.alive,
+                    detail: b.detail.clone(),
+                    log: b.log.iter().skip(tail(b.log.len())).cloned().collect(),
+                })
+                .collect(),
+        },
+        changes: app
+            .all_file_changes()
+            .into_iter()
+            .map(|(view, row, call, path, kind)| hub::UiChange { view, row, call, path, kind })
+            .collect(),
+    }
+}
+
+/// Stable identity of a row's visible content. Running think clocks are left
+/// out: the browser ticks those itself.
+fn row_hash(row: &Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match row {
+        Row::User(u) => {
+            0u8.hash(&mut h);
+            u.text.hash(&mut h);
+            u.images.hash(&mut h);
+        }
+        Row::Agent(a) => {
+            1u8.hash(&mut h);
+            a.text.hash(&mut h);
+            a.work_ms.hash(&mut h);
+        }
+        Row::Tools(g) => {
+            2u8.hash(&mut h);
+            g.expanded.hash(&mut h);
+            for c in &g.calls {
+                c.call_id.hash(&mut h);
+                c.name.hash(&mut h);
+                c.args.to_string().hash(&mut h);
+                c.output.hash(&mut h);
+                c.done.hash(&mut h);
+                c.phase.hash(&mut h);
+                for f in &c.files {
+                    f.path.hash(&mut h);
+                    f.kind.hash(&mut h);
+                    f.diff.hash(&mut h);
+                }
+            }
+        }
+        Row::Think(t) => {
+            3u8.hash(&mut h);
+            t.text.hash(&mut h);
+            t.expanded.hash(&mut h);
+            t.done.hash(&mut h);
+            if t.done {
+                t.elapsed_ms.hash(&mut h);
+            }
+        }
+        Row::Meta(s) => {
+            4u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        Row::Err(s) => {
+            5u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        Row::Picture { path, label } => {
+            6u8.hash(&mut h);
+            path.hash(&mut h);
+            label.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Row patches for every transcript view whose rows changed since the last
+/// publish, plus the views that disappeared.
+fn view_patches(app: &mut App) -> (Vec<hub::UiViewPatch>, Vec<String>) {
+    let mut views: Vec<(String, &Vec<Row>)> = vec![(String::new(), &app.rows)];
+    for a in &app.bench.agents {
+        views.push((a.path.clone(), &a.view.rows));
+    }
+    let mut patches = Vec::new();
+    let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (path, rows) in views {
+        let hashes: Vec<u64> = rows.iter().map(row_hash).collect();
+        live.extend(hashes.iter().copied());
+        seen.push(path.clone());
+        let prev = app.web_sent.get(&path);
+        if prev == Some(&hashes) {
+            continue;
+        }
+        let from = match prev {
+            Some(p) => p.iter().zip(&hashes).take_while(|(a, b)| a == b).count(),
+            None => 0,
+        };
+        let out: Vec<hub::UiRow> = rows[from..]
+            .iter()
+            .zip(&hashes[from..])
+            .map(|(r, h)| {
+                app.web_cache
+                    .entry(*h)
+                    .or_insert_with(|| ui_row(r))
+                    .clone()
+            })
+            .collect();
+        patches.push(hub::UiViewPatch {
+            path: path.clone(),
+            from,
+            len: rows.len(),
+            rows: out,
+        });
+        app.web_sent.insert(path, hashes);
+    }
+    let removed: Vec<String> = app
+        .web_sent
+        .keys()
+        .filter(|k| !seen.contains(k))
+        .cloned()
+        .collect();
+    for k in &removed {
+        app.web_sent.remove(k);
+    }
+    app.web_cache.retain(|h, _| live.contains(h));
+    (patches, removed)
+}
+
 fn publish_ui(hub: Option<&hub::Hub>, app: &mut App, opts: &TuiOptions) {
     let Some(hub) = hub else {
         return;
     };
     app.refresh_session_list();
     hub.set_workspace(app.session.workspace.clone());
-    hub.publish(&hub::ServerMsg::Snapshot {
-        snapshot: ui_snapshot(app, opts),
-    });
+    let snapshot = ui_snapshot(app, opts);
+    let logs = ui_logs(app);
+    let (patches, removed) = view_patches(app);
+    hub.publish(snapshot, logs, patches, removed);
 }
 
 async fn recv_hub_cmd(hub: &mut Option<hub::Hub>) -> Option<UiCommand> {

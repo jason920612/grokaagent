@@ -238,6 +238,21 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Child-agent transcripts shown in the UI (not the agents' API context).
+    pub fn save_agents<T: Serialize>(&self, id: &str, agents: &T) -> Result<()> {
+        let dir = self.dir(id);
+        if !dir.join("meta.json").exists() {
+            return Ok(());
+        }
+        atomic_write(&dir.join("agents.json"), &serde_json::to_vec(agents)?)?;
+        Ok(())
+    }
+
+    pub fn load_agents<T: DeserializeOwned>(&self, id: &str) -> Option<T> {
+        let raw = fs::read(self.dir(id).join("agents.json")).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
     pub fn load_task<T: DeserializeOwned>(&self, id: &str) -> Option<T> {
         let path = self.dir(id).join("task.json");
         let raw = fs::read(path).ok()?;

@@ -1,7 +1,18 @@
 struct App {
     web_receipts: Vec<(String, String)>,
-    panel: u8,
-    panel_scroll: usize,
+    side_view: SideView,
+    /// Side bar shown (docked when wide, overlaid when narrow).
+    side_open: bool,
+    side_scroll: usize,
+    /// Bottom panel tab; `None` = panel closed.
+    bottom: Option<BottomTab>,
+    bottom_scroll: usize,
+    side_area: Rect,
+    bottom_area: Rect,
+    /// Row hashes last published to the web, per view path.
+    web_sent: HashMap<String, Vec<u64>>,
+    /// Rendered rows by hash, so unchanged rows are not re-rendered.
+    web_cache: HashMap<u64, hub::UiRow>,
     rows: Vec<Row>,
     edit: Edit,
     status: String,
@@ -97,7 +108,7 @@ struct App {
     last_graphic_blits: Vec<crate::preview::GraphicBlit>,
     image_hits: Vec<String>,
     image_view: Option<String>,
-    children: Vec<SideChild>,
+    bench: Workbench,
     monitors: Vec<SideMon>,
     backgrounds: Vec<SideBg>,
     inspector: Option<Inspector>,
@@ -222,16 +233,16 @@ impl App {
                 }
                 self.push(Row::Agent(AgentMsg::new(text)));
             }
-            AgentEvent::ToolStarted { name, args, .. } => {
+            AgentEvent::ToolStarted { call_id, name, args, .. } => {
                 self.streaming = false;
                 self.finish_open_think();
                 self.activity = live_tool_activity(&name, &args, "執行中");
-                self.push_tool_start(name, args);
+                self.push_tool_start(call_id, name, args);
             }
-            AgentEvent::ToolFinished { name, output, .. } => {
+            AgentEvent::ToolFinished { call_id, name, output, .. } => {
                 let _ = enable_raw_mode();
                 let pic = picture_from_tool(&name, &output);
-                self.finish_tool(&name, output);
+                self.finish_tool(&call_id, &name, output);
                 if let Some((path, label)) = pic {
                     self.push(Row::Picture { path, label });
                 }
@@ -266,20 +277,20 @@ impl App {
             }
             AgentEvent::ChildSpawned {
                 name,
-                agent_card_url,
                 prompt,
+                model,
                 ..
             } => {
-                self.upsert_child(name.clone(), prompt, agent_card_url);
-                self.child_count = self.children.iter().filter(|c| c.alive).count() as u32;
+                // The task supervisor reports itself like a child but is not a process.
+                if name != task::AGENT_NAME {
+                    self.agent_spawned("", &name, &prompt, &model);
+                }
                 self.push(Row::Meta(format!("子代理 {name} 已啟動")));
             }
             AgentEvent::ChildExited { name, detail, .. } => {
-                if let Some(c) = self.child_named_mut(&name) {
-                    c.upsert_status(format!("結束 ({detail})"), false);
-                    c.activity.clear();
+                if name != task::AGENT_NAME {
+                    self.agent_exited("", &name, &detail);
                 }
-                self.child_count = self.children.iter().filter(|c| c.alive).count() as u32;
                 self.mark_spawn_tool_done(&name);
                 self.push(Row::Meta(format!("子代理 {name} 結束")));
             }
@@ -362,7 +373,13 @@ impl App {
             AgentEvent::AgentMessage {
                 from, to, text, ..
             } => {
-                self.push_agent_message(from, to, text);
+                if from == task::AGENT_NAME || to == task::AGENT_NAME {
+                    let preview: String = text.chars().take(160).collect();
+                    let line = format!("{from} → {to}  {}", preview.replace('\n', " "));
+                    self.bench.log_event("", "message", line);
+                } else {
+                    self.agent_message("", &from, &to, &text);
+                }
             }
             AgentEvent::AskUser {
                 question,
@@ -428,39 +445,12 @@ impl App {
         }
     }
 
-    fn child_named_mut(&mut self, name: &str) -> Option<&mut SideChild> {
-        self.children.iter_mut().find(|c| c.name == name)
-    }
-
     fn mon_named_mut(&mut self, name: &str) -> Option<&mut SideMon> {
         self.monitors.iter_mut().find(|m| m.name == name)
     }
 
     fn bg_named_mut(&mut self, name: &str) -> Option<&mut SideBg> {
         self.backgrounds.iter_mut().find(|b| b.name == name)
-    }
-
-    fn upsert_child(&mut self, name: String, prompt: String, card_url: String) {
-        if let Some(c) = self.child_named_mut(&name) {
-            if !prompt.is_empty() {
-                c.prompt = prompt;
-            }
-            if !card_url.is_empty() {
-                c.card_url = card_url;
-            }
-            c.upsert_status("工作中".into(), true);
-            return;
-        }
-        self.children.push(SideChild {
-            name,
-            prompt,
-            card_url,
-            status: "工作中".into(),
-            alive: true,
-            activity: String::new(),
-            log: Vec::new(),
-            messages: Vec::new(),
-        });
     }
 
     fn upsert_monitor(&mut self, name: String, command: String, pid: u32) {
@@ -502,36 +492,9 @@ impl App {
         });
     }
 
-    fn push_agent_message(&mut self, from: String, to: String, text: String) {
-        let child = if self.children.iter().any(|c| c.name == from) {
-            from.clone()
-        } else {
-            to.clone()
-        };
-        if let Some(c) = self.child_named_mut(&child) {
-            if c.messages.len() > 80 {
-                c.messages.drain(0..20);
-            }
-            c.messages.push(SideMsg { from, to, text });
-        }
-    }
-
-    fn apply_child_work(&mut self, ev: AgentEvent) {
-        let name = ev.meta().agent_name.clone();
-        if name.is_empty() || name == "root" {
-            return;
-        }
-        if self.child_named_mut(&name).is_none() {
-            self.upsert_child(name.clone(), String::new(), String::new());
-        }
-        if let Some(c) = self.child_named_mut(&name) {
-            c.apply_work(&ev);
-        }
-        self.child_count = self.children.iter().filter(|c| c.alive).count() as u32;
-    }
-
+    #[cfg(test)]
     fn has_side(&self) -> bool {
-        !self.children.is_empty() || !self.monitors.is_empty() || !self.backgrounds.is_empty()
+        !self.bench.agents.is_empty() || !self.monitors.is_empty() || !self.backgrounds.is_empty()
     }
 
     fn close_inspector(&mut self) {
@@ -852,8 +815,9 @@ impl App {
         }));
     }
 
-    fn push_tool_start(&mut self, name: String, args: Value) {
+    fn push_tool_start(&mut self, call_id: String, name: String, args: Value) {
         let call = ToolCall {
+            call_id,
             name,
             args,
             output: String::new(),
@@ -873,36 +837,30 @@ impl App {
         }
     }
 
-    fn finish_tool(&mut self, name: &str, output: String) {
-        let Some(g) = self.rows.iter_mut().rev().find_map(|r| match r {
-            Row::Tools(g) => Some(g),
-            _ => None,
-        }) else {
+    fn finish_tool(&mut self, call_id: &str, name: &str, output: String) {
+        // Match by call id anywhere in the transcript first; fall back to the
+        // newest group by name for rows restored from before call ids existed.
+        let by_id = if call_id.is_empty() {
+            None
+        } else {
+            self.rows.iter().rposition(|r| {
+                matches!(r, Row::Tools(g) if g.calls.iter().any(|c| c.call_id == call_id))
+            })
+        };
+        let group = by_id.or_else(|| self.rows.iter().rposition(|r| matches!(r, Row::Tools(_))));
+        let Some(Row::Tools(g)) = group.and_then(|i| self.rows.get_mut(i)) else {
             return;
         };
-        let idx = g
-            .calls
-            .iter()
-            .rposition(|c| c.name == name && !c.done)
+        let idx = (!call_id.is_empty())
+            .then(|| g.calls.iter().rposition(|c| c.call_id == call_id))
+            .flatten()
+            .or_else(|| g.calls.iter().rposition(|c| c.name == name && !c.done))
             .or_else(|| g.calls.iter().rposition(|c| !c.done))
             .or_else(|| g.calls.len().checked_sub(1));
         if let Some(i) = idx {
-            let still = name == "spawn_agent" && spawn_output_still_running(&output);
-            let result = serde_json::from_str::<Value>(&output).unwrap_or(Value::Null);
-            let cancelled = result.get("cancelled").and_then(Value::as_bool) == Some(true);
-            let failed = result.get("error").is_some_and(|e| !e.is_null() && e != "")
-                || result.get("exit_code").and_then(Value::as_i64).is_some_and(|code| code != 0);
             let c = &mut g.calls[i];
-            c.done = !still;
-            c.phase = if still {
-                "已啟動".into()
-            } else if cancelled {
-                "已停止".into()
-            } else if failed {
-                "失敗".into()
-            } else {
-                "完成".into()
-            };
+            c.done = true;
+            c.phase = tool_phase(name, &output).into();
             c.files.extend(parse_file_changes(&output));
             c.output = output;
         }
@@ -967,6 +925,7 @@ impl App {
 
         let output = server_tool_line(kind, &args);
         let call = ToolCall {
+            call_id: String::new(),
             name,
             args,
             output,
@@ -1155,7 +1114,7 @@ impl App {
             queue_edit: self.queue_edit.take(),
             composer_stash: self.composer_stash.take(),
             pending: std::mem::take(&mut self.pending),
-            children: std::mem::take(&mut self.children),
+            bench: std::mem::take(&mut self.bench),
             monitors: std::mem::take(&mut self.monitors),
             backgrounds: std::mem::take(&mut self.backgrounds),
             inspector: self.inspector.take(),
@@ -1193,7 +1152,7 @@ impl App {
         self.image_cells.clear();
         self.graphic_blits.clear();
         self.last_graphic_blits.clear();
-        self.children = p.children;
+        self.bench = p.bench;
         self.monitors = p.monitors;
         self.backgrounds = p.backgrounds;
         self.inspector = p.inspector;
@@ -1259,6 +1218,7 @@ impl App {
             if child_work {
                 self.apply_child_work(ev);
             } else {
+                self.log_root_event(&ev);
                 self.apply_event(ev);
                 if !skip_persist {
                     self.persist_transcript();
@@ -1274,6 +1234,7 @@ impl App {
             if child_work {
                 app.apply_child_work(ev);
             } else {
+                app.log_root_event(&ev);
                 app.apply_event(ev);
                 if !skip_persist {
                     app.persist_transcript();
@@ -1447,6 +1408,7 @@ impl App {
         }
         self.cancel_ask();
         self.persist_transcript();
+        self.persist_agents();
         let parked = self.snapshot_live();
         self.parked.insert(parked.session.id.clone(), parked);
         let session = if let Some(store) = &self.store {
@@ -1471,6 +1433,7 @@ impl App {
         }
         self.cancel_ask();
         self.persist_transcript();
+        self.persist_agents();
         let parked = self.snapshot_live();
         self.parked.insert(parked.session.id.clone(), parked);
         if let Some(p) = self.parked.remove(id) {
@@ -1521,7 +1484,12 @@ impl App {
             queue_edit: None,
             composer_stash: None,
             pending: Vec::new(),
-            children: Vec::new(),
+            bench: self
+                .store
+                .as_ref()
+                .and_then(|s| s.load_agents::<Vec<SavedAgent>>(id))
+                .map(Workbench::restore)
+                .unwrap_or_default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,

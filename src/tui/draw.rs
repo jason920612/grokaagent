@@ -1,191 +1,3 @@
-fn draw_ui(f: &mut Frame, app: &mut App, opts: &TuiOptions, freeze_composer: bool) -> Position {
-    app.hits.clear();
-    app.chat_glyphs.clear();
-    app.graphic_blits.clear();
-    app.area = f.area();
-    f.render_widget(Block::default().style(Style::default().bg(BG).fg(TEXT)), f.area());
-    app.refresh_session_list();
-
-    let sidebar_w = if f.area().width >= SIDEBAR_MIN_TERM {
-        SIDEBAR_W
-    } else {
-        0
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(sidebar_w), Constraint::Min(20)])
-        .split(f.area());
-    let mut rename_caret = None;
-    if sidebar_w > 0 {
-        rename_caret = draw_sidebar(f, app, cols[0]);
-    }
-    let rest = cols[1];
-    let rest_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(6)])
-        .split(rest);
-    let header = rest_rows[0];
-    let below = rest_rows[1];
-    let rail_w = if f.area().width >= RAIL_MIN_TERM {
-        RAIL_W.min(below.width.saturating_sub(24))
-    } else {
-        0
-    };
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(rail_w)])
-        .split(below);
-    let main = body[0];
-
-    let qn = app.queue.len().min(5);
-    let attach = if app.pending.is_empty() { 0 } else { 1 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(composer_height(qn, attach).saturating_add(app.edit.text.lines().count().saturating_sub(1).min(3) as u16)),
-        ])
-        .split(main);
-
-    draw_header(f, app, opts, header);
-    let tool_hits = draw_chat(f, app, chunks[0]);
-    draw_tool_panel(f, app, chunks[0], &tool_hits);
-    draw_jump_bottom(f, app, chunks[0]);
-    app.composer_frame = chunks[1];
-    let composer_caret = if freeze_composer && composer_snap_matches(app) {
-        if let Some(snap) = &app.composer_snap {
-            copy_rect(snap, f.buffer_mut(), app.composer_frame);
-        }
-        app.last_caret
-    } else {
-        let caret = draw_composer(f, app, opts, chunks[1]);
-        app.composer_snap = Some(clone_rect(f.buffer_mut(), app.composer_frame));
-        caret
-    };
-    let mut caret = composer_caret;
-    if app.focus == Focus::Rename {
-        if let Some(pos) = rename_caret {
-            caret = pos;
-        }
-    }
-    let settings_visible = app.settings.as_ref().is_some_and(|s| !s.minimized);
-    let settings_min = app.settings.as_ref().is_some_and(|s| s.minimized);
-    if settings_min {
-        let dock = settings_dock_rect(header);
-        f.render_widget(
-            Paragraph::new(Span::styled(" 設定 ", Style::default().bg(COMPOSER).fg(ACCENT))),
-            dock,
-        );
-        app.hits.push((dock, Hit::Dock));
-    }
-    if settings_visible {
-        if let Some(pos) = draw_settings(f, app, opts) {
-            if app.focus == Focus::Settings {
-                caret = pos;
-            }
-        }
-    }
-    if rail_w > 0 {
-        draw_rail(f, app, body[1]);
-    }
-    if app.panel == 1 {
-        let area = f.area();
-        f.render_widget(Clear, area);
-        draw_sidebar(f, app, area);
-    } else if app.panel == 2 {
-        let area = f.area();
-        f.render_widget(Clear, area);
-        draw_rail(f, app, area);
-    }
-    if app.inspector.is_some() {
-        draw_inspector(f, app, f.area());
-    }
-    if app.image_view.is_some() {
-        draw_image_view(f, app, f.area());
-    }
-    if app.skill_view.is_some() {
-        if let Some(pos) = draw_skill_view(f, app, f.area()) {
-            caret = pos;
-        }
-    }
-    if app.ask.is_some() {
-        if let Some(pos) = draw_ask(f, app) {
-            caret = pos;
-        }
-    }
-    if app.task_ui.is_some() {
-        if let Some(pos) = draw_task(f, app) {
-            caret = pos;
-        }
-    }
-    if app.workspace_pick.is_some() {
-        if let Some(pos) = draw_workspace_pick(f, app) {
-            caret = pos;
-        }
-    }
-    crate::preview::reveal_obscured_graphics(f.buffer_mut(), &mut app.graphic_blits);
-    caret
-}
-
-fn draw_rail(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(Block::default().borders(Borders::LEFT)
-        .border_style(Style::default().fg(BORDER)).style(Style::default().bg(PANEL).fg(TEXT)), area);
-    if area.width < 8 || area.height < 3 { return; }
-    let inner = Rect::new(area.x + 1, area.y, area.width - 1, area.height);
-    let mut lines: Vec<(String, Color, Option<Hit>)> = Vec::new();
-    let task = app.task.snapshot();
-    lines.push((format!("狀態：{}", if app.ask.is_some() { "等你回覆" } else { &app.status }), ACCENT, None));
-    if !app.activity.is_empty() { lines.push((format!("目前：{}", app.activity), TEXT, None)); }
-    if task.goal.is_empty() {
-        lines.push(("尚未設定任務目標".into(), DIM, None));
-    } else {
-        lines.push((format!("目標：{}", task.goal), TEXT, None));
-        lines.push((format!("{} · {}/{}", if task.skip_steer { "已暫停" } else { task.phase.label() },
-            task.checklist.iter().filter(|i| i.done).count(), task.checklist.len()), ACCENT, None));
-        for item in &task.checklist {
-            lines.push((format!("{} {}", if item.done { "✓" } else { "□" }, item.text),
-                if item.done { AGENT } else { TEXT }, None));
-        }
-        if !task.review_note.is_empty() { lines.push((task.review_note.clone(), DIM, None)); }
-    }
-    let mut changes = Vec::new();
-    for (group, row) in app.rows.iter().enumerate() {
-        if let Row::Tools(g) = row {
-            for (item, call) in g.calls.iter().enumerate() {
-                for file in &call.files { changes.push((group, item, file.path.clone())); }
-            }
-        }
-    }
-    lines.push((format!("檔案變更 {} · 點選查看", changes.len()), ACCENT, None));
-    for (group, item, path) in changes.into_iter().rev() {
-        lines.push((path, TEXT, Some(Hit::ToolItem(group, item))));
-    }
-    lines.push(("子代理 / 監控 / 後台".into(), ACCENT, None));
-    if !app.has_side() { lines.push(("尚無代理或背景工作".into(), DIM, None)); }
-    for (i, c) in app.children.iter().enumerate() {
-        lines.push((format!("{} {} · {}", if c.alive { "●" } else { "○" }, c.name, c.status),
-            if c.alive { AGENT } else { DIM }, Some(Hit::RailChild(i as u16))));
-        if !c.activity.is_empty() { lines.push((c.activity.clone(), DIM, Some(Hit::RailChild(i as u16)))); }
-    }
-    for (i, m) in app.monitors.iter().enumerate() {
-        lines.push((format!("{} {} · {}", if m.alive { "●" } else { "○" }, m.name, m.status), TOOL, Some(Hit::RailMon(i as u16))));
-    }
-    for (i, b) in app.backgrounds.iter().enumerate() {
-        lines.push((format!("{} {} · {}", if b.alive { "●" } else { "○" }, b.name, b.status), USER, Some(Hit::RailBg(i as u16))));
-    }
-    let view_h = inner.height.saturating_sub(2) as usize;
-    app.panel_scroll = app.panel_scroll.min(lines.len().saturating_sub(view_h));
-    f.render_widget(Paragraph::new("工作詳情 · F4 切換").style(Style::default().fg(ACCENT)), Rect::new(inner.x, inner.y, inner.width, 1));
-    for (i, (text, color, hit)) in lines.iter().skip(app.panel_scroll).take(view_h).enumerate() {
-        let row = Rect::new(inner.x, inner.y + 1 + i as u16, inner.width, 1);
-        f.render_widget(Paragraph::new(truncate_width(text, inner.width)).style(Style::default().fg(*color)), row);
-        if let Some(hit) = hit { app.hits.push((row, *hit)); }
-    }
-    f.render_widget(Paragraph::new(format!("↑↓ / 滾輪 · {}–{} / {}", app.panel_scroll + 1,
-        (app.panel_scroll + view_h).min(lines.len()), lines.len())).style(Style::default().fg(DIM)),
-        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1));
-}
-
 fn inspector_rect(area: Rect) -> Rect {
     let max_w = area.width.saturating_sub(4).max(1);
     let max_h = area.height.saturating_sub(3).max(1);
@@ -203,7 +15,6 @@ fn draw_inspector(f: &mut Frame, app: &mut App, area: Rect) {
     let panel = inspector_rect(area);
     f.render_widget(Clear, panel);
     let title = match &kind {
-        Inspector::Child(n) => format!(" 子代理 {n} "),
         Inspector::Monitor(n) => format!(" 監控 {n} "),
         Inspector::Background(n) => format!(" 後台 {n} "),
     };
@@ -237,82 +48,6 @@ fn draw_inspector(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let mut lines: Vec<Line<'static>> = Vec::new();
     match kind {
-        Inspector::Child(name) => {
-            let Some(c) = app.children.iter().find(|c| c.name == name) else {
-                lines.push(Line::from(Span::styled(
-                    format!("找不到子代理「{name}」（可能已結束或已移除）"),
-                    Style::default().fg(DIM),
-                )));
-                f.render_widget(
-                    Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-                    inner,
-                );
-                return;
-            };
-            let spin = if c.alive {
-                spinner(app.tick).to_string()
-            } else {
-                "·".into()
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{spin} {}  {}", c.status, c.activity),
-                Style::default().fg(if c.alive { AGENT } else { DIM }),
-            )));
-            if !c.prompt.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("任務  {}", c.prompt.replace('\n', " ")),
-                    Style::default().fg(TEXT),
-                )));
-            }
-            if !c.card_url.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("card  {}", c.card_url),
-                    Style::default().fg(DIM),
-                )));
-            }
-            if !c.messages.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "── 訊息 ──",
-                    Style::default().fg(DIM),
-                )));
-                for m in &c.messages {
-                    lines.push(Line::from(Span::styled(
-                        format!("{} → {}", m.from, m.to),
-                        Style::default().fg(ACCENT),
-                    )));
-                    for part in m.text.split('\n') {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {part}"),
-                            Style::default().fg(TEXT),
-                        )));
-                    }
-                }
-            }
-            if !c.log.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "── 工作 ──",
-                    Style::default().fg(DIM),
-                )));
-                for row in &c.log {
-                    let style = if row.starts_with("思考 ") {
-                        Style::default().fg(THINK)
-                    } else if row.starts_with("grok ") {
-                        Style::default().fg(AGENT)
-                    } else if row.starts_with("錯誤 ") {
-                        Style::default().fg(WARN)
-                    } else {
-                        Style::default().fg(TOOL)
-                    };
-                    lines.push(Line::from(Span::styled(row.clone(), style)));
-                }
-            }
-            if c.messages.is_empty() && c.log.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "尚無工作紀錄（echo 子代理不會寫事件）",
-                    Style::default().fg(DIM),
-                )));
-            }
-        }
         Inspector::Monitor(name) => {
             let Some(m) = app.monitors.iter().find(|m| m.name == name) else {
                 lines.push(Line::from(Span::styled(
@@ -564,7 +299,7 @@ fn header_copy(app: &App, opts: &TuiOptions) -> (String, String) {
     let kids = if app.child_count == 0 {
         String::new()
     } else {
-        format!("  子代理 {}", app.child_count)
+        format!("  代理 {}/{}", app.bench.live_count(), app.child_count)
     };
     let left = if app.running {
         let act = if app.activity.is_empty() {
@@ -1686,7 +1421,7 @@ fn draw_composer(f: &mut Frame, app: &mut App, opts: &TuiOptions, area: Rect) ->
         "Enter 完成編輯  ·  Esc 或點取消 還原  ·  工作結束也不會送出，直到編輯完成".to_string()
     } else {
         format!(
-            "F3 工作 · F4 詳情 · Enter 送出 · Shift+Enter 換行 · Esc 停止 · Ctrl+Q 離開 · {} · {}",
+            "Enter 送出 · Shift+Enter 換行 · Esc 停止 · Ctrl+B 側欄 · Ctrl+J 面板 · Ctrl+Q 離開 · {} · {}",
             opts.model,
             opts.reasoning_effort.label()
         )

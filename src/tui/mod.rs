@@ -1,4 +1,7 @@
-//! Cursor-like chat TUI: transcript, composer, settings overlay, queue/insert.
+//! VS Code-style agent workbench TUI: activity bar, side views (sessions,
+//! agent tree, file changes, backgrounds, task), editor tabs (main chat plus
+//! read-only child-agent transcripts), bottom panel (tools, output, events),
+//! and a status bar.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, stdout};
@@ -58,22 +61,27 @@ const DIFF_DEL: Color = Color::Rgb(248, 81, 73);
 const DIFF_HUNK: Color = Color::Rgb(88, 166, 255);
 const TOOL: Color = Color::Rgb(210, 180, 80);
 const THINK: Color = Color::Rgb(168, 148, 210);
-const SIDEBAR_MIN_TERM: u16 = 110;
-const SIDEBAR_W: u16 = 28;
-const RAIL_MIN_TERM: u16 = 130;
-const RAIL_W: u16 = 34;
+/// Below this width the side bar overlays the editor instead of docking.
+const SIDEBAR_MIN_TERM: u16 = 100;
+const SIDEBAR_W: u16 = 30;
+/// Below this width the activity bar is hidden (side views stay on F3 / Ctrl+B).
+const ACTIVITY_MIN_TERM: u16 = 60;
+const ACTIVITY_W: u16 = 3;
 const DROP_VISIBLE: usize = 8;
 
 include!("types.rs");
 include!("edit.rs");
 include!("state.rs");
+include!("bench.rs");
 include!("app.rs");
 include!("session_boot.rs");
 include!("tool_text.rs");
 include!("chat_view.rs");
 include!("settings_ops.rs");
 include!("draw.rs");
+include!("workbench_draw.rs");
 include!("hub_bridge.rs");
+include!("workbench_input.rs");
 include!("run.rs");
 
 #[cfg(test)]

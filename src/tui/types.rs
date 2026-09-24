@@ -7,6 +7,8 @@ struct FileChange {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ToolCall {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    call_id: String,
     name: String,
     args: Value,
     output: String,
@@ -293,9 +295,20 @@ enum Hit {
     DeleteSession(u16),
     QueueItem(u16),
     CancelQueueEdit,
-    RailChild(u16),
     RailMon(u16),
     RailBg(u16),
+    /// Activity bar: side view index, or `u8::MAX` for settings.
+    Activity(u8),
+    SideAgent(u16),
+    SideRoot,
+    SideChange(u16),
+    SideScroll,
+    EditorTab(u16),
+    EditorTabClose(u16),
+    BottomTab(u8),
+    BottomClose,
+    BottomRow(u16),
+    ReadOnlyBar,
     Inspector,
     InspectorClose,
     ChatRow(u16),

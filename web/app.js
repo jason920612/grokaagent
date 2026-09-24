@@ -2,32 +2,75 @@
   const params = new URLSearchParams(location.search);
   const token = params.get("t") || "";
   const $ = (id) => document.getElementById(id);
+  const appEl = $("app");
   const chat = $("chat");
   const composer = $("composer");
   const overlay = $("overlay");
-  let snap = null;
-  let composing = false;
+
+  // —— Server state (mirrored from the TUI) ——
+  let snap = null;          // shell: header, composer, sessions, overlays
+  let logs = { agents: [], tools: [], events: [], rail: { monitors: [], backgrounds: [] }, changes: [] };
+  const views = new Map();  // "" = main chat, "coder/lint" = child agent
+  let seq = 0;
+
+  // —— Local UI state (per browser tab) ——
+  const narrow = window.matchMedia("(max-width: 900px)");
+  let sideView = "sessions";
+  let sideOpen = !narrow.matches;
+  let panelTab = null;      // null | "tools" | "output" | "events"
+  let outputPick = null;
+  const openTabs = [];      // agent paths
+  let activeTab = "";       // "" = main chat
   let stick = true;
+  const scrollPositions = new Map();
+  // Deep link: #side=agents&tab=coder&panel=tools
+  const linked = new URLSearchParams(location.hash.slice(1));
+  let pendingTab = linked.get("tab") || "";
+  if (["sessions", "agents", "changes", "background", "task"].includes(linked.get("side"))) {
+    sideView = linked.get("side");
+    sideOpen = true;
+  }
+  if (["tools", "output", "events"].includes(linked.get("panel"))) panelTab = linked.get("panel");
+
   let ws;
-  let settingsFocus = null;
-  let railManual = false;
   let connected = false;
+  let composing = false;
+  let settingsFocus = null;
   let sendMode = "queue";
   let draftSession = "";
   let awaitingReceipt = null;
   let receiptRetryReady = false;
   const drafts = new Map();
   const folds = new Map();
-  const scrollPositions = new Map();
   let overlayKey = "";
   let overlayComposing = false;
   let localView = {};
   let taskDraft = "";
 
+  const STATE_ICON = { starting: "◌", working: "◐", idle: "✓", paused: "‖", interrupted: "⊘", exited: "○" };
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function agentOf(path) {
+    return logs.agents.find((a) => a.path === path);
+  }
+
+  function viewRows(path) {
+    return views.get(path) || [];
+  }
+
   function connectionState(ok, message) {
     connected = ok;
-    $("connection").textContent = message;
-    $("connection").classList.toggle("offline", !ok);
+    const c = $("connection");
+    c.textContent = message;
+    c.classList.toggle("offline", !ok);
+    c.classList.toggle("ok", ok);
+    $("statusbar").classList.toggle("offline", !ok);
     $("send-message").disabled = !ok || (!!awaitingReceipt && !receiptRetryReady);
   }
 
@@ -58,35 +101,13 @@
     }, 8000);
   }
 
-  const appEl = $("app");
-  const scrim = $("scrim");
-
-  function setSidebar(open) {
-    $("sidebar").inert = !open && !appEl.classList.contains("sidebar-pinned");
-    appEl.classList.toggle("sidebar-open", open);
-    if (open) {
-      scrim.classList.remove("hidden");
-      appEl.classList.remove("rail-open");
-    } else if (!appEl.classList.contains("rail-open")) {
-      scrim.classList.add("hidden");
-    }
-  }
-
-  function setRailOpen(open) {
-    $("rail").inert = !open && !appEl.classList.contains("rail-pinned");
-    if (open) {
-      $("rail").classList.remove("hidden");
-      appEl.classList.add("rail-open");
-      appEl.classList.remove("sidebar-open");
-      scrim.classList.remove("hidden");
-    } else {
-      appEl.classList.remove("rail-open");
-      if (!appEl.classList.contains("sidebar-open")) scrim.classList.add("hidden");
-    }
-  }
-
   function mediaUrl(path) {
     return `/media?t=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`;
+  }
+
+  function wsSend(obj) {
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(obj)); return true; }
+    return false;
   }
 
   function send(obj) {
@@ -114,26 +135,25 @@
       localView = {}; renderOverlay(); return true;
     }
     // Reading details is local to this browser, independent of the terminal.
-    const views = {
-      open_tool: () => ({ tool_panel: { group: obj.group, item: obj.item } }),
+    const local = {
+      open_tool: () => ({ tool_panel: { view: obj.view || "", group: obj.group, item: obj.item } }),
       open_image: () => ({ image_view: obj.path }),
-      open_child: () => ({ inspector: { kind: "child", name: obj.name } }),
       open_monitor: () => ({ inspector: { kind: "monitor", name: obj.name } }),
-      open_background: () => ({ inspector: { kind: "background", name: obj.name } }),
+      open_agent_info: () => ({ agent_info: obj.path }),
       edit_queue: () => ({ queue_editor: { index: obj.index, original: snap.queue[obj.index].text } }),
     };
-    if (views[obj.type]) { localView = views[obj.type](); renderOverlay(); return true; }
-    if (["close_tool", "close_image", "close_inspector", "close_queue_editor"].includes(obj.type)) {
+    if (local[obj.type]) { localView = local[obj.type](); renderOverlay(); return true; }
+    if (["close_tool", "close_image", "close_inspector", "close_queue_editor", "close_agent_info"].includes(obj.type)) {
       localView = {}; renderOverlay(); return true;
     }
-    if (ws && ws.readyState === 1 && connected) { ws.send(JSON.stringify(obj)); return true; }
+    if (connected && wsSend(obj)) return true;
     $("delivery").textContent = "未送出：連線中斷，請重連後再操作";
     return false;
   }
 
   function providerKind() {
     const fromHeader = snap && snap.header && snap.header.kind;
-    const fromSettings = snap && snap.settings && snap.settings.kind;
+    const fromSettings = snap && snap.settings_data && snap.settings_data.kind;
     return String(fromSettings || fromHeader || "xai").toLowerCase();
   }
 
@@ -142,18 +162,56 @@
   }
 
   function agentLabel() {
+    if (activeTab) return activeTab.split("/").pop();
     if (isCustom()) return "助手";
     const model = (snap && snap.header && snap.header.model) || "";
     return model.toLowerCase().startsWith("grok") ? "grok" : "助手";
   }
 
-  function applySnapshot(s) {
+  // —— Protocol ——
+  function onHello(msg) {
+    seq = msg.seq;
+    logs = msg.logs || logs;
+    views.clear();
+    (msg.views || []).forEach((v) => views.set(v.path, v.rows));
+    applyShell(msg.snapshot);
+    if (pendingTab && agentOf(pendingTab)) {
+      openTabs.push(pendingTab);
+      activeTab = pendingTab;
+    }
+    pendingTab = "";
+    renderAll();
+  }
+
+  function onDelta(msg) {
+    if (msg.seq <= seq) return;
+    if (msg.seq !== seq + 1) {
+      wsSend({ type: "resync" });
+      return;
+    }
+    seq = msg.seq;
+    if (msg.logs) logs = msg.logs;
+    (msg.views || []).forEach((p) => {
+      const rows = views.get(p.path) || [];
+      rows.length = Math.min(p.from, rows.length);
+      rows.push(...p.rows);
+      rows.length = p.len;
+      views.set(p.path, rows);
+    });
+    (msg.removed || []).forEach((path) => views.delete(path));
+    if (msg.snapshot) applyShell(msg.snapshot);
+    renderAll();
+  }
+
+  function applyShell(s) {
     if (draftSession !== s.session_id) {
       drafts.set(draftSession, composer.value);
-      scrollPositions.set(draftSession, { top: chat.scrollTop, stick });
       draftSession = s.session_id;
       composer.value = drafts.get(draftSession) || "";
       localView = {};
+      // Agent tabs belong to a session.
+      openTabs.length = 0;
+      activeTab = "";
     }
     snap = s;
     if (awaitingReceipt) {
@@ -179,184 +237,293 @@
         $("send-message").disabled = !connected;
       }
     }
-    renderHeader();
-    renderSessions();
+  }
+
+  function renderAll() {
+    if (!snap) return;
+    // Drop tabs whose agent is gone (session switched, or never existed here).
+    for (let i = openTabs.length - 1; i >= 0; i--) {
+      if (!agentOf(openTabs[i])) openTabs.splice(i, 1);
+    }
+    if (activeTab && !agentOf(activeTab)) activeTab = "";
+    renderActivity();
+    renderSide();
+    renderTabs();
     renderChat();
-    renderQueue();
-    renderPending();
-    renderRail();
-    renderComposer();
+    renderEditorFooter();
+    renderPanel();
+    renderStatus();
     renderOverlay();
-    $("interrupt").classList.toggle("hidden", !s.header.running);
-    $("mode-queue").classList.toggle("on", sendMode !== "insert");
-    $("mode-insert").classList.toggle("on", sendMode === "insert");
-    const hasRail = true;
-    $("rail-toggle").classList.toggle("hidden", !hasRail);
-    if (!hasRail) {
-      railManual = false;
-      setRailOpen(false);
-      $("rail").classList.add("hidden");
-    } else if (railManual) {
-      setRailOpen(true);
+  }
+
+  // —— Activity bar & side bar ——
+  function setSide(view) {
+    if (view === undefined) {
+      sideOpen = !sideOpen;
+    } else if (sideOpen && sideView === view) {
+      sideOpen = false;
+    } else {
+      sideView = view;
+      sideOpen = true;
     }
-    composer.placeholder = isCustom()
-      ? "傳給自訂模型… Enter 送出，Shift+Enter 換行"
-      : "傳給 Grok… Enter 送出，Shift+Enter 換行";
+    renderAll();
   }
 
-  function renderHeader() {
-    const h = snap.header;
-    const el = $("header");
-    el.classList.toggle("running", h.running);
-    const clock = h.running ? ` · ${(h.elapsed_ms / 1000).toFixed(1)}s` : "";
-    const activity = h.activity || h.status || "待命";
-    $("status-line").textContent = `${activity}${clock}`;
-    $("meta-line").textContent = [
-      h.logged_in ? "已登入" : "未登入",
-      h.cache,
-      h.workspace ? `📂 ${h.workspace}` : "",
-    ].filter(Boolean).join("  ·  ");
-    $("gear").textContent = `${h.model}${h.effort ? " · " + h.effort : ""}`;
-    $("task").classList.toggle("on", !!h.task_live);
-    $("task").textContent = h.task_live ? "任務●" : "任務";
-    const badge = $("provider-badge");
-    badge.classList.remove("hidden");
-    badge.textContent = isCustom() ? "自訂 API" : "Grok";
+  function closeSideIfNarrow() {
+    if (narrow.matches) { sideOpen = false; renderAll(); }
   }
 
-  let sessionsKey = "";
-  let queueKey = "";
-  let pendingKey = "";
-  let railKey = "";
-  let chatSession = "";
+  function renderActivity() {
+    appEl.classList.toggle("side-open", sideOpen);
+    $("side-scrim").classList.toggle("hidden", !(sideOpen && narrow.matches));
+    document.querySelectorAll(".act[data-view]").forEach((b) => {
+      b.classList.toggle("on", sideOpen && b.dataset.view === sideView);
+      const badge = b.querySelector(".badge");
+      if (!badge) return;
+      let n = "";
+      if (b.dataset.view === "agents") {
+        const live = logs.agents.filter((a) => a.state === "working" || a.state === "starting").length;
+        n = live ? String(live) : "";
+      } else if (b.dataset.view === "changes") {
+        const files = new Set(logs.changes.map((c) => c.path)).size;
+        n = files ? String(files) : "";
+      } else if (b.dataset.view === "background") {
+        const live = logs.rail.backgrounds.filter((x) => x.alive).length + logs.rail.monitors.filter((x) => x.alive).length;
+        n = live ? String(live) : "";
+      } else if (b.dataset.view === "task") {
+        n = snap.header.task_live ? "●" : "";
+      }
+      badge.textContent = n;
+      badge.classList.toggle("hidden", !n);
+    });
+  }
 
-  function renderSessions() {
-    const key = JSON.stringify(snap.sessions || []);
-    if (key === sessionsKey) return;
-    sessionsKey = key;
-    const box = $("sessions");
+  let sideKey = "";
+  function renderSide() {
+    const titles = { sessions: "對話", agents: "代理", changes: "檔案變更", background: "背景工作", task: "任務" };
+    const key = JSON.stringify([sideView, activeTab, snap.sessions, snap.header.status, snap.header.running,
+      snap.header.model, !!snap.ask,
+      sideView === "agents" ? logs.agents : null,
+      sideView === "changes" ? logs.changes : null,
+      sideView === "background" ? [logs.rail.monitors, logs.rail.backgrounds.map((b) => [b.name, b.status, b.alive, b.command]), outputPick] : null,
+      sideView === "task" ? snap.task_summary : null]);
+    if (key === sideKey) return;
+    sideKey = key;
+    const title = $("side-title");
+    title.replaceChildren(el("span", "", titles[sideView]));
+    const body = $("side-body");
+    body.replaceChildren();
+    if (sideView === "sessions") {
+      const add = el("button", "", "＋ 新工作");
+      add.type = "button";
+      add.title = "新工作";
+      add.addEventListener("click", () => { send({ type: "new_chat" }); closeSideIfNarrow(); });
+      title.append(add);
+      for (const s of snap.sessions || []) {
+        const item = el("button", "side-item two session" + (s.current ? " on current" : ""));
+        item.type = "button";
+        const grow = el("div", "grow");
+        grow.append(el("span", "name", s.name), el("span", "dim", `${s.status || "待命"} · ${s.folder}`));
+        const acts = el("span", "acts");
+        const ren = el("span", "", "✎");
+        ren.title = "改名";
+        ren.addEventListener("click", (e) => { e.stopPropagation(); send({ type: "begin_rename", id: s.id }); });
+        const del = el("span", "", "✕");
+        del.title = "刪除";
+        del.addEventListener("click", (e) => { e.stopPropagation(); send({ type: "delete_session", id: s.id }); });
+        acts.append(ren, del);
+        item.append(el("span", "icon", s.current ? "●" : "○"), grow, acts);
+        item.addEventListener("click", () => { send({ type: "switch", id: s.id }); closeSideIfNarrow(); });
+        body.append(item);
+      }
+    } else if (sideView === "agents") {
+      const root = el("button", "side-item two" + (activeTab === "" ? " on" : ""));
+      root.type = "button";
+      const rg = el("div", "grow");
+      rg.append(el("span", "name", "主代理"), el("span", "dim", `${snap.ask ? "等你回覆" : snap.header.status} · ${snap.header.model}`));
+      root.append(el("span", "icon" + (snap.header.running ? " state-working" : ""), snap.header.running ? "◐" : "●"), rg);
+      root.addEventListener("click", () => { activate(""); closeSideIfNarrow(); });
+      body.append(root);
+      if (!logs.agents.length) {
+        body.append(el("div", "side-note", "尚無子代理。主代理呼叫 spawn_agent 後，子代理與它們的子代理會以樹狀列在這裡；點選可開啟唯讀分頁查看完整工作紀錄。"));
+      }
+      for (const a of logs.agents) {
+        const item = el("button", "side-item two" + (activeTab === a.path ? " on" : ""));
+        item.type = "button";
+        item.style.paddingLeft = `${16 + (a.depth + 1) * 14}px`;
+        item.title = a.prompt || a.path;
+        const grow = el("div", "grow");
+        const turn = a.turn ? ` · 第${a.turn}輪` : "";
+        grow.append(el("span", "name", a.name), el("span", "dim",
+          `${a.label}${turn}${a.activity && (a.state === "working") ? " · " + a.activity : a.model ? " · " + a.model : ""}`));
+        item.append(el("span", "icon state-" + a.state, STATE_ICON[a.state] || "·"), grow);
+        item.addEventListener("click", () => { openAgent(a.path); closeSideIfNarrow(); });
+        body.append(item);
+      }
+    } else if (sideView === "changes") {
+      const files = new Set(logs.changes.map((c) => c.path));
+      body.append(el("div", "side-note", `${files.size} 個檔案 · ${logs.changes.length} 次變更`));
+      [...logs.changes].reverse().forEach((c) => {
+        const mark = c.kind === "create" || c.kind === "add" ? "A" : c.kind === "delete" ? "D" : "M";
+        const item = el("button", "side-item");
+        item.type = "button";
+        item.title = `${c.path}${c.view ? " · " + c.view : ""}`;
+        item.append(el("span", "icon kind-" + mark, mark), el("span", "name", c.path));
+        if (c.view) item.append(el("span", "dim", c.view));
+        item.addEventListener("click", () => {
+          send({ type: "open_tool", view: c.view, group: c.row, item: c.call });
+          closeSideIfNarrow();
+        });
+        body.append(item);
+      });
+    } else if (sideView === "background") {
+      const { backgrounds, monitors } = logs.rail;
+      if (!backgrounds.length && !monitors.length) body.append(el("div", "side-note", "尚無背景行程、監控或計時器"));
+      backgrounds.forEach((b) => {
+        const item = el("button", "side-item two" + (outputPick === b.name ? " on" : ""));
+        item.type = "button";
+        const grow = el("div", "grow");
+        grow.append(el("span", "name", `${b.name}  ${b.status}`), el("span", "dim", b.command));
+        item.append(el("span", "icon " + (b.alive ? "state-working" : "state-exited"), b.alive ? "●" : "○"), grow);
+        item.addEventListener("click", () => { outputPick = b.name; panelTab = "output"; renderAll(); closeSideIfNarrow(); });
+        body.append(item);
+      });
+      monitors.forEach((m) => {
+        const item = el("button", "side-item");
+        item.type = "button";
+        item.append(el("span", "icon " + (m.alive ? "state-paused" : "state-exited"), m.alive ? "●" : "○"),
+          el("span", "name", `監控 ${m.name}`), el("span", "dim", m.status));
+        item.addEventListener("click", () => send({ type: "open_monitor", name: m.name }));
+        body.append(item);
+      });
+    } else if (sideView === "task") {
+      const task = snap.task_summary || {};
+      if (!task.goal) {
+        body.append(el("div", "side-note", "尚未設定任務目標。任務模式會用監督者檢查表，讓主代理一直做到目標完成。"));
+      } else {
+        body.append(el("div", "side-note", `目標  ${task.goal}`));
+        const done = (task.checklist || []).filter((i) => i.done).length;
+        body.append(el("div", "side-section", `${task.phase} · ${done}/${(task.checklist || []).length}`));
+        (task.checklist || []).forEach((i) => {
+          body.append(el("div", "side-item check" + (i.done ? " done" : ""), `${i.done ? "✓" : "□"} ${i.text}`));
+        });
+        if (task.note) body.append(el("div", "side-note", task.note));
+      }
+      const btn = el("button", "side-btn", task.goal ? "開啟任務面板" : "設定任務目標");
+      btn.type = "button";
+      btn.addEventListener("click", () => send({ type: "open_task" }));
+      body.append(btn);
+    }
+  }
+
+  // —— Editor tabs ——
+  function openAgent(path) {
+    if (!openTabs.includes(path)) openTabs.push(path);
+    activate(path);
+  }
+
+  function activate(path) {
+    scrollPositions.set(activeTab, { top: chat.scrollTop, stick });
+    activeTab = path;
+    renderAll();
+    if (!path) composer.focus();
+  }
+
+  function closeTab(path) {
+    const i = openTabs.indexOf(path);
+    if (i < 0) return;
+    openTabs.splice(i, 1);
+    if (activeTab === path) activeTab = openTabs[i - 1] ?? openTabs[0] ?? "";
+    renderAll();
+  }
+
+  function cycleTab(delta) {
+    const all = ["", ...openTabs];
+    const i = all.indexOf(activeTab);
+    activate(all[(i + delta + all.length) % all.length]);
+  }
+
+  let tabsKey = "";
+  function renderTabs() {
+    const key = JSON.stringify([activeTab, openTabs, snap.header.running,
+      openTabs.map((p) => agentOf(p)?.state)]);
+    if (key === tabsKey) return;
+    tabsKey = key;
+    const box = $("tabs");
     box.replaceChildren();
-    for (const s of snap.sessions) {
-      const div = document.createElement("div");
-      div.className = "session" + (s.current ? " current" : "");
-      const acts = document.createElement("div");
-      acts.className = "acts";
-      const ren = document.createElement("button");
-      ren.type = "button";
-      ren.textContent = "改名";
-      ren.addEventListener("click", (e) => {
-        e.stopPropagation();
-        send({ type: "begin_rename", id: s.id });
-      });
-      const del = document.createElement("button");
-      del.type = "button";
-      del.textContent = "刪";
-      del.addEventListener("click", (e) => {
-        e.stopPropagation();
-        send({ type: "delete_session", id: s.id });
-      });
-      acts.append(ren, del);
-      const name = document.createElement("div");
-      name.className = "name";
-      name.textContent = s.name;
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      meta.textContent = `${s.status || "待命"} · ${s.folder}`;
-      div.append(acts, name, meta);
-      div.addEventListener("click", () => {
-        send({ type: "switch", id: s.id });
-        if (!appEl.classList.contains("sidebar-pinned")) setSidebar(false);
-      });
-      box.append(div);
-    }
+    const mk = (path, label, icon, stateCls) => {
+      const t = el("div", "tab" + (activeTab === path ? " on" : ""));
+      t.setAttribute("role", "tab");
+      t.setAttribute("aria-selected", String(activeTab === path));
+      t.tabIndex = 0;
+      t.append(el("span", stateCls, icon), el("span", "", label));
+      if (path) {
+        const x = el("span", "close", "✕");
+        x.title = "關閉 (Ctrl+W)";
+        x.addEventListener("click", (e) => { e.stopPropagation(); closeTab(path); });
+        t.append(x);
+      }
+      t.addEventListener("click", () => activate(path));
+      t.addEventListener("auxclick", (e) => { if (e.button === 1 && path) closeTab(path); });
+      box.append(t);
+    };
+    mk("", "主對話", snap.header.running ? "◐" : "●", snap.header.running ? "state-working" : "");
+    openTabs.forEach((p) => {
+      const a = agentOf(p);
+      mk(p, a ? a.name : p, STATE_ICON[a?.state] || "·", "state-" + (a?.state || "exited"));
+    });
   }
 
+  // —— Chat ——
   function rowSig(row) {
-    // elapsed_ms ticks every pulse while running; keep it out of the identity
-    // so completed rows are not rebuilt (which caused visible flicker).
     return JSON.stringify({
-      kind: row.kind,
-      html: row.html,
-      text: row.text,
-      expanded: row.expanded,
-      done: row.done,
-      images: row.images,
-      calls: row.calls,
-      path: row.path,
-      label: row.label,
+      kind: row.kind, html: row.html, text: row.text, expanded: row.expanded, done: row.done,
+      images: row.images, calls: row.calls, path: row.path, label: row.label,
+      work: row.kind === "agent" ? row.elapsed_ms : undefined,
     }) + "\0" + agentLabel();
   }
 
-  function patchThinkClock(el, row) {
+  function patchThinkClock(node, row) {
     if (row.kind !== "think") return;
-    const sum = el.querySelector("summary");
+    const sum = node.querySelector("summary");
     if (!sum) return;
-    const next = row.done
-      ? `思考 ${((row.elapsed_ms || 0) / 1000).toFixed(1)}s`
-      : "思考中";
+    const next = row.done ? `思考 ${((row.elapsed_ms || 0) / 1000).toFixed(1)}s` : "思考中…";
     if (sum.textContent !== next) sum.textContent = next;
   }
 
-  function buildChatRow(row, i) {
-    const el = document.createElement("article");
-    el.className = "row " + row.kind;
-    el.dataset.sig = rowSig(row);
-    const who = document.createElement("div");
-    who.className = "who";
-    who.textContent =
-      row.kind === "user" ? "你" :
+  function buildChatRow(row, i, view) {
+    const node = el("article", "row " + row.kind);
+    node.dataset.sig = rowSig(row);
+    node.append(el("div", "who",
+      row.kind === "user" ? (view ? "上層代理" : "你") :
       row.kind === "agent" ? agentLabel() :
       row.kind === "think" ? "思考" :
       row.kind === "tools" ? "工具" :
       row.kind === "picture" ? "圖片" :
-      row.kind === "err" ? "錯誤" : "系統";
-    el.append(who);
-
-    const wrapContent = (node) => {
-      if (row.kind === "user") {
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        bubble.append(node);
-        el.append(bubble);
-      } else if (row.kind === "agent") {
-        node.classList.add("body");
-        el.append(node);
-      } else {
-        el.append(node);
-      }
-    };
+      row.kind === "err" ? "錯誤" : "系統"));
 
     if (row.kind === "think" || row.kind === "tools") {
-      const d = document.createElement("details");
-      d.className = "fold";
-      const foldKey = `${snap.session_id}:${i}`;
+      const d = el("details", "fold");
+      const foldKey = `${snap.session_id}:${view}:${i}`;
       d.open = folds.get(foldKey) ?? !!row.expanded;
-      const sum = document.createElement("summary");
-      sum.textContent = row.kind === "think"
-        ? (row.done ? `思考 ${((row.elapsed_ms || 0) / 1000).toFixed(1)}s` : "思考中")
-        : `工具 ${row.calls.length}${row.calls.some(c => c.phase === "失敗") ? " · 有操作失敗" : row.calls.some(c => c.phase === "已停止") ? " · 已停止" : ""}`;
+      const sum = el("summary", "", row.kind === "think"
+        ? (row.done ? `思考 ${((row.elapsed_ms || 0) / 1000).toFixed(1)}s` : "思考中…")
+        : `工具 ${row.calls.length}${row.calls.some(c => c.phase === "失敗") ? " · 有操作失敗" : row.calls.some(c => c.phase === "已停止") ? " · 已停止" : row.calls.some(c => !c.done) ? " · 執行中" : ""}`);
       d.append(sum);
-      const body = document.createElement("div");
+      const body = el("div");
       body.innerHTML = row.html;
       if (row.kind === "tools") {
         row.calls.forEach((c, j) => {
-          const call = document.createElement("div");
-          call.className = "call";
-          const t = document.createElement("div");
+          const call = el("div", "call");
           const mark = c.phase === "失敗" ? "!" : c.phase === "已停止" ? "⊘" : c.done ? "✓" : "▸";
-          t.textContent = `${mark} ${c.name}  ${c.phase}`;
-          call.append(t);
-          if (c.output) {
-            const pre = document.createElement("pre");
-            pre.textContent = c.output;
-            call.append(pre);
-          }
+          call.append(el("div", "head" + (c.phase === "失敗" ? " fail" : ""), `${mark} ${c.name}  ${c.phase}`));
+          if (c.output) call.append(el("pre", "", c.output.length > 2000 ? c.output.slice(0, 2000) + "\n…" : c.output));
           c.files.forEach((f) => {
-            const wrap = document.createElement("div");
+            const wrap = el("div");
             wrap.innerHTML = f.diff_html;
             call.append(wrap);
           });
-          call.addEventListener("click", () => send({ type: "open_tool", group: i, item: j }));
+          call.addEventListener("click", () => send({ type: "open_tool", view, group: i, item: j }));
           body.append(call);
         });
       }
@@ -366,54 +533,42 @@
         d.open = !d.open;
         folds.set(foldKey, d.open);
       });
-      el.append(d);
+      node.append(d);
     } else {
-      const body = document.createElement("div");
+      const body = el("div", row.kind === "user" ? "bubble" : row.kind === "agent" ? "body" : "");
       body.innerHTML = row.html;
-      wrapContent(body);
-    }
-    if (row.images && row.images.length) {
-      const pics = document.createElement("div");
-      pics.className = "pics";
-      row.images.forEach((p) => {
-        const img = document.createElement("img");
-        img.src = mediaUrl(p);
-        img.alt = p;
-        img.addEventListener("click", () => send({ type: "open_image", path: p }));
-        pics.append(img);
-      });
-      if (row.kind === "user") {
-        const bubble = el.querySelector(".bubble") || el;
-        bubble.append(pics);
-      } else {
-        el.append(pics);
+      node.append(body);
+      if (row.kind === "agent" && row.elapsed_ms) {
+        node.append(el("div", "work", `工作 ${(row.elapsed_ms / 1000).toFixed(1)}s`));
       }
     }
-    if (row.path) {
-      const pics = document.createElement("div");
-      pics.className = "pics";
-      const img = document.createElement("img");
-      img.src = mediaUrl(row.path);
-      img.alt = row.label || row.path;
-      img.addEventListener("click", () => send({ type: "open_image", path: row.path }));
-      pics.append(img);
-      el.append(pics);
+    const pics = row.path ? [row.path] : (row.images || []);
+    if (pics.length) {
+      const box = el("div", "pics");
+      pics.forEach((p) => {
+        const img = el("img");
+        img.src = mediaUrl(p);
+        img.alt = row.label || p;
+        img.addEventListener("click", () => send({ type: "open_image", path: p }));
+        box.append(img);
+      });
+      (node.querySelector(".bubble") || node).append(box);
     }
-    return el;
+    return node;
   }
 
+  let chatKey = "";
   function renderChat() {
-    const sid = snap.session_id || "";
-    const changedSession = sid !== chatSession;
-    if (changedSession) {
-      chatSession = sid;
+    const key = `${snap.session_id}|${activeTab}`;
+    const changed = key !== chatKey;
+    if (changed) {
+      chatKey = key;
       chat.replaceChildren();
-      stick = scrollPositions.get(sid)?.stick ?? true;
+      const saved = scrollPositions.get(activeTab);
+      stick = saved ? saved.stick : true;
     }
-    const rows = snap.rows || [];
-    while (chat.children.length > rows.length) {
-      chat.lastElementChild.remove();
-    }
+    const rows = viewRows(activeTab);
+    while (chat.children.length > rows.length) chat.lastElementChild.remove();
     rows.forEach((row, i) => {
       const sig = rowSig(row);
       const existing = chat.children[i];
@@ -421,12 +576,15 @@
         patchThinkClock(existing, row);
         return;
       }
-      const next = buildChatRow(row, i);
+      const next = buildChatRow(row, i, activeTab);
       if (existing) existing.replaceWith(next);
       else chat.append(next);
     });
+    if (!rows.length && activeTab) {
+      chat.append(el("div", "row meta", "尚無工作紀錄"));
+    }
     if (stick) chat.scrollTop = chat.scrollHeight;
-    else if (changedSession && scrollPositions.has(sid)) chat.scrollTop = scrollPositions.get(sid).top;
+    else if (changed && scrollPositions.has(activeTab)) chat.scrollTop = scrollPositions.get(activeTab).top;
     $("jump-bottom").classList.toggle("hidden", stick);
   }
 
@@ -435,376 +593,404 @@
     $("jump-bottom").classList.toggle("hidden", stick);
   });
 
-  function renderQueue() {
-    const key = JSON.stringify(snap.queue || []);
-    if (key === queueKey) return;
-    queueKey = key;
-    const box = $("queue");
-    box.replaceChildren();
-    (snap.queue || []).forEach((q, i) => {
-      const p = document.createElement("button");
-      p.type = "button";
-      p.className = "pill";
-      p.textContent = q.text || `${q.images} 張圖`;
-      p.addEventListener("click", () => send({ type: "edit_queue", index: i }));
-      box.append(p);
-    });
-  }
-
-  function renderPending() {
-    const key = JSON.stringify(snap.pending || []);
-    if (key === pendingKey) return;
-    pendingKey = key;
-    const box = $("pending");
-    box.replaceChildren();
-    (snap.pending || []).forEach((p, i) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "pill";
-      b.textContent = p + " ×";
-      b.addEventListener("click", () => send({ type: "remove_pending", index: i }));
-      box.append(b);
-    });
-  }
-
-  function renderRail() {
-    renderWorkSummary();
-    const key = JSON.stringify(snap.rail || {});
-    if (key === railKey) return;
-    railKey = key;
-    const box = $("rail-body");
-    box.replaceChildren();
-    const add = (kind, items, type) => {
-      if (!items.length) return;
-      const h = document.createElement("h3");
-      h.textContent = kind;
-      box.append(h);
-      items.forEach((it) => {
-        const d = document.createElement("div");
-        d.className = "rail-item" + (it.alive ? " alive" : "");
-        d.textContent = `${it.name}  ${it.status || ""}  ${it.activity || it.command || ""}`;
-        d.addEventListener("click", () => send({ type, name: it.name }));
-        box.append(d);
-      });
-    };
-    add("子代理", snap.rail.children, "open_child");
-    add("監控", snap.rail.monitors, "open_monitor");
-    add("後台", snap.rail.backgrounds, "open_background");
-  }
-
-  function renderWorkSummary() {
-    const box = $("work-summary");
-    const task = snap.task_summary || {};
-    const signature = JSON.stringify([task, snap.header.status, snap.header.activity, !!snap.ask]);
-    if (box.dataset.signature !== signature) {
-      box.dataset.signature = signature;
+  // —— Composer / read-only footer ——
+  let queueKey = "";
+  let pendingKey = "";
+  function renderEditorFooter() {
+    const viewing = !!activeTab;
+    $("composer-wrap").classList.toggle("hidden", viewing);
+    $("tray").classList.toggle("hidden", viewing);
+    const ro = $("readonly");
+    ro.classList.toggle("hidden", !viewing);
+    if (viewing) {
+      const a = agentOf(activeTab);
+      ro.replaceChildren();
+      if (a) {
+        const strong = el("strong", "state-" + a.state, `${STATE_ICON[a.state] || ""} ${a.path}`);
+        const bits = [a.label, a.model, a.turn ? `第${a.turn}輪` : "", `工具 ${a.tools}`].filter(Boolean).join(" · ");
+        const info = el("button", "chip", "任務說明");
+        info.type = "button";
+        info.addEventListener("click", () => send({ type: "open_agent_info", path: a.path }));
+        ro.append(strong, document.createTextNode(`  ${bits}  ·  唯讀：子代理由主代理指揮  `), info);
+      }
+    }
+    const qk = JSON.stringify(snap.queue || []);
+    if (qk !== queueKey) {
+      queueKey = qk;
+      const box = $("queue");
       box.replaceChildren();
-      const title = document.createElement("h3");
-      title.textContent = "目前工作";
-      const status = document.createElement("p");
-      status.className = "work-status";
-      status.textContent = snap.ask ? "需要你回覆" : snap.header.status;
-      const activity = document.createElement("p");
-      activity.textContent = snap.header.activity || "等待下一個指示";
-      const goal = document.createElement("p");
-      goal.className = "work-goal";
-      goal.textContent = task.goal || "尚未設定任務目標，可從上方「任務」建立。";
-      box.append(title, status, activity, goal);
-      if (task.goal) {
-        const progress = document.createElement("p");
-        progress.textContent = `${task.phase} · ${(task.checklist || []).filter(i => i.done).length}/${(task.checklist || []).length}`;
-        box.append(progress);
-      }
-      for (const item of task.checklist || []) {
-        const line = document.createElement("div");
-        line.className = "check-item" + (item.done ? " done" : "");
-        line.textContent = `${item.done ? "✓" : "□"} ${item.text}`;
-        box.append(line);
-      }
-      if (task.note) {
-        const note = document.createElement("p"); note.textContent = task.note; box.append(note);
-      }
+      (snap.queue || []).forEach((q, i) => {
+        const p = el("button", "pill", q.text || `${q.images} 張圖`);
+        p.type = "button";
+        p.title = "編輯待處理訊息";
+        p.addEventListener("click", () => send({ type: "edit_queue", index: i }));
+        box.append(p);
+      });
     }
-    const changes = $("file-changes");
-    const files = [];
-    (snap.rows || []).forEach((row, group) => (row.calls || []).forEach((call, item) =>
-      (call.files || []).forEach(file => files.push({ ...file, group, item }))));
-    const key = JSON.stringify(files);
-    if (changes.dataset.signature === key) return;
-    changes.dataset.signature = key;
-    changes.replaceChildren();
-    const title = document.createElement("h3");
-    title.textContent = `檔案變更 · ${new Set(files.map(f => f.path)).size}`;
-    changes.append(title);
-    if (!files.length) {
-      const empty = document.createElement("p"); empty.className = "hint";
-      empty.textContent = "這項工作尚無檔案變更紀錄"; changes.append(empty);
+    const pk = JSON.stringify(snap.pending || []);
+    if (pk !== pendingKey) {
+      pendingKey = pk;
+      const box = $("pending");
+      box.replaceChildren();
+      (snap.pending || []).forEach((p, i) => {
+        const b = el("button", "pill", p + " ✕");
+        b.type = "button";
+        b.addEventListener("click", () => send({ type: "remove_pending", index: i }));
+        box.append(b);
+      });
     }
-    files.forEach(file => {
-      const button = document.createElement("button");
-      button.className = "file-change";
-      button.textContent = file.path;
-      button.title = "查看這次操作的差異";
-      button.onclick = () => send({ type: "open_tool", group: file.group, item: file.item });
-      changes.append(button);
-    });
+    $("interrupt").classList.toggle("hidden", !snap.header.running);
+    $("mode-queue").classList.toggle("on", sendMode !== "insert");
+    $("mode-insert").classList.toggle("on", sendMode === "insert");
+    composer.placeholder = isCustom()
+      ? "傳給自訂模型… Enter 送出，Shift+Enter 換行，Ctrl+Enter 調整目前工作"
+      : "傳給 Grok… Enter 送出，Shift+Enter 換行，Ctrl+Enter 調整目前工作";
+    resizeComposer();
   }
 
-  function renderComposer() {
+  function resizeComposer() {
     composer.style.height = "auto";
-    composer.style.height = Math.min(180, composer.scrollHeight) + "px";
+    composer.style.height = Math.min(200, composer.scrollHeight) + "px";
   }
 
   function pushComposer() {
     drafts.set(draftSession, composer.value);
     if (!awaitingReceipt) $("delivery").textContent = connected ? "草稿只保留在此分頁" : "離線草稿 · 重連後可送出";
-    renderComposer();
+    resizeComposer();
   }
 
   composer.addEventListener("compositionstart", () => { composing = true; });
-  composer.addEventListener("compositionend", () => {
-    composing = false;
-    pushComposer();
-  });
-  composer.addEventListener("input", () => {
-    if (!composing) pushComposer();
-  });
+  composer.addEventListener("compositionend", () => { composing = false; pushComposer(); });
+  composer.addEventListener("input", () => { if (!composing) pushComposer(); });
   composer.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !composing) {
+    if (e.key === "Enter" && !e.shiftKey && !composing && !e.isComposing) {
       e.preventDefault();
       submitMessage(e.ctrlKey || e.metaKey);
     }
   });
 
+  // —— Bottom panel ——
+  function setPanel(tab) {
+    panelTab = tab === undefined ? (panelTab ? null : "tools") : tab;
+    renderAll();
+  }
+
+  let panelKey = "";
+  function renderPanel() {
+    const panel = $("panel");
+    panel.classList.toggle("hidden", !panelTab);
+    if (!panelTab) { panelKey = ""; return; }
+    const key = JSON.stringify([panelTab, outputPick,
+      panelTab === "tools" ? logs.tools : null,
+      panelTab === "events" ? logs.events : null,
+      panelTab === "output" ? logs.rail.backgrounds : null]);
+    if (key === panelKey) return;
+    panelKey = key;
+    const tabs = $("panel-tabs");
+    tabs.replaceChildren();
+    const running = logs.tools.filter((t) => !t.done).length;
+    const liveBg = logs.rail.backgrounds.filter((b) => b.alive).length;
+    [["tools", "工具", running], ["output", "輸出", liveBg], ["events", "事件", 0]].forEach(([id, label, n]) => {
+      const b = el("button", "ptab" + (panelTab === id ? " on" : ""), label);
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      if (n) b.append(el("span", "count", String(n)));
+      b.addEventListener("click", () => setPanel(id));
+      tabs.append(b);
+    });
+    const body = $("panel-body");
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+    body.replaceChildren();
+    if (panelTab === "tools") {
+      if (!logs.tools.length) body.append(el("div", "side-note", "尚無工具呼叫"));
+      logs.tools.forEach((t) => {
+        const cls = !t.done ? "run" : t.phase === "失敗" ? "fail" : "";
+        const line = el("div", "pline click " + cls);
+        const mark = !t.done ? "◐" : t.phase === "失敗" ? "!" : t.phase === "已停止" ? "⊘" : "✓";
+        line.append(el("span", "", mark), el("span", "who", t.path || "主"),
+          el("span", "txt", `${t.line.replace(/^▸ /, "")}  ${t.phase}`),
+          el("span", "ms", t.done ? `${(t.ms / 1000).toFixed(1)}s` : ""));
+        line.title = "查看這次工具呼叫";
+        line.addEventListener("click", () => revealTool(t.path, t.call_id));
+        body.append(line);
+      });
+    } else if (panelTab === "events") {
+      if (!logs.events.length) body.append(el("div", "side-note", "尚無事件"));
+      logs.events.forEach((e) => {
+        const line = el("div", "pline " + e.kind + (e.path ? " click" : ""));
+        line.append(el("span", "at", e.at), el("span", "who", e.path || "主"), el("span", "txt", e.text));
+        line.title = e.text;
+        if (e.path) line.addEventListener("click", () => openAgent(e.path));
+        body.append(line);
+      });
+    } else {
+      const bgs = logs.rail.backgrounds;
+      if (!bgs.length) { body.append(el("div", "side-note", "尚無背景行程輸出")); }
+      else {
+        const pick = bgs.find((b) => b.name === outputPick) || bgs.slice().reverse().find((b) => b.alive) || bgs[bgs.length - 1];
+        const picks = el("div", "out-picks");
+        bgs.forEach((b) => {
+          const c = el("button", "chip" + (b === pick ? " on" : ""), `${b.alive ? "●" : "○"} ${b.name}`);
+          c.type = "button";
+          c.addEventListener("click", () => { outputPick = b.name; renderAll(); });
+          picks.append(c);
+        });
+        body.append(picks, el("div", "hint", `$ ${pick.command} · ${pick.status}${pick.detail ? " · " + pick.detail : ""}`));
+        const pre = el("pre", "out-log");
+        (pick.log || []).forEach((l) => {
+          const span = el("span", l.startsWith("stderr") ? "stderr" : "", l + "\n");
+          pre.append(span);
+        });
+        body.append(pre);
+      }
+    }
+    if (atBottom) body.scrollTop = body.scrollHeight;
+  }
+
+  function revealTool(path, callId) {
+    const rows = viewRows(path);
+    for (let r = rows.length - 1; r >= 0; r--) {
+      const calls = rows[r].calls || [];
+      const c = calls.findIndex((x) => x.call_id === callId);
+      if (c >= 0) { send({ type: "open_tool", view: path, group: r, item: c }); return; }
+    }
+    if (path) openAgent(path);
+  }
+
+  // —— Status bar ——
+  function renderStatus() {
+    const h = snap.header;
+    $("statusbar").classList.toggle("running", !!h.running);
+    const left = $("status-left");
+    left.replaceChildren();
+    const clock = h.running ? ` ${(h.elapsed_ms / 1000).toFixed(1)}s` : "";
+    const activity = snap.ask ? "等你回覆" : (h.activity || h.status || "待命");
+    const act = el("span", "sb", `${h.running ? "◐" : "●"} ${activity}${clock}`);
+    act.title = h.status;
+    left.append(act);
+    const live = logs.agents.filter((a) => a.state === "working" || a.state === "starting").length;
+    if (logs.agents.length) {
+      const b = el("button", "sb", `◎ 代理 ${live}/${logs.agents.filter((a) => a.alive).length}`);
+      b.type = "button";
+      b.title = "開啟代理檢視";
+      b.addEventListener("click", () => setSide("agents"));
+      left.append(b);
+    }
+    const tools = el("button", "sb wide", `⚙ 工具 ${logs.tools.filter((t) => !t.done).length}`);
+    tools.type = "button";
+    tools.title = "開啟工具面板 (Ctrl+J)";
+    tools.addEventListener("click", () => setPanel(panelTab === "tools" ? null : "tools"));
+    left.append(tools);
+    if (h.workspace) left.append(el("span", "sb wide", `📂 ${h.workspace}`));
+
+    const right = $("status-right");
+    right.replaceChildren();
+    right.append(el("span", "sb wide", h.cache));
+    right.append(el("span", "sb wide", h.logged_in ? "已登入" : "未登入"));
+    const task = el("button", "sb", h.task_live ? "任務 ●" : "任務");
+    task.type = "button";
+    task.addEventListener("click", () => send({ type: "open_task" }));
+    const model = el("button", "sb", `${isCustom() ? "自訂 API" : "Grok"} · ${h.model}${h.effort ? " · " + h.effort : ""}`);
+    model.type = "button";
+    model.title = "設定";
+    model.addEventListener("click", () => send({ type: "open_settings" }));
+    right.append(task, model);
+  }
+
+  // —— Overlays ——
   function rememberSettingsFocus() {
     const ae = document.activeElement;
-    if (!ae || !overlay.contains(ae)) {
-      settingsFocus = null;
-      return;
-    }
-    settingsFocus = {
-      key: ae.getAttribute("data-field") || "",
-      start: ae.selectionStart,
-      end: ae.selectionEnd,
-    };
+    if (!ae || !overlay.contains(ae)) { settingsFocus = null; return; }
+    settingsFocus = { key: ae.getAttribute("data-field") || "", start: ae.selectionStart, end: ae.selectionEnd };
   }
 
   function restoreSettingsFocus(root) {
     if (!settingsFocus || !settingsFocus.key) return;
-    const el = root.querySelector(`[data-field="${settingsFocus.key}"]`);
-    if (!el) return;
-    el.focus();
-    if (typeof settingsFocus.start === "number" && el.setSelectionRange) {
-      try {
-        el.setSelectionRange(settingsFocus.start, settingsFocus.end ?? settingsFocus.start);
-      } catch (_) {}
+    const target = root.querySelector(`[data-field="${settingsFocus.key}"]`);
+    if (!target) return;
+    target.focus();
+    if (typeof settingsFocus.start === "number" && target.setSelectionRange) {
+      try { target.setSelectionRange(settingsFocus.start, settingsFocus.end ?? settingsFocus.start); } catch (_) {}
     }
   }
 
-  function drawerOverlay(snap) {
-    return !!(snap.settings || snap.task || snap.inspector || snap.tool_panel || snap.skill_view);
-  }
-
   function overlaySnapshot() {
-    return { ...snap, settings: null, task: null, rename: null,
-      inspector: null, image_view: null, tool_panel: null, ...localView,
+    if (!snap) return null;
+    return { ...snap, settings: null, task: null, rename: null, inspector: null, image_view: null,
+      tool_panel: null, ...localView,
       settings: localView.settings ? snap.settings_data : null,
       task: localView.task ? { ...snap.task_summary, draft: taskDraft,
         mode: snap.task_summary?.goal ? "status" : "form" } : null };
   }
 
-  function renderOverlay(snap = overlaySnapshot()) {
-    if (!snap || overlayComposing) return;
-    const key = JSON.stringify([snap.session_id, snap.settings,
-      snap.rename && snap.rename.id,
-      snap.task && { ...snap.task, draft: undefined },
-      snap.ask && { ...snap.ask, options: snap.ask.options.map(o => ({ ...o, value: undefined })) },
-      snap.picker, snap.inspector && [snap.inspector, snap.rail], snap.image_view,
-      snap.skill_view, snap.queue_editor, snap.tool_panel && [snap.tool_panel, snap.rows[snap.tool_panel.group]]]);
+  function drawerOverlay(o) {
+    return !!(o.settings || o.task || o.inspector || o.tool_panel || o.skill_view || o.agent_info);
+  }
+
+  function toolCall(tp) {
+    const g = viewRows(tp.view)[tp.group];
+    return g && g.calls ? g.calls[tp.item] : null;
+  }
+
+  function renderOverlay(o = overlaySnapshot()) {
+    if (!o || overlayComposing) return;
+    const key = JSON.stringify([o.session_id, o.settings,
+      o.rename && o.rename.id,
+      o.task && { ...o.task, draft: undefined },
+      o.ask && { ...o.ask, options: o.ask.options.map(x => ({ ...x, value: undefined })) },
+      o.picker, o.inspector && [o.inspector, logs.rail.monitors], o.image_view,
+      o.skill_view, o.queue_editor, o.tool_panel && [o.tool_panel, toolCall(o.tool_panel)],
+      o.agent_info && agentOf(o.agent_info)]);
     if (key === overlayKey) return;
     overlayKey = key;
     const active = overlay.contains(document.activeElement) ? document.activeElement : null;
     const activeValue = active && "value" in active ? active.value : null;
     rememberSettingsFocus();
-    const show = !!(snap.settings || snap.ask || snap.task || snap.picker || snap.inspector || snap.image_view || snap.skill_view || snap.rename || snap.tool_panel || snap.queue_editor);
+    const show = !!(o.settings || o.ask || o.task || o.picker || o.inspector || o.image_view || o.skill_view
+      || o.rename || o.tool_panel || o.queue_editor || o.agent_info);
     overlay.classList.toggle("hidden", !show);
-    overlay.classList.toggle("centered", show && !drawerOverlay(snap));
-    if (!show) {
-      overlay.replaceChildren();
-      settingsFocus = null;
-      return;
-    }
+    overlay.classList.toggle("centered", show && !drawerOverlay(o));
+    if (!show) { overlay.replaceChildren(); settingsFocus = null; return; }
 
-    // Keep settings form mounted so typing endpoint/key does not steal focus.
+    // Keep the settings form mounted so typing does not lose focus.
     const existing = overlay.querySelector(".modal.settings");
-    if (snap.settings && existing && !snap.ask && !snap.task && !snap.picker && !snap.inspector && !snap.image_view && !snap.skill_view && !snap.rename && !snap.tool_panel) {
-      updateSettingsModal(existing, snap.settings);
+    if (o.settings && existing && !o.ask && !o.task && !o.picker && !o.inspector && !o.image_view
+      && !o.skill_view && !o.rename && !o.tool_panel && !o.agent_info) {
+      buildSettingsModal(existing, o.settings);
       restoreSettingsFocus(existing);
       return;
     }
 
     overlay.replaceChildren();
-    const modal = document.createElement("div");
-    modal.className = "modal";
-    if (snap.queue_editor) {
+    const modal = el("div", "modal");
+    if (o.queue_editor) {
       modal.append(h2("編輯待處理訊息"));
-      const input = document.createElement("textarea");
-      input.value = snap.queue_editor.original;
+      const input = el("textarea");
+      input.rows = 6;
+      input.value = o.queue_editor.original;
       modal.append(input);
-      const notice = document.createElement("p"); notice.className = "queue-notice"; notice.setAttribute("role", "status"); modal.append(notice);
+      const notice = el("p", "queue-notice hint");
+      notice.setAttribute("role", "status");
+      modal.append(notice);
       addBtns(modal, [
         ["取消", () => send({ type: "close_queue_editor" })],
         ["儲存", () => {
           if (!connected) { notice.textContent = "未儲存：連線中斷，文字保留在此處"; return; }
           if (awaitingReceipt) { send(awaitingReceipt); return; }
-          awaitingReceipt = { type: "update_queue", request_id: crypto.randomUUID(), session_id: snap.session_id,
-            index: snap.queue_editor.index, expected: snap.queue_editor.original, text: input.value };
+          awaitingReceipt = { type: "update_queue", request_id: crypto.randomUUID(), session_id: o.session_id,
+            index: o.queue_editor.index, expected: o.queue_editor.original, text: input.value };
           notice.textContent = "儲存中，請等待確認；未回應時可再次點選儲存確認同一筆修改";
           send(awaitingReceipt);
         }],
       ]);
-    } else if (snap.image_view) {
+    } else if (o.image_view) {
       modal.className = "modal lightbox";
-      const img = document.createElement("img");
-      img.src = mediaUrl(snap.image_view);
+      const img = el("img");
+      img.src = mediaUrl(o.image_view);
+      img.alt = o.image_view;
       modal.append(img);
       addClose(modal, () => send({ type: "close_image" }));
-    } else if (snap.rename) {
+    } else if (o.rename) {
       modal.append(h2("改名"));
-      const inp = document.createElement("input");
+      const inp = el("input");
       inp.type = "text";
-      inp.value = snap.rename.text;
+      inp.value = o.rename.text;
+      inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) send({ type: "commit_rename", text: inp.value }); });
       modal.append(inp);
-      addBtns(modal, [
-        ["取消", () => send({ type: "cancel_rename" })],
-        ["確定", () => send({ type: "commit_rename", text: inp.value })],
-      ]);
-    } else if (snap.task) {
-      if (snap.task.mode === "form") {
+      addBtns(modal, [["取消", () => send({ type: "cancel_rename" })], ["確定", () => send({ type: "commit_rename", text: inp.value })]]);
+    } else if (o.task) {
+      if (o.task.mode === "form") {
         modal.append(h2("任務目標"));
-        const ta = document.createElement("textarea");
+        const ta = el("textarea");
         ta.rows = 6;
-        ta.value = snap.task.draft || "";
+        ta.value = o.task.draft || "";
         ta.placeholder = "這則對話要達成什麼？";
         ta.addEventListener("input", () => send({ type: "set_task_draft", text: ta.value }));
         modal.append(ta);
-        addBtns(modal, [
-          ["取消", () => send({ type: "close_task" })],
-          ["確定", () => send({ type: "submit_task" })],
-        ]);
+        addBtns(modal, [["取消", () => send({ type: "close_task" })], ["確定", () => send({ type: "submit_task" })]]);
       } else {
-        modal.append(h2("任務模式  ·  " + (snap.task.phase || "")));
-        const goal = document.createElement("p");
-        goal.textContent = "目標  " + (snap.task.goal || "");
-        modal.append(goal);
-        const list = document.createElement("pre");
-        list.textContent = (snap.task.checklist || [])
-          .map((i) => (i.done ? "[x] " : "[ ] ") + i.text)
-          .join("\n") || "（尚無檢查表）";
-        modal.append(list);
-        addBtns(modal, [
-          ["關閉", () => send({ type: "close_task" })],
-          ["結束任務", () => send({ type: "end_task" })],
-        ]);
+        modal.append(h2("任務模式  ·  " + (o.task.phase || "")));
+        modal.append(el("p", "", "目標  " + (o.task.goal || "")));
+        modal.append(el("pre", "", (o.task.checklist || []).map((i) => (i.done ? "[x] " : "[ ] ") + i.text).join("\n") || "（尚無檢查表）"));
+        if (o.task.note) modal.append(el("p", "hint", o.task.note));
+        addBtns(modal, [["關閉", () => send({ type: "close_task" })], ["結束任務", () => send({ type: "end_task" })]]);
       }
-    } else if (snap.ask) {
-      modal.append(h2(snap.ask.prompt));
-      snap.ask.options.forEach((o, i) => {
-        const row = document.createElement("div");
-        row.className = "opt" + (o.chosen ? " on" : "");
-        const mark = document.createElement("span");
-        mark.textContent = o.chosen ? (snap.ask.allow_multiple ? "☑" : "●") : (snap.ask.allow_multiple ? "☐" : "○");
-        const lab = document.createElement("span");
-        lab.textContent = o.label;
-        row.append(mark, lab);
+    } else if (o.ask) {
+      modal.append(h2(o.ask.prompt));
+      o.ask.options.forEach((opt, i) => {
+        const row = el("div", "opt" + (opt.chosen ? " on" : ""));
+        row.append(el("span", "", opt.chosen ? (o.ask.allow_multiple ? "☑" : "●") : (o.ask.allow_multiple ? "☐" : "○")), el("span", "", opt.label));
         row.addEventListener("click", () => send({ type: "ask_toggle", index: i }));
-        if (o.input) {
-          const inp = document.createElement("input");
+        if (opt.input) {
+          const inp = el("input");
           inp.type = "text";
-          inp.value = o.value;
+          inp.value = opt.value;
           inp.addEventListener("click", (e) => e.stopPropagation());
           inp.addEventListener("input", () => send({ type: "ask_fill", index: i, text: inp.value }));
           row.append(inp);
         }
         modal.append(row);
       });
-      addBtns(modal, [
-        ["取消", () => send({ type: "ask_cancel" })],
-        ["確定", () => send({ type: "ask_confirm" })],
-      ]);
-    } else if (snap.picker) {
+      addBtns(modal, [["取消", () => send({ type: "ask_cancel" })], ["確定", () => send({ type: "ask_confirm" })]]);
+    } else if (o.picker) {
       modal.append(h2("選擇工作目錄"));
-      const inp = document.createElement("input");
+      const inp = el("input");
       inp.type = "text";
-      inp.value = snap.picker.path;
-      inp.style.width = "100%";
+      inp.value = o.picker.path;
       inp.addEventListener("input", () => send({ type: "ws_set_path", text: inp.value }));
       modal.append(inp);
-      if (snap.picker.notice) {
-        const n = document.createElement("p");
-        n.textContent = snap.picker.notice;
-        modal.append(n);
-      }
-      snap.picker.entries.forEach((e, i) => {
-        const row = document.createElement("div");
-        row.className = "entry" + (i === snap.picker.cursor ? " on" : "");
-        row.textContent = (e.is_parent ? ".." : e.name) + (e.is_dir && !e.is_parent ? "/" : "");
+      if (o.picker.notice) modal.append(el("p", "hint", o.picker.notice));
+      o.picker.entries.forEach((e, i) => {
+        const row = el("div", "entry" + (i === o.picker.cursor ? " on" : ""), (e.is_parent ? ".." : e.name) + (e.is_dir && !e.is_parent ? "/" : ""));
         row.addEventListener("click", () => send({ type: "ws_select", index: i }));
         row.addEventListener("dblclick", () => send({ type: "ws_enter" }));
         modal.append(row);
       });
-      addBtns(modal, [
-        ["取消", () => send({ type: "ws_cancel" })],
-        ["建立資料夾", () => send({ type: "ws_create" })],
-        ["確定", () => send({ type: "ws_confirm" })],
-      ]);
-    } else if (snap.skill_view) {
-      modal.append(h2(snap.skill_view.title + "  ·  " + snap.skill_view.origin));
-      const pre = document.createElement("pre");
-      pre.textContent = snap.skill_view.body;
-      modal.append(pre);
+      addBtns(modal, [["取消", () => send({ type: "ws_cancel" })], ["建立資料夾", () => send({ type: "ws_create" })], ["確定", () => send({ type: "ws_confirm" })]]);
+    } else if (o.skill_view) {
+      modal.append(h2(o.skill_view.title + "  ·  " + o.skill_view.origin));
+      modal.append(el("pre", "", o.skill_view.body));
       addClose(modal, () => send({ type: "close_skill" }));
-    } else if (snap.inspector) {
-      modal.append(h2(snap.inspector.kind + "  " + snap.inspector.name));
-      const body = document.createElement("pre");
-      if (snap.inspector.kind === "child") {
-        const c = snap.rail.children.find((x) => x.name === snap.inspector.name);
-        body.textContent = c ? `${c.status}\n${c.prompt}\n${c.card_url}\n\n${c.log.join("\n")}` : "";
-      } else if (snap.inspector.kind === "monitor") {
-        const m = snap.rail.monitors.find((x) => x.name === snap.inspector.name);
-        body.textContent = m ? `pid ${m.pid}\n${m.command}\n${m.detail}` : "";
-      } else {
-        const b = snap.rail.backgrounds.find((x) => x.name === snap.inspector.name);
-        body.textContent = b ? `pid ${b.pid}\n${b.command}\n${b.detail}\n\n${(b.log || []).join("\n")}` : "";
-      }
-      modal.append(body);
+    } else if (o.inspector) {
+      const m = logs.rail.monitors.find((x) => x.name === o.inspector.name);
+      modal.append(h2("監控  " + o.inspector.name));
+      modal.append(el("pre", "", m ? `pid ${m.pid}\n${m.command}\n${m.status}\n${m.detail}` : "已不存在"));
       addClose(modal, () => send({ type: "close_inspector" }));
-    } else if (snap.tool_panel) {
-      const g = snap.rows[snap.tool_panel.group];
-      const c = g && g.calls ? g.calls[snap.tool_panel.item] : null;
-      modal.append(h2(c ? c.name : "工具"));
+    } else if (o.agent_info) {
+      const a = agentOf(o.agent_info);
+      modal.append(h2("子代理  " + o.agent_info));
+      if (a) {
+        const card = el("div", "agent-card");
+        card.append(el("div", "state-" + a.state, `${STATE_ICON[a.state] || ""} ${a.label}${a.turn ? " · 第" + a.turn + "輪" : ""} · 工具 ${a.tools}`));
+        if (a.model) card.append(el("div", "dim", "模型  " + a.model));
+        if (a.activity) card.append(el("div", "dim", "目前  " + a.activity));
+        modal.append(card, el("h2", "", "任務說明"), el("pre", "", a.prompt || "（無）"));
+      }
+      addClose(modal, () => send({ type: "close_agent_info" }));
+    } else if (o.tool_panel) {
+      const c = toolCall(o.tool_panel);
+      modal.append(h2((o.tool_panel.view ? `[${o.tool_panel.view}] ` : "") + (c ? `${c.name} · ${c.phase}` : "工具")));
       if (c) {
-        const pre = document.createElement("pre");
-        pre.textContent = c.args + "\n\n" + c.output;
-        modal.append(pre);
+        modal.append(el("pre", "", c.args));
+        if (c.output) modal.append(el("pre", "", c.output));
         c.files.forEach((f) => {
-          const wrap = document.createElement("div");
+          const wrap = el("div");
           wrap.innerHTML = f.diff_html;
           modal.append(wrap);
         });
+      } else {
+        modal.append(el("p", "hint", "這次工具呼叫已不在紀錄中"));
       }
       addClose(modal, () => send({ type: "close_tool" }));
-    } else if (snap.settings) {
+    } else if (o.settings) {
       modal.classList.add("settings");
-      buildSettingsModal(modal, snap.settings);
+      buildSettingsModal(modal, o.settings);
     }
     overlay.append(modal);
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
     modal.setAttribute("aria-label", modal.querySelector("h2")?.textContent || "詳情");
-    modal.querySelectorAll("input, textarea, select").forEach((el, i) => {
-      if (!el.dataset.field) el.dataset.field = "input-" + i;
-    });
+    modal.querySelectorAll("input, textarea, select").forEach((x, i) => { if (!x.dataset.field) x.dataset.field = "input-" + i; });
     if (settingsFocus && activeValue !== null) {
       const input = modal.querySelector(`[data-field="${settingsFocus.key}"]`);
       if (input) input.value = activeValue;
@@ -816,16 +1002,12 @@
   function buildSettingsModal(modal, st) {
     modal.replaceChildren();
     modal.append(h2("設定"));
-    const kindRow = document.createElement("div");
-    kindRow.className = "field";
+    const kindRow = el("div", "field");
     kindRow.append(label("連線方式"));
-    const seg = document.createElement("div");
-    seg.className = "seg";
+    const seg = el("div", "seg");
     [["xai", "Grok"], ["openai", "自訂 API"]].forEach(([id, name]) => {
-      const b = document.createElement("button");
+      const b = el("button", (st.kind || "xai") === id ? "on" : "", name);
       b.type = "button";
-      b.textContent = name;
-      if ((st.kind || "xai") === id) b.classList.add("on");
       b.addEventListener("click", () => send({ type: "set_provider_kind", kind: id }));
       seg.append(b);
     });
@@ -833,20 +1015,11 @@
     modal.append(kindRow);
 
     if ((st.kind || "xai") === "openai") {
-      const hint = document.createElement("p");
-      hint.className = "hint";
-      hint.textContent = "填寫 OpenAI 相容端點。切回 Grok 會自動恢復 Grok 模型，自訂端點仍會保留。";
-      modal.append(hint);
+      modal.append(el("p", "hint", "填寫 OpenAI 相容端點。切回 Grok 會自動恢復 Grok 模型，自訂端點仍會保留。"));
       modal.append(textField("端點", "endpoint", st.base_url || "", (v) => send({ type: "set_endpoint", text: v })));
       if (st.custom_models) {
         modal.append(selectField("模型（端點＋Grok）", "model", st.models, snap.header.model, (id) => send({ type: "set_model", id })));
-        modal.append(selectField(
-          "子代理模型",
-          "child_model",
-          [["", "跟隨主模型"], ...(st.models || [])],
-          st.child_model || "",
-          (id) => send({ type: "set_child_model", id }),
-        ));
+        modal.append(selectField("子代理模型", "child_model", [["", "跟隨主模型"], ...(st.models || [])], st.child_model || "", (id) => send({ type: "set_child_model", id })));
       } else {
         modal.append(textField("模型名", "model", snap.header.model, (v) => send({ type: "set_model", id: v })));
         modal.append(textField("子代理模型（留空＝同主模型）", "child_model", st.child_model || "", (v) => send({ type: "set_child_model", id: v })));
@@ -854,28 +1027,20 @@
       modal.append(textField("API 金鑰", "api_key", st.api_key || "", (v) => send({ type: "set_api_key", text: v }), true));
       modal.append(textField("上下文", "context", st.context || "", (v) => send({ type: "set_context", text: v })));
     } else {
-      const hint = document.createElement("p");
-      hint.className = "hint";
-      hint.textContent = "使用 xAI Grok 訂閱 OAuth。若剛從自訂 API 切換，模型會回到 Grok 目錄。";
-      modal.append(hint);
-      const acc = document.createElement("div");
-      acc.className = "field";
+      modal.append(el("p", "hint", "使用 xAI Grok 訂閱 OAuth。若剛從自訂 API 切換，模型會回到 Grok 目錄。"));
+      const acc = el("div", "field");
       acc.append(label("帳號"));
-      const btn = document.createElement("button");
+      const btn = el("button");
       btn.type = "button";
       if (st.login === "waiting") {
         btn.textContent = "取消登入";
         btn.addEventListener("click", () => send({ type: "login" }));
-        const code = document.createElement("p");
-        code.className = "hint";
-        code.textContent = `在瀏覽器核准：${st.login_code || ""}`;
-        acc.append(btn, code);
+        acc.append(btn, el("p", "hint", `在瀏覽器核准：${st.login_code || ""}`));
         if (st.login_url) {
-          const a = document.createElement("a");
+          const a = el("a", "", "開啟登入頁");
           a.href = st.login_url;
           a.target = "_blank";
           a.rel = "noreferrer";
-          a.textContent = "開啟登入頁";
           acc.append(a);
         }
       } else if (snap.header.logged_in) {
@@ -889,46 +1054,31 @@
       }
       modal.append(acc);
       modal.append(selectField("模型", "model", st.models, snap.header.model, (id) => send({ type: "set_model", id })));
-      modal.append(selectField(
-        "子代理模型",
-        "child_model",
-        [["", "跟隨主模型"], ...(st.models || [])],
-        st.child_model || "",
-        (id) => send({ type: "set_child_model", id }),
-      ));
+      modal.append(selectField("子代理模型", "child_model", [["", "跟隨主模型"], ...(st.models || [])], st.child_model || "", (id) => send({ type: "set_child_model", id })));
       modal.append(selectField("思考強度", "effort", st.efforts, effortId(st), (id) => send({ type: "set_effort", id })));
-      const search = document.createElement("button");
+      const search = el("button", "", st.web_search ? "搜尋：開" : "搜尋：關");
       search.type = "button";
-      search.textContent = st.web_search ? "搜尋：開" : "搜尋：關";
       search.addEventListener("click", () => send({ type: "toggle_search" }));
       modal.append(search);
     }
-
-    const disp = document.createElement("button");
+    const disp = el("button", "", st.dispatcher ? "調度員模式：開" : "調度員模式：關");
     disp.type = "button";
-    disp.textContent = st.dispatcher ? "調度員模式：開" : "調度員模式：關";
     disp.title = "開啟後模型只負責規劃並指揮子代理，盡量不直接動手";
     disp.addEventListener("click", () => send({ type: "toggle_dispatcher" }));
     modal.append(disp);
-
-    const ic = document.createElement("button");
+    const ic = el("button", "", st.import_claude ? "Claude 技能：開" : "Claude 技能：關");
     ic.type = "button";
-    ic.textContent = st.import_claude ? "Claude 技能：開" : "Claude 技能：關";
     ic.addEventListener("click", () => send({ type: "toggle_import_claude" }));
-    const ix = document.createElement("button");
+    const ix = el("button", "", st.import_codex ? "Codex 技能：開" : "Codex 技能：關");
     ix.type = "button";
-    ix.textContent = st.import_codex ? "Codex 技能：開" : "Codex 技能：關";
     ix.addEventListener("click", () => send({ type: "toggle_import_codex" }));
     modal.append(ic, ix);
     st.skills.forEach((sk, i) => {
-      const row = document.createElement("div");
-      row.className = "skill";
-      const tog = document.createElement("button");
+      const row = el("div", "skill");
+      const tog = el("button", "", sk.enabled ? "開" : "關");
       tog.type = "button";
-      tog.textContent = sk.enabled ? "開" : "關";
       tog.addEventListener("click", () => send({ type: "toggle_skill", index: i }));
-      const name = document.createElement("span");
-      name.textContent = `${sk.name}  (${sk.origin})`;
+      const name = el("span", "", `${sk.name}  (${sk.origin})`);
       name.style.cursor = "pointer";
       name.addEventListener("click", () => send({ type: "open_skill", index: i }));
       row.append(tog, name);
@@ -937,46 +1087,27 @@
     addClose(modal, () => send({ type: "close_settings" }));
   }
 
-  function updateSettingsModal(modal, st) {
-    // Rebuild contents but keep the same modal node for focus restore.
-    buildSettingsModal(modal, st);
-  }
-
   function effortId(st) {
     const hit = (st.efforts || []).find((e) => e[1] === snap.header.effort || e[0] === snap.header.effort);
     return hit ? hit[0] : "";
   }
-
-  function h2(t) {
-    const e = document.createElement("h2");
-    e.textContent = t;
-    return e;
-  }
-  function label(t) {
-    const e = document.createElement("label");
-    e.textContent = t;
-    return e;
-  }
-  function addClose(modal, fn) {
-    addBtns(modal, [["關閉", fn]]);
-  }
+  function h2(t) { return el("h2", "", t); }
+  function label(t) { return el("label", "", t); }
+  function addClose(modal, fn) { addBtns(modal, [["關閉", fn]]); }
   function addBtns(modal, items) {
-    const row = document.createElement("div");
-    row.className = "row-btns";
+    const row = el("div", "row-btns");
     items.forEach(([t, fn]) => {
-      const b = document.createElement("button");
+      const b = el("button", "", t);
       b.type = "button";
-      b.textContent = t;
       b.addEventListener("click", fn);
       row.append(b);
     });
     modal.append(row);
   }
   function textField(title, key, current, onChange, secret) {
-    const wrap = document.createElement("div");
-    wrap.className = "field";
+    const wrap = el("div", "field");
     wrap.append(label(title));
-    const inp = document.createElement("input");
+    const inp = el("input");
     inp.type = secret ? "password" : "text";
     inp.value = current || "";
     inp.setAttribute("data-field", key);
@@ -986,104 +1117,91 @@
     return wrap;
   }
   function selectField(title, key, pairs, current, onChange) {
-    const wrap = document.createElement("div");
-    wrap.className = "field";
+    const wrap = el("div", "field");
     wrap.append(label(title));
-    const sel = document.createElement("select");
+    const sel = el("select");
     sel.setAttribute("data-field", key);
     (pairs || []).forEach(([id, name]) => {
-      const o = document.createElement("option");
-      o.value = id;
-      o.textContent = name || id;
-      if (id === current) o.selected = true;
-      sel.append(o);
+      const opt = el("option", "", name || id);
+      opt.value = id;
+      if (id === current) opt.selected = true;
+      sel.append(opt);
     });
     if (!(pairs || []).length) {
-      const o = document.createElement("option");
-      o.value = current || "";
-      o.textContent = current ? `${current}（載入目錄中…）` : "尚無模型";
-      o.selected = true;
-      sel.append(o);
+      const opt = el("option", "", current ? `${current}（載入目錄中…）` : "尚無模型");
+      opt.value = current || "";
+      opt.selected = true;
+      sel.append(opt);
     }
     sel.addEventListener("change", () => onChange(sel.value));
     wrap.append(sel);
     return wrap;
   }
 
-  $("new-chat").addEventListener("click", () => {
-    setSidebar(false);
-    send({ type: "new_chat" });
-  });
-  $("menu-toggle").addEventListener("click", () => {
-    setSidebar(!appEl.classList.contains("sidebar-open"));
-  });
-  $("sidebar-close").addEventListener("click", () => setSidebar(false));
-  $("rail-toggle").addEventListener("click", () => {
-    railManual = !appEl.classList.contains("rail-open");
-    setRailOpen(railManual);
-  });
-  $("rail-close").addEventListener("click", () => {
-    railManual = false;
-    setRailOpen(false);
-  });
-  scrim.addEventListener("click", () => {
-    setSidebar(false);
-    railManual = false;
-    setRailOpen(false);
-  });
-  $("task").addEventListener("click", () => send({ type: "open_task" }));
-  $("gear").addEventListener("click", () => send({ type: "open_settings" }));
-  $("mode-queue").addEventListener("click", () => { sendMode = "queue"; if (snap) applySnapshot(snap); });
-  $("mode-insert").addEventListener("click", () => { sendMode = "insert"; if (snap) applySnapshot(snap); });
+  // —— Wiring ——
+  document.querySelectorAll(".act[data-view]").forEach((b) => b.addEventListener("click", () => setSide(b.dataset.view)));
+  $("act-settings").addEventListener("click", () => send({ type: "open_settings" }));
+  $("side-scrim").addEventListener("click", () => { sideOpen = false; renderAll(); });
+  $("panel-close").addEventListener("click", () => setPanel(null));
+  $("mode-queue").addEventListener("click", () => { sendMode = "queue"; renderAll(); });
+  $("mode-insert").addEventListener("click", () => { sendMode = "insert"; renderAll(); });
   $("send-message").addEventListener("click", () => submitMessage());
   $("jump-bottom").addEventListener("click", () => { stick = true; chat.scrollTop = chat.scrollHeight; $("jump-bottom").classList.add("hidden"); });
-  overlay.addEventListener("compositionstart", () => { overlayComposing = true; });
-  overlay.addEventListener("compositionend", () => { overlayComposing = false; });
   $("paste-image").addEventListener("click", () => send({ type: "paste_image" }));
   $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+  overlay.addEventListener("compositionstart", () => { overlayComposing = true; });
+  overlay.addEventListener("compositionend", () => { overlayComposing = false; });
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) {
-      const snap = overlaySnapshot();
-      if (snap.queue_editor) { send({ type: "close_queue_editor" }); return; }
-      if (snap && snap.image_view) send({ type: "close_image" });
-      else if (snap && snap.task) send({ type: "close_task" });
-      else if (snap && snap.settings) send({ type: "close_settings" });
-      else if (snap && snap.inspector) send({ type: "close_inspector" });
-      else if (snap && snap.skill_view) send({ type: "close_skill" });
-      else if (snap && snap.tool_panel) send({ type: "close_tool" });
-      else if (snap && snap.ask) send({ type: "ask_cancel" });
-      else if (snap && snap.picker) send({ type: "ws_cancel" });
-      else if (snap && snap.rename) send({ type: "cancel_rename" });
-    }
+    if (e.target !== overlay) return;
+    const o = overlaySnapshot();
+    if (!o) return;
+    if (o.queue_editor) send({ type: "close_queue_editor" });
+    else if (o.image_view) send({ type: "close_image" });
+    else if (o.task) send({ type: "close_task" });
+    else if (o.settings) send({ type: "close_settings" });
+    else if (o.inspector) send({ type: "close_inspector" });
+    else if (o.agent_info) send({ type: "close_agent_info" });
+    else if (o.skill_view) send({ type: "close_skill" });
+    else if (o.tool_panel) send({ type: "close_tool" });
+    else if (o.ask) send({ type: "ask_cancel" });
+    else if (o.picker) send({ type: "ws_cancel" });
+    else if (o.rename) send({ type: "cancel_rename" });
   });
   document.addEventListener("keydown", (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && !e.shiftKey && (e.key === "b" || e.key === "B")) { e.preventDefault(); setSide(); return; }
+    if (mod && !e.shiftKey && (e.key === "j" || e.key === "J")) { e.preventDefault(); setPanel(); return; }
+    if (e.altKey && /^[0-5]$/.test(e.key)) {
+      e.preventDefault();
+      if (e.key === "0") activate("");
+      else setSide(["sessions", "agents", "changes", "background", "task"][Number(e.key) - 1]);
+      return;
+    }
+    if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault();
+      cycleTab(e.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
     if (e.key === "Escape") {
       if (!overlay.classList.contains("hidden")) { overlay.click(); e.preventDefault(); }
-      else if (appEl.classList.contains("rail-open")) { railManual = false; setRailOpen(false); }
-      else if (appEl.classList.contains("sidebar-open")) setSidebar(false);
+      else if (sideOpen && narrow.matches) { sideOpen = false; renderAll(); }
+      else if (activeTab) activate("");
       else if (snap?.header.running) send({ type: "interrupt" });
+      return;
     }
     if (e.key === "Tab" && !overlay.classList.contains("hidden")) {
-      const items = [...overlay.querySelectorAll("button, input, textarea, select, [tabindex='0']")].filter(el => !el.disabled);
+      const items = [...overlay.querySelectorAll("button, input, textarea, select, [tabindex='0']")].filter(x => !x.disabled);
       const first = items[0], last = items[items.length - 1];
       if (items.length && (!overlay.contains(document.activeElement) || (e.shiftKey && document.activeElement === first) || (!e.shiftKey && document.activeElement === last))) {
         e.preventDefault(); (e.shiftKey ? last : first).focus();
       }
     }
   });
-  const wide = window.matchMedia("(min-width: 1200px)");
-  function layout() {
-    appEl.classList.toggle("sidebar-pinned", wide.matches);
-    appEl.classList.toggle("rail-pinned", wide.matches);
-    setSidebar(false); setRailOpen(false); railManual = false;
-  }
-  wide.addEventListener("change", layout);
-  layout();
+  narrow.addEventListener("change", () => { sideOpen = !narrow.matches; renderAll(); });
 
   function connect() {
     if (!token) {
-      $("status-line").textContent = "缺少存取 token";
-      $("meta-line").textContent = "請從 TUI 開啟的網址進入";
+      $("status-left").textContent = "缺少存取 token · 請從 TUI 開啟的網址進入";
       connectionState(false, "缺少連線資訊 · 請使用 TUI 提供的網址");
       return;
     }
@@ -1092,9 +1210,11 @@
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === "hello" || msg.type === "snapshot") {
-        connectionState(true, "● 已連線 · 工作狀態即時同步");
-        applySnapshot(msg.snapshot);
+      if (msg.type === "hello") {
+        connectionState(true, "● 已連線");
+        onHello(msg);
+      } else if (msg.type === "delta") {
+        onDelta(msg);
       }
     };
     ws.onclose = () => {

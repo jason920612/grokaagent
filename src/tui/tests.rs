@@ -109,7 +109,7 @@
     }
 
     #[test]
-    fn child_and_monitor_fill_the_side_rail() {
+    fn child_gets_a_read_only_transcript_tab_and_monitor_fills_the_side_view() {
         let mut app = test_app();
         app.current_id = "r".into();
         app.session.id = "r".into();
@@ -119,7 +119,7 @@
             name: "coder".into(),
             agent_card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
             prompt: "fix src/a.rs".into(),
-            model: String::new(),
+            model: "grok-3-mini".into(),
         });
         app.route_event(AgentEvent::AgentMessage {
             meta: meta.clone(),
@@ -134,44 +134,139 @@
             pid: 4242,
         });
         assert!(app.has_side());
-        assert_eq!(app.children.len(), 1);
-        assert_eq!(app.children[0].prompt, "fix src/a.rs");
-        assert_eq!(app.children[0].messages.len(), 1);
-        assert_eq!(app.children[0].messages[0].from, "root");
+        assert_eq!(app.bench.agents.len(), 1);
+        let tab = &app.bench.agents[0];
+        assert_eq!(tab.path, "coder");
+        assert_eq!(tab.prompt, "fix src/a.rs");
+        assert_eq!(tab.model, "grok-3-mini");
+        assert_eq!(tab.state, AgentState::Starting);
+        assert!(
+            matches!(tab.view.rows.first(), Some(Row::User(u)) if u.text == "fix src/a.rs"),
+            "the parent's instruction opens the child transcript"
+        );
         assert_eq!(app.monitors[0].command, "python hook.py");
         assert_eq!(app.monitors[0].pid, 4242);
 
-        let child_meta = crate::events::EventMeta {
+        let child_meta = |path: &str, run: &str| crate::events::EventMeta {
             ts: chrono::Utc::now(),
-            agent_name: "coder".into(),
-            run_id: "child-run".into(),
+            agent_name: path.rsplit('/').next().unwrap().into(),
+            run_id: run.into(),
             parent_run_id: Some("r".into()),
-            path: String::new(),
+            path: path.into(),
         };
         let before = app.rows.len();
+        app.route_event(AgentEvent::TurnStarted { meta: child_meta("coder", "c1"), turn: 1 });
         app.route_event(AgentEvent::ModelDelta {
-            meta: child_meta,
+            meta: child_meta("coder", "c1"),
             text: "reading the file".into(),
         });
+        app.route_event(AgentEvent::ToolStarted {
+            meta: child_meta("coder", "c1"),
+            call_id: "k1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "src/a.rs"}),
+            kind: "client".into(),
+        });
         assert_eq!(app.rows.len(), before, "child work must not land in parent chat");
-        assert!(
-            app.children[0]
-                .log
-                .iter()
-                .any(|l| l.contains("reading the file")),
-            "{:?}",
-            app.children[0].log
-        );
+        let tab = app.bench.agent("coder").unwrap();
+        assert_eq!(tab.state, AgentState::Working);
+        assert!(tab.view.rows.iter().any(|r| matches!(r, Row::Agent(a) if a.text.contains("reading the file"))));
+        assert!(tab.view.rows.iter().any(|r| matches!(r, Row::Tools(g) if g.calls[0].call_id == "k1")));
+        assert_eq!(app.bench.tool_log.back().map(|t| t.path.as_str()), Some("coder"));
 
-        app.inspector = Some(Inspector::Child("coder".into()));
-        app.focus = Focus::Inspector;
-        app.close_inspector();
-        assert!(app.inspector.is_none());
-        assert!(matches!(app.focus, Focus::Chat));
+        // A grandchild spawned by coder shows up nested under it.
+        app.route_event(AgentEvent::ChildSpawned {
+            meta: child_meta("coder", "c1"),
+            name: "lint".into(),
+            agent_card_url: String::new(),
+            prompt: "run clippy".into(),
+            model: String::new(),
+        });
+        app.route_event(AgentEvent::ModelDelta {
+            meta: child_meta("coder/lint", "g1"),
+            text: "clippy clean".into(),
+        });
+        let lint = app.bench.agent("coder/lint").expect("grandchild tab");
+        assert_eq!(lint.depth(), 1);
+        assert!(lint.view.rows.iter().any(|r| matches!(r, Row::Agent(a) if a.text == "clippy clean")));
+
+        // Going idle after a natural stop.
+        app.route_event(AgentEvent::ModelFinished {
+            meta: child_meta("coder", "c1"),
+            text: "done".into(),
+            finish: "stop".into(),
+            input_tokens: 0,
+            cached_tokens: 0,
+        });
+        app.route_event(AgentEvent::AwaitingInput { meta: child_meta("coder", "c1") });
+        assert_eq!(app.bench.agent("coder").unwrap().state, AgentState::Idle);
+
+        app.route_event(AgentEvent::ChildExited {
+            meta: meta.clone(),
+            name: "coder".into(),
+            detail: "killed".into(),
+        });
+        assert_eq!(app.bench.agent("coder").unwrap().state, AgentState::Exited);
+        assert_eq!(app.bench.agent("coder/lint").unwrap().state, AgentState::Exited, "descendants die too");
+        assert_eq!(app.child_count, 0);
     }
 
     #[test]
-    fn gear_stays_clickable_when_the_side_rail_is_open() {
+    fn agent_tab_swaps_in_its_own_transcript_and_back() {
+        let mut app = test_app();
+        app.current_id = "r".into();
+        app.session.id = "r".into();
+        app.push(Row::Meta("root row".into()));
+        app.agent_spawned("", "coder", "fix", "");
+        app.with_agent("coder", |app| app.push(Row::Meta("child row".into())));
+        app.open_agent_tab("coder");
+        assert!(app.viewing_agent());
+        let seen = app.with_active_view(|app| app.rows.iter().filter_map(|r| match r {
+            Row::Meta(m) => Some(m.clone()),
+            _ => None,
+        }).collect::<Vec<_>>());
+        assert_eq!(seen, vec!["child row".to_string()]);
+        assert!(matches!(app.rows.last(), Some(Row::Meta(m)) if m == "root row"), "root rows stay in place");
+
+        let opts = test_opts("grok-4.6", ReasoningEffort::High);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| { let _ = draw_ui(f, &mut app, &opts, false); }).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("childrow"), "the child tab shows the child transcript");
+        assert!(!compact.contains("rootrow"));
+        assert!(compact.contains("唯讀"), "child tabs have no composer");
+        assert!(matches!(app.rows.last(), Some(Row::Meta(m)) if m == "root row"), "drawing restores root rows");
+
+        // Esc goes back to the main chat; typing on a child tab switches back too.
+        let (mut opts, sink, tx) = dummy_key_env();
+        handle_key(&mut app, &mut opts, KeyCode::Esc, KeyModifiers::NONE, &sink, &tx);
+        assert!(!app.viewing_agent());
+        app.open_agent_tab("coder");
+        handle_key(&mut app, &mut opts, KeyCode::Char('x'), KeyModifiers::NONE, &sink, &tx);
+        assert!(!app.viewing_agent());
+        assert_eq!(app.edit.text, "x");
+
+        app.open_agent_tab("coder");
+        app.close_agent_tab("coder");
+        assert!(app.bench.open.is_empty());
+        assert!(!app.viewing_agent());
+    }
+
+    #[test]
+    fn tool_rows_finish_by_call_id_not_name() {
+        let mut app = test_app();
+        app.push_tool_start("a".into(), "run_command".into(), serde_json::json!({"command": "one"}));
+        app.push_tool_start("b".into(), "run_command".into(), serde_json::json!({"command": "two"}));
+        app.finish_tool("a", "run_command", r#"{"exit_code":1}"#.into());
+        let Row::Tools(g) = &app.rows[0] else { panic!("tool row"); };
+        assert!(g.calls[0].done, "first call finished by id");
+        assert_eq!(g.calls[0].phase, "失敗");
+        assert!(!g.calls[1].done, "second call still running");
+    }
+
+    #[test]
+    fn gear_stays_clickable_on_the_status_bar() {
         let mut app = test_app();
         app.current_id = "r".into();
         app.session.id = "r".into();
@@ -183,6 +278,8 @@
             model: String::new(),
         });
         assert!(app.has_side());
+        app.side_open = true;
+        app.side_view = SideView::Agents;
         let opts = test_opts("grok-4.6", ReasoningEffort::High);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
@@ -198,17 +295,17 @@
             .find(|(_, h)| *h == Hit::Gear)
             .map(|(r, _)| *r)
             .expect("gear hit");
-        assert_eq!(gear.y, 0, "gear must stay on the top header row");
-        assert!(
-            gear.x + gear.width >= 110,
-            "gear must sit at the top-right, not left of the rail: {gear:?}"
-        );
-        assert_eq!(hit_at(&app.hits, gear.x, 0), Some(Hit::Gear));
-        assert_eq!(hit_at(&app.hits, gear.x + 1, 0), Some(Hit::Gear));
-        assert!(!matches!(
-            hit_at(&app.hits, gear.x, 0),
-            Some(Hit::RailChild(_)) | Some(Hit::RailMon(_)) | Some(Hit::RailBg(_))
-        ));
+        assert_eq!(gear.y, 23, "gear lives on the bottom status bar");
+        assert!(gear.x + gear.width >= 110, "gear must sit at the right: {gear:?}");
+        assert_eq!(hit_at(&app.hits, gear.x, 23), Some(Hit::Gear));
+        assert_eq!(hit_at(&app.hits, gear.x + 1, 23), Some(Hit::Gear));
+        let agent_row = app
+            .hits
+            .iter()
+            .find(|(_, h)| matches!(h, Hit::SideAgent(0)))
+            .map(|(r, _)| *r)
+            .expect("the agent tree lists coder");
+        assert_eq!(hit_at(&app.hits, agent_row.x + 2, agent_row.y), Some(Hit::SideAgent(0)));
     }
 
     #[test]
@@ -1190,8 +1287,8 @@
     fn failed_and_cancelled_tools_are_not_reported_as_success() {
         for (output, phase) in [(r#"{"exit_code":1}"#, "失敗"), (r#"{"error":"interrupted","cancelled":true}"#, "已停止")] {
             let mut app = test_app();
-            app.push_tool_start("run_command".into(), serde_json::json!({}));
-            app.finish_tool("run_command", output.into());
+            app.push_tool_start("c1".into(), "run_command".into(), serde_json::json!({}));
+            app.finish_tool("c1", "run_command", output.into());
             let Row::Tools(g) = &app.rows[0] else { panic!("tool row"); };
             assert_eq!(g.calls[0].phase, phase);
             assert!(g.calls[0].done);
@@ -1199,23 +1296,102 @@
     }
 
     #[test]
-    fn console_panels_render_at_terminal_sizes_and_scroll() {
-        for (width, height, panel) in [(80, 24, 0), (140, 40, 0), (80, 24, 1), (80, 24, 2)] {
-            let mut app = test_app();
-            app.panel = panel;
-            app.task = TaskHub::new("");
-            app.task.start_goal("驗證控制台");
-            let opts = test_opts("grok-4.6", ReasoningEffort::High);
-            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| { draw(f, &mut app, &opts); }).unwrap();
-            if panel == 0 && width == 80 { assert!(app.chat_inner.width >= 70); }
-            if panel == 2 || width == 140 {
-                let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
-                let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                assert!(compact.contains("工作詳情"));
-                assert!(compact.contains("驗證控制台"));
+    fn workbench_renders_at_terminal_sizes_with_every_view() {
+        for (width, height) in [(80, 24), (140, 40)] {
+            for view in SideView::ALL {
+                for bottom in [None, Some(BottomTab::Tools), Some(BottomTab::Output), Some(BottomTab::Events)] {
+                    let mut app = test_app();
+                    app.side_open = true;
+                    app.side_view = view;
+                    app.bottom = bottom;
+                    app.task = TaskHub::new("");
+                    app.task.start_goal("驗證控制台");
+                    app.agent_spawned("", "coder", "fix", "grok-3-mini");
+                    app.bench.log_event("", "error", "boom".into());
+                    let opts = test_opts("grok-4.6", ReasoningEffort::High);
+                    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|f| { draw(f, &mut app, &opts); }).unwrap();
+                    let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+                    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    if width >= SIDEBAR_MIN_TERM {
+                        assert!(compact.contains("主對話"), "tab strip at {width}x{height}");
+                    } else {
+                        // Narrow: the side bar floats over the editor.
+                        assert!(compact.contains(view.title()), "overlay {view:?} at {width}x{height}");
+                    }
+                    if width == 140 {
+                        assert!(app.chat_inner.width >= 70, "docked side bar leaves room for chat");
+                        assert!(compact.contains(view.title()), "side view title {view:?}");
+                    }
+                    if view == SideView::Task && width == 140 {
+                        assert!(compact.contains("驗證控制台"));
+                    }
+                    if bottom == Some(BottomTab::Events) && width >= SIDEBAR_MIN_TERM {
+                        assert!(compact.contains("boom"));
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn workbench_keys_toggle_side_bar_panel_and_tabs() {
+        let mut app = test_app();
+        app.agent_spawned("", "coder", "fix", "");
+        app.agent_spawned("", "tester", "test", "");
+        let (mut opts, sink, tx) = dummy_key_env();
+        app.side_open = true;
+        handle_key(&mut app, &mut opts, KeyCode::Char('b'), KeyModifiers::CONTROL, &sink, &tx);
+        assert!(!app.side_open);
+        handle_key(&mut app, &mut opts, KeyCode::Char('2'), KeyModifiers::ALT, &sink, &tx);
+        assert!(app.side_open);
+        assert_eq!(app.side_view, SideView::Agents);
+        handle_key(&mut app, &mut opts, KeyCode::Char('j'), KeyModifiers::CONTROL, &sink, &tx);
+        assert_eq!(app.bottom, Some(BottomTab::Tools));
+        handle_key(&mut app, &mut opts, KeyCode::F(4), KeyModifiers::NONE, &sink, &tx);
+        assert_eq!(app.bottom, None);
+
+        app.open_agent_tab("coder");
+        app.open_agent_tab("tester");
+        assert_eq!(app.bench.active.as_deref(), Some("tester"));
+        handle_key(&mut app, &mut opts, KeyCode::Left, KeyModifiers::ALT, &sink, &tx);
+        assert_eq!(app.bench.active.as_deref(), Some("coder"));
+        handle_key(&mut app, &mut opts, KeyCode::Char('0'), KeyModifiers::ALT, &sink, &tx);
+        assert!(app.bench.active.is_none());
+        handle_key(&mut app, &mut opts, KeyCode::Right, KeyModifiers::ALT, &sink, &tx);
+        assert_eq!(app.bench.active.as_deref(), Some("coder"));
+        handle_key(&mut app, &mut opts, KeyCode::Char('w'), KeyModifiers::CONTROL, &sink, &tx);
+        assert_eq!(app.bench.open, vec!["tester".to_string()]);
+    }
+
+    #[test]
+    fn workbench_clicks_open_agents_changes_and_tools() {
+        let mut app = test_app();
+        app.agent_spawned("", "coder", "fix", "");
+        app.with_agent("coder", |app| {
+            app.push_tool_start("w1".into(), "write_file".into(), serde_json::json!({"path": "a.rs"}));
+            app.finish_tool("w1", "write_file", r#"{"path":"a.rs","kind":"create","diff":"+x"}"#.into());
+        });
+        app.bench.tool_started("coder", "w1", "write_file", &serde_json::json!({"path": "a.rs"}));
+        assert!(handle_workbench_click(&mut app, Hit::SideAgent(0)));
+        assert_eq!(app.bench.active.as_deref(), Some("coder"));
+        assert!(handle_workbench_click(&mut app, Hit::EditorTab(0)));
+        assert!(app.bench.active.is_none());
+
+        let changes = app.all_file_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "coder");
+        assert!(handle_workbench_click(&mut app, Hit::SideChange(0)));
+        assert_eq!(app.bench.active.as_deref(), Some("coder"));
+        assert_eq!(app.bench.agent("coder").unwrap().view.open_tool, Some((0, 0)));
+
+        app.bench.active = None;
+        app.bottom = Some(BottomTab::Tools);
+        assert!(handle_workbench_click(&mut app, Hit::BottomRow(0)));
+        assert_eq!(app.bench.active.as_deref(), Some("coder"), "a tool row opens its agent tab");
+        assert!(handle_workbench_click(&mut app, Hit::EditorTabClose(1)));
+        assert!(app.bench.open.is_empty());
+        assert!(!handle_workbench_click(&mut app, Hit::Gear));
     }
 
     #[test]
@@ -1837,8 +2013,15 @@
     fn test_app() -> App {
         App {
             web_receipts: Vec::new(),
-            panel: 0,
-            panel_scroll: 0,
+            side_view: SideView::Sessions,
+            side_open: false,
+            side_scroll: 0,
+            bottom: None,
+            bottom_scroll: 0,
+            side_area: Rect::default(),
+            bottom_area: Rect::default(),
+            web_sent: HashMap::new(),
+            web_cache: HashMap::new(),
             rows: vec![],
             edit: Edit::default(),
             status: String::new(),
@@ -1932,7 +2115,7 @@
             last_graphic_blits: Vec::new(),
             image_hits: Vec::new(),
             image_view: None,
-            children: Vec::new(),
+            bench: Workbench::default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
@@ -1986,7 +2169,7 @@
             queue_edit: None,
             composer_stash: None,
             pending: Vec::new(),
-            children: Vec::new(),
+            bench: Workbench::default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
@@ -2210,6 +2393,7 @@
     #[test]
     fn tool_detail_shows_command_and_diff() {
         let call = ToolCall {
+            call_id: String::new(),
             name: "run_command".into(),
             args: serde_json::json!({"command": "git status"}),
             output: serde_json::json!({
@@ -2243,6 +2427,7 @@
         let mut app = test_app();
         app.push(Row::Tools(ToolGroup {
             calls: vec![ToolCall {
+                call_id: String::new(),
                 name: "list_dir".into(),
                 args: serde_json::json!({"path": "."}),
                 output: String::new(),
@@ -2640,10 +2825,11 @@
     }
 
     #[test]
-    fn finish_spawn_working_keeps_tool_open() {
+    fn finish_spawn_marks_the_tool_started_not_running() {
         let mut app = test_app();
         app.push(Row::Tools(ToolGroup {
             calls: vec![ToolCall {
+                call_id: "s1".into(),
                 name: "spawn_agent".into(),
                 args: serde_json::json!({"name": "coder"}),
                 output: String::new(),
@@ -2653,37 +2839,24 @@
             }],
             expanded: true,
         }));
-        let out = r#"{"name":"coder","state":"TASK_STATE_WORKING"}"#.to_string();
-        app.finish_tool("spawn_agent", out);
+        let out = r#"{"name":"coder","state":"working"}"#.to_string();
+        app.finish_tool("s1", "spawn_agent", out);
         let Row::Tools(g) = &app.rows[0] else {
             panic!("expected tool group");
         };
-        assert!(!g.calls[0].done);
+        assert!(g.calls[0].done, "a long-lived child must not keep the spawn call spinning");
         assert_eq!(g.calls[0].phase, "已啟動");
-        app.mark_spawn_tool_done("coder");
-        let Row::Tools(g) = &app.rows[0] else {
-            panic!("expected tool group");
-        };
-        assert!(g.calls[0].done);
-        assert_eq!(g.calls[0].phase, "完成");
     }
 
     #[test]
     fn side_pulse_when_child_alive() {
         let mut app = test_app();
         app.running = false;
-        app.children.push(SideChild {
-            name: "coder".into(),
-            prompt: "fix".into(),
-            card_url: String::new(),
-            status: "工作中".into(),
-            alive: true,
-            activity: String::new(),
-            log: Vec::new(),
-            messages: Vec::new(),
-        });
+        app.agent_spawned("", "coder", "fix", "");
         assert!(rail_needs_pulse(&app));
         assert!(side_pulse_ok(&app));
+        app.agent_exited("", "coder", "killed");
+        assert!(!rail_needs_pulse(&app));
     }
 
     #[test]
@@ -2756,7 +2929,7 @@
                 queue_edit: None,
                 composer_stash: None,
             pending: Vec::new(),
-            children: Vec::new(),
+            bench: Workbench::default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
@@ -2833,7 +3006,7 @@
                 queue_edit: None,
                 composer_stash: None,
             pending: Vec::new(),
-            children: Vec::new(),
+            bench: Workbench::default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
@@ -3046,6 +3219,7 @@
         let mut app = test_app();
         app.push(Row::Tools(ToolGroup {
             calls: vec![ToolCall {
+                call_id: String::new(),
                 name: "write_file".into(),
                 args: serde_json::json!({"path": "a.txt"}),
                 output: String::new(),
@@ -3219,11 +3393,6 @@
                 !frame.contains(Position { x: *x, y: *y }),
                 "clock cell ({x},{y}) inside composer {frame:?}"
             );
-            assert!(
-                *y < frame.y,
-                "clock row {y} must sit above composer y={}",
-                frame.y
-            );
         }
     }
 
@@ -3343,9 +3512,39 @@
         let snap = ui_snapshot(&app, &opts);
         assert_eq!(snap.composer.text, "typed");
         assert_eq!(snap.composer.seq, 4);
-        let user = snap.rows.iter().find(|r| r.kind == "user").unwrap();
+        let (patches, removed) = view_patches(&mut app);
+        assert!(removed.is_empty());
+        let main = patches.iter().find(|p| p.path.is_empty()).expect("main view");
+        let user = main.rows.iter().find(|r| r.kind == "user").unwrap();
         assert!(user.html.contains("&lt;b&gt;"), "{}", user.html);
         assert!(!user.html.contains("<b>"), "{}", user.html);
+    }
+
+    #[test]
+    fn web_patches_send_only_changed_rows_per_view() {
+        let mut app = test_app();
+        app.push(Row::Meta("one".into()));
+        app.push(Row::Meta("two".into()));
+        let (first, _) = view_patches(&mut app);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].from, first[0].len, first[0].rows.len()), (0, 2, 2));
+
+        let (none, _) = view_patches(&mut app);
+        assert!(none.is_empty(), "unchanged rows are not resent");
+
+        app.push(Row::Meta("three".into()));
+        app.agent_spawned("", "coder", "fix", "");
+        app.with_agent("coder", |app| app.push(Row::Meta("kid".into())));
+        let (next, _) = view_patches(&mut app);
+        let main = next.iter().find(|p| p.path.is_empty()).unwrap();
+        assert_eq!((main.from, main.len, main.rows.len()), (2, 3, 1), "only the appended row");
+        let kid = next.iter().find(|p| p.path == "coder").unwrap();
+        assert_eq!(kid.rows.len(), 1);
+
+        // Leaving the session drops the agent view.
+        app.bench = Workbench::default();
+        let (_, removed) = view_patches(&mut app);
+        assert_eq!(removed, vec!["coder".to_string()]);
     }
 
     #[test]
@@ -3440,29 +3639,24 @@
         assert_eq!(app.task.snapshot().phase, TaskPhase::Inactive);
         assert!(app.task_ui.is_none());
 
-        app.children.clear();
-        app.children.push(SideChild {
-            name: "coder".into(),
-            prompt: "fix".into(),
-            card_url: "http://127.0.0.1:9/.well-known/agent-card.json".into(),
-            status: "工作中".into(),
-            alive: true,
-            activity: "思考".into(),
-            log: vec!["hi".into()],
-            messages: vec![],
-        });
+        app.agent_spawned("", "coder", "fix", "grok-3-mini");
+        let logs = ui_logs(&app);
+        assert_eq!(logs.agents.len(), 1);
+        assert_eq!(logs.agents[0].path, "coder");
+        assert_eq!(logs.agents[0].model, "grok-3-mini");
+        assert_eq!(logs.agents[0].state, "starting");
 
-        apply_ui_command(
-            &mut app,
-            &mut opts,
-            &sink,
-            &done_tx,
-            UiCommand::OpenChild { name: "coder".into() },
-        );
-        assert!(matches!(app.inspector, Some(Inspector::Child(ref n)) if n == "coder"));
+        app.monitors.push(SideMon {
+            name: "hook".into(),
+            command: "python hook.py".into(),
+            pid: 7,
+            status: "執行中".into(),
+            alive: true,
+            detail: String::new(),
+        });
+        apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::OpenMonitor { name: "hook".into() });
         let snap = ui_snapshot(&app, &opts);
-        assert_eq!(snap.rail.children.len(), 1);
-        assert_eq!(snap.inspector.as_ref().unwrap().name, "coder");
+        assert_eq!(snap.inspector.as_ref().unwrap().name, "hook");
         apply_ui_command(&mut app, &mut opts, &sink, &done_tx, UiCommand::CloseInspector);
         assert!(app.inspector.is_none());
 
@@ -3490,8 +3684,8 @@
             .find(|(_, h)| *h == Hit::TaskChip)
             .map(|(r, _)| *r)
             .expect("task chip");
-        assert_eq!(chip.y, 0, "task chip must stay on the header");
-        assert_eq!(hit_at(&app.hits, chip.x, 0), Some(Hit::TaskChip));
+        assert_eq!(chip.y, 23, "task chip lives on the status bar");
+        assert_eq!(hit_at(&app.hits, chip.x, 23), Some(Hit::TaskChip));
     }
 
     #[test]
@@ -4035,3 +4229,4 @@
         assert_eq!(k.model, "qwen-2");
         assert!(k.server_tools.is_empty(), "xai search tools must not follow a custom model");
     }
+

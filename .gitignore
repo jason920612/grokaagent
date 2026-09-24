@@ -8,3 +8,4 @@
 *.pem
 xai-auth.json
 groka-events.jsonl
+groka-children/

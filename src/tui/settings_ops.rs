@@ -393,7 +393,7 @@ fn login_in_flight(ui: &LoginUi) -> bool {
 
 fn is_pulsing(app: &App) -> bool {
     app.running
-        || app.children.iter().any(|c| c.alive)
+        || app.bench.live_count() > 0
         || app.monitors.iter().any(|m| m.alive)
         || app.backgrounds.iter().any(|b| b.alive)
 }
@@ -412,7 +412,7 @@ fn header_pulse_ok(app: &App) -> bool {
 
 /// Side-rail spinners need a full redraw; header clock patch alone is not enough.
 fn rail_needs_pulse(app: &App) -> bool {
-    app.children.iter().any(|c| c.alive)
+    app.bench.live_count() > 0
         || app.monitors.iter().any(|m| m.alive)
         || app.backgrounds.iter().any(|b| b.alive)
 }
@@ -441,7 +441,7 @@ fn want_hardware_cursor(app: &App) -> bool {
         || app.focus == Focus::Rename
         || (app.focus == Focus::Settings && app.settings.as_ref().is_some_and(|s| !s.minimized))
         || app.queue_edit.is_some()
-        || app.focus == Focus::Chat
+        || (app.focus == Focus::Chat && !app.viewing_agent())
 }
 
 fn begin_login(app: &mut App) {
@@ -673,8 +673,7 @@ fn submit_task_goal(
     }
     app.task.start_goal(goal.clone());
     app.push(Row::Meta(format!("已啟動任務模式：{goal}")));
-    app.upsert_child(task::AGENT_NAME.into(), goal, String::new());
-    app.child_count = app.children.iter().filter(|c| c.alive).count() as u32;
+    app.bench.log_event("", "message", format!("任務目標：{goal}"));
     app.task_ui = Some(TaskUi::Status);
     app.focus = Focus::Task;
     ensure_task_run(app, opts, sink, done_tx);
@@ -689,10 +688,7 @@ fn end_task_mode(app: &mut App) {
         return;
     }
     app.task.end();
-    if let Some(c) = app.child_named_mut(task::AGENT_NAME) {
-        c.upsert_status("結束（使用者結束）".into(), false);
-    }
-    app.child_count = app.children.iter().filter(|c| c.alive).count() as u32;
+    app.bench.log_event("", "message", "任務模式由使用者結束".into());
     app.push(Row::Meta("已結束任務模式".into()));
     close_task(app);
 }

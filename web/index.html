@@ -4,42 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>grokaagent</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="app">
-    <aside id="sidebar">
-      <div class="sidebar-top">
-        <div class="sidebar-brand">grokaagent</div>
-        <button type="button" id="sidebar-close" class="icon-btn" title="關閉側欄" aria-label="關閉側欄">✕</button>
-      </div>
-      <button type="button" id="new-chat" class="primary">＋ 新工作</button>
-      <div id="sessions"></div>
+  <div id="app" class="side-open">
+    <nav id="activity" aria-label="檢視">
+      <button type="button" class="act" data-view="sessions" title="對話 (Alt+1)" aria-label="對話"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v10H9l-5 4z"/></svg></button>
+      <button type="button" class="act" data-view="agents" title="代理 (Alt+2)" aria-label="代理"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="18" r="2.2"/><path d="M12 7.2v4.3M12 11.5L6.8 16M12 11.5l5.2 4.5"/></svg><span class="badge hidden"></span></button>
+      <button type="button" class="act" data-view="changes" title="檔案變更 (Alt+3)" aria-label="檔案變更"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v12M6 16a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM18 8a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM18 8c0 5-12 4-12 8"/></svg><span class="badge hidden"></span></button>
+      <button type="button" class="act" data-view="background" title="背景工作 (Alt+4)" aria-label="背景工作"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg><span class="badge hidden"></span></button>
+      <button type="button" class="act" data-view="task" title="任務 (Alt+5)" aria-label="任務"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/></svg><span class="badge hidden"></span></button>
+      <div class="spacer"></div>
+      <button type="button" class="act" id="act-settings" title="設定" aria-label="設定"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg></button>
+    </nav>
+    <aside id="side" aria-label="側欄">
+      <header id="side-title"></header>
+      <div id="side-body"></div>
     </aside>
-    <div id="scrim" class="hidden" aria-hidden="true"></div>
-    <main>
-      <header id="header">
-        <div id="header-left">
-          <button type="button" id="menu-toggle" class="icon-btn" title="對話列表" aria-label="對話列表">☰</button>
-          <div class="header-copy">
-            <div id="brand">grokaagent</div>
-            <div id="status-line"></div>
-            <div id="meta-line"></div>
-          </div>
-        </div>
-        <div id="header-right">
-          <span id="provider-badge" class="badge hidden"></span>
-          <button type="button" id="rail-toggle" class="ghost" title="工作詳情">工作詳情</button>
-          <button type="button" id="task" class="ghost" title="任務模式">任務</button>
-          <button type="button" id="gear" class="ghost" title="設定">設定</button>
-        </div>
-      </header>
+    <div id="side-scrim" class="hidden" aria-hidden="true"></div>
+    <main id="editor">
+      <div id="tabs" role="tablist" aria-label="分頁"></div>
       <div id="connection" role="status" aria-live="polite">連線中…</div>
-      <section id="chat" aria-label="工作紀錄"></section>
-      <button type="button" id="jump-bottom" class="hidden">↓ 回到最新進度</button>
+      <div id="chat-wrap">
+        <section id="chat" aria-label="工作紀錄"></section>
+        <button type="button" id="jump-bottom" class="hidden">↓ 回到最新進度</button>
+      </div>
+      <div id="readonly" class="hidden" role="status"></div>
       <div id="tray">
         <div id="queue"></div>
         <div id="pending"></div>
@@ -56,16 +46,18 @@
           <div class="composer-actions"><span id="delivery" role="status" aria-live="polite">草稿只保留在此分頁</span><button type="button" id="send-message">送出</button></div>
         </div>
       </footer>
+      <section id="panel" class="hidden" aria-label="面板">
+        <div id="panel-head">
+          <div id="panel-tabs" role="tablist"></div>
+          <button type="button" id="panel-close" class="icon-btn" title="關閉面板 (Ctrl+J)" aria-label="關閉面板">✕</button>
+        </div>
+        <div id="panel-body"></div>
+      </section>
     </main>
-    <aside id="rail">
-      <div class="rail-head">
-        <h2>工作詳情</h2>
-        <button type="button" id="rail-close" class="icon-btn" title="關閉" aria-label="關閉活動">✕</button>
-      </div>
-      <div id="work-summary"></div>
-      <div id="rail-body"></div>
-      <div id="file-changes"></div>
-    </aside>
+    <footer id="statusbar">
+      <div id="status-left"></div>
+      <div id="status-right"></div>
+    </footer>
   </div>
   <div id="overlay" class="hidden"></div>
   <script src="app.js"></script>

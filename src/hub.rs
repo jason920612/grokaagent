@@ -1,5 +1,11 @@
-//! Loopback web mirror of the TUI: one App writer, snapshot over WebSocket.
+//! Loopback web mirror of the TUI: one App writer, deltas over WebSocket.
+//!
+//! The TUI publishes a small shell (header, composer, sessions, overlays),
+//! the workbench logs, and row patches per transcript view (`""` = main chat,
+//! `coder/lint` = a child agent). The hub keeps a full mirror so a new client,
+//! or one that missed a delta, gets a complete `hello`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,8 +37,39 @@ struct HubState {
     token: String,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     out: broadcast::Sender<String>,
-    latest: Arc<Mutex<String>>,
+    mirror: Arc<Mutex<Mirror>>,
     workspace: Arc<Mutex<PathBuf>>,
+}
+
+/// Everything a client needs to render from scratch.
+#[derive(Default)]
+struct Mirror {
+    seq: u64,
+    snapshot: Option<UiSnapshot>,
+    snapshot_json: String,
+    logs: Option<UiLogs>,
+    logs_json: String,
+    views: BTreeMap<String, Vec<UiRow>>,
+}
+
+impl Mirror {
+    fn hello(&self) -> Option<String> {
+        let snapshot = self.snapshot.clone()?;
+        let msg = ServerMsg::Hello {
+            seq: self.seq,
+            snapshot,
+            logs: self.logs.clone().unwrap_or_default(),
+            views: self
+                .views
+                .iter()
+                .map(|(path, rows)| UiView {
+                    path: path.clone(),
+                    rows: rows.clone(),
+                })
+                .collect(),
+        };
+        serde_json::to_string(&msg).ok()
+    }
 }
 
 pub struct Hub {
@@ -44,16 +81,52 @@ pub struct Hub {
 #[derive(Clone)]
 struct HubHandle {
     out: broadcast::Sender<String>,
-    latest: Arc<Mutex<String>>,
+    mirror: Arc<Mutex<Mirror>>,
     workspace: Arc<Mutex<PathBuf>>,
 }
 
 impl Hub {
-    pub fn publish(&self, msg: &ServerMsg) {
-        let json = serde_json::to_string(msg).unwrap_or_else(|_| "{}".into());
-        if let Ok(mut g) = self.handle.latest.lock() {
-            *g = json.clone();
+    /// Apply an update to the mirror and broadcast only what changed.
+    pub fn publish(
+        &self,
+        snapshot: UiSnapshot,
+        logs: UiLogs,
+        patches: Vec<UiViewPatch>,
+        removed: Vec<String>,
+    ) {
+        let Ok(mut m) = self.handle.mirror.lock() else {
+            return;
+        };
+        let snap_json = serde_json::to_string(&snapshot).unwrap_or_default();
+        let logs_json = serde_json::to_string(&logs).unwrap_or_default();
+        let snap_changed = snap_json != m.snapshot_json;
+        let logs_changed = logs_json != m.logs_json;
+        if !snap_changed && !logs_changed && patches.is_empty() && removed.is_empty() {
+            return;
         }
+        m.seq += 1;
+        for p in &patches {
+            let rows = m.views.entry(p.path.clone()).or_default();
+            rows.truncate(p.from.min(rows.len()));
+            rows.extend(p.rows.iter().cloned());
+            rows.truncate(p.len);
+        }
+        for path in &removed {
+            m.views.remove(path);
+        }
+        let msg = ServerMsg::Delta {
+            seq: m.seq,
+            snapshot: snap_changed.then(|| snapshot.clone()),
+            logs: logs_changed.then(|| logs.clone()),
+            views: patches,
+            removed,
+        };
+        m.snapshot = Some(snapshot);
+        m.snapshot_json = snap_json;
+        m.logs = Some(logs);
+        m.logs_json = logs_json;
+        let json = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
+        drop(m);
         let _ = self.handle.out.send(json);
     }
 
@@ -67,8 +140,95 @@ impl Hub {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    Hello { snapshot: UiSnapshot },
-    Snapshot { snapshot: UiSnapshot },
+    /// Full state: sent on connect and on a client's `resync`.
+    Hello {
+        seq: u64,
+        snapshot: UiSnapshot,
+        logs: UiLogs,
+        views: Vec<UiView>,
+    },
+    /// Changes since `seq - 1`. A client that sees a gap asks for `resync`.
+    Delta {
+        seq: u64,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        snapshot: Option<UiSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        logs: Option<UiLogs>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        views: Vec<UiViewPatch>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        removed: Vec<String>,
+    },
+}
+
+/// A transcript view: `""` = main chat, otherwise a child agent's path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiView {
+    pub path: String,
+    pub rows: Vec<UiRow>,
+}
+
+/// Replace rows `from..` of a view with `rows`; the view then has `len` rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiViewPatch {
+    pub path: String,
+    pub from: usize,
+    pub len: usize,
+    pub rows: Vec<UiRow>,
+}
+
+/// Workbench panels: agent tree, tool timeline, events, backgrounds.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct UiLogs {
+    pub agents: Vec<UiAgent>,
+    pub tools: Vec<UiToolEntry>,
+    pub events: Vec<UiEventEntry>,
+    pub rail: UiRail,
+    pub changes: Vec<UiChange>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiAgent {
+    pub path: String,
+    pub name: String,
+    pub depth: usize,
+    pub model: String,
+    pub state: String,
+    pub label: String,
+    pub activity: String,
+    pub alive: bool,
+    pub turn: u32,
+    pub tools: u32,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiToolEntry {
+    pub path: String,
+    pub call_id: String,
+    pub name: String,
+    pub line: String,
+    pub phase: String,
+    pub done: bool,
+    pub ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiEventEntry {
+    pub at: String,
+    pub path: String,
+    pub kind: String,
+    pub text: String,
+}
+
+/// One file change and where its tool call sits (`path` view, row, call).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiChange {
+    pub view: String,
+    pub row: usize,
+    pub call: usize,
+    pub path: String,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -76,12 +236,10 @@ pub struct UiSnapshot {
     pub session_id: String,
     pub header: UiHeader,
     pub composer: UiComposer,
-    pub rows: Vec<UiRow>,
     pub sessions: Vec<UiSession>,
     pub queue: Vec<UiQueued>,
     pub pending: Vec<String>,
     pub send_mode: String,
-    pub rail: UiRail,
     pub settings: Option<UiSettings>,
     #[serde(default)]
     pub settings_data: Option<UiSettings>,
@@ -152,6 +310,8 @@ pub struct UiRow {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiToolCall {
+    #[serde(default)]
+    pub call_id: String,
     pub name: String,
     pub phase: String,
     pub done: bool,
@@ -185,28 +345,8 @@ pub struct UiQueued {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UiRail {
-    pub children: Vec<UiChild>,
     pub monitors: Vec<UiMon>,
     pub backgrounds: Vec<UiBg>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UiChild {
-    pub name: String,
-    pub prompt: String,
-    pub status: String,
-    pub activity: String,
-    pub alive: bool,
-    pub card_url: String,
-    pub log: Vec<String>,
-    pub messages: Vec<UiSideMsg>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UiSideMsg {
-    pub from: String,
-    pub to: String,
-    pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -398,7 +538,6 @@ pub enum UiCommand {
     WsCancel,
     WsCreate,
     WsEnter,
-    OpenChild { name: String },
     OpenMonitor { name: String },
     OpenBackground { name: String },
     CloseInspector,
@@ -434,14 +573,14 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
     let addr = listener.local_addr().map_err(Error::Io)?;
     let url = format!("http://127.0.0.1:{}/?t={token}", addr.port());
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (out, _) = broadcast::channel(32);
-    let latest = Arc::new(Mutex::new(String::from("{}")));
+    let (out, _) = broadcast::channel(256);
+    let mirror = Arc::new(Mutex::new(Mirror::default()));
     let workspace = Arc::new(Mutex::new(workspace));
     let state = HubState {
         token: token.clone(),
         cmd_tx,
         out: out.clone(),
-        latest: latest.clone(),
+        mirror: mirror.clone(),
         workspace: workspace.clone(),
     };
     let app = Router::new()
@@ -460,10 +599,17 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
         cmd_rx,
         handle: HubHandle {
             out,
-            latest,
+            mirror,
             workspace,
         },
     }))
+}
+
+fn is_resync(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "resync"))
+        .unwrap_or(false)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -519,24 +665,31 @@ async fn ws_upgrade(
     ws.on_upgrade(move |socket| client_loop(socket, st))
 }
 
+fn mirror_hello(st: &HubState) -> Option<String> {
+    st.mirror.lock().ok().and_then(|m| m.hello())
+}
+
 async fn client_loop(mut socket: WebSocket, st: HubState) {
-    let hello = st
-        .latest
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    if !hello.is_empty() && hello != "{}" {
+    // Subscribe before reading the mirror so no delta falls in between.
+    let mut rx = st.out.subscribe();
+    if let Some(hello) = mirror_hello(&st) {
         if socket.send(Message::text(hello)).await.is_err() {
             return;
         }
     }
-    let mut rx = st.out.subscribe();
     loop {
         tokio::select! {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
+                        if is_resync(t.as_str()) {
+                            if let Some(hello) = mirror_hello(&st) {
+                                if socket.send(Message::text(hello)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         if let Ok(cmd) = serde_json::from_str::<UiCommand>(t.as_str()) {
                             if st.cmd_tx.send(cmd).is_err() {
                                 break;
@@ -555,7 +708,14 @@ async fn client_loop(mut socket: WebSocket, st: HubState) {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Missed deltas: send the full state instead.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(hello) = mirror_hello(&st) {
+                            if socket.send(Message::text(hello)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -709,6 +869,92 @@ mod tests {
             UiCommand::SetTaskDraft { text } => assert_eq!(text, "goal"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn ui_row(text: &str) -> UiRow {
+        UiRow {
+            kind: "meta".into(),
+            html: text.into(),
+            text: text.into(),
+            expanded: None,
+            done: None,
+            elapsed_ms: None,
+            images: vec![],
+            calls: vec![],
+            path: None,
+            label: None,
+        }
+    }
+
+    fn patch(path: &str, from: usize, len: usize, rows: &[&str]) -> UiViewPatch {
+        UiViewPatch {
+            path: path.into(),
+            from,
+            len,
+            rows: rows.iter().map(|r| ui_row(r)).collect(),
+        }
+    }
+
+    fn next_delta(rx: &mut broadcast::Receiver<String>) -> serde_json::Value {
+        serde_json::from_str(&rx.try_recv().expect("a delta")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn publish_sends_only_changes_and_keeps_a_full_mirror() {
+        std::env::set_var("GROKA_NO_WEB_OPEN", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let hub = start(dir.path().to_path_buf()).await.unwrap().expect("hub");
+        let mut rx = hub.handle.out.subscribe();
+        let snap = UiSnapshot {
+            session_id: "s".into(),
+            ..UiSnapshot::default()
+        };
+
+        hub.publish(snap.clone(), UiLogs::default(), vec![patch("", 0, 2, &["a", "b"])], vec![]);
+        let d = next_delta(&mut rx);
+        assert_eq!(d["type"], "delta");
+        assert_eq!(d["seq"], 1);
+        assert!(d.get("snapshot").is_some(), "first publish carries the shell");
+
+        hub.publish(snap.clone(), UiLogs::default(), vec![], vec![]);
+        assert!(rx.try_recv().is_err(), "nothing changed, nothing sent");
+
+        hub.publish(
+            snap.clone(),
+            UiLogs::default(),
+            vec![patch("", 1, 3, &["c", "d"]), patch("coder", 0, 1, &["kid"])],
+            vec![],
+        );
+        let d = next_delta(&mut rx);
+        assert_eq!(d["seq"], 2);
+        assert!(d.get("snapshot").is_none(), "unchanged shell is not resent");
+        assert_eq!(d["views"].as_array().unwrap().len(), 2);
+
+        hub.publish(snap, UiLogs::default(), vec![], vec!["coder".into()]);
+        let d = next_delta(&mut rx);
+        assert_eq!(d["seq"], 3);
+        assert_eq!(d["removed"][0], "coder");
+
+        let hello: serde_json::Value =
+            serde_json::from_str(&hub.handle.mirror.lock().unwrap().hello().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["seq"], 3);
+        let views = hello["views"].as_array().unwrap();
+        assert_eq!(views.len(), 1, "removed views leave the mirror");
+        let texts: Vec<&str> = views[0]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["a", "c", "d"], "patches applied from their offset");
+    }
+
+    #[test]
+    fn resync_is_recognised() {
+        assert!(is_resync(r#"{"type":"resync"}"#));
+        assert!(!is_resync(r#"{"type":"submit","insert":false}"#));
+        assert!(!is_resync("not json"));
     }
 
     #[test]

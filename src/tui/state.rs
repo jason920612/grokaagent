@@ -9,128 +9,6 @@ struct Win {
 }
 
 #[derive(Clone)]
-struct SideMsg {
-    from: String,
-    to: String,
-    text: String,
-}
-
-#[derive(Clone)]
-struct SideChild {
-    name: String,
-    prompt: String,
-    card_url: String,
-    status: String,
-    alive: bool,
-    activity: String,
-    log: Vec<String>,
-    messages: Vec<SideMsg>,
-}
-
-impl SideChild {
-    fn upsert_status(&mut self, status: String, alive: bool) {
-        self.status = status;
-        self.alive = alive;
-    }
-
-    fn push_log(&mut self, line: String) {
-        if line.is_empty() {
-            return;
-        }
-        if self.log.len() > 400 {
-            self.log.drain(0..150);
-        }
-        self.log.push(line);
-    }
-
-    fn append_log_prefix(&mut self, prefix: &str, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if let Some(last) = self.log.last_mut() {
-            if last.starts_with(prefix) {
-                last.push_str(text);
-                return;
-            }
-        }
-        self.push_log(format!("{prefix}{text}"));
-    }
-
-    fn apply_work(&mut self, ev: &AgentEvent) {
-        match ev {
-            AgentEvent::RunStarted { model, .. } => {
-                self.alive = true;
-                self.status = "工作中".into();
-                self.activity = format!("連線 {model}");
-            }
-            AgentEvent::TurnStarted { turn, .. } => {
-                self.alive = true;
-                self.status = format!("第 {turn} 輪");
-                self.activity = "思考中".into();
-            }
-            AgentEvent::ReasoningDelta { text, .. } => {
-                self.append_log_prefix("思考 ", text);
-                self.activity = "思考中".into();
-            }
-            AgentEvent::ModelDelta { text, .. } => {
-                self.append_log_prefix("grok ", text);
-                self.activity = "撰寫中".into();
-            }
-            AgentEvent::ModelFinished { text, .. } => {
-                if !text.is_empty() {
-                    // A think line may land after the streamed grok line; skip
-                    // over think lines (only) so the final text replaces the
-                    // streamed partial instead of appending a duplicate.
-                    if let Some(line) = self
-                        .log
-                        .iter_mut()
-                        .rev()
-                        .take_while(|l| l.starts_with("思考 ") || l.starts_with("grok "))
-                        .find(|l| l.starts_with("grok "))
-                    {
-                        *line = format!("grok {text}");
-                    } else {
-                        self.push_log(format!("grok {text}"));
-                    }
-                }
-            }
-            AgentEvent::ToolStarted { name, args, .. } => {
-                self.push_log(tool_started_line(name, args));
-                self.activity = format!("工具 {name}");
-            }
-            AgentEvent::ToolFinished { name, output, .. } => {
-                let preview: String = output.lines().next().unwrap_or("").chars().take(80).collect();
-                self.push_log(format!("完成 {name}  {preview}"));
-                self.activity = "思考中".into();
-            }
-            AgentEvent::FileChanged { path, kind, .. } => {
-                self.push_log(format!("檔案 {kind} {path}"));
-            }
-            AgentEvent::Error { message, .. } => {
-                self.push_log(format!("錯誤 {message}"));
-            }
-            AgentEvent::Notice { message, .. } => {
-                self.push_log(message.clone());
-            }
-            AgentEvent::RunFinished { reason, text, .. } => {
-                self.alive = false;
-                self.status = format!("結束 ({reason})");
-                self.activity.clear();
-                if !text.is_empty()
-                    && !self
-                        .log
-                        .iter()
-                        .any(|l| l.starts_with("grok ") && l.contains(text))
-                {
-                    self.push_log(format!("grok {text}"));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-#[derive(Clone)]
 struct SideMon {
     name: String,
     command: String,
@@ -247,7 +125,6 @@ struct SkillView {
 
 #[derive(Clone)]
 enum Inspector {
-    Child(String),
     Monitor(String),
     Background(String),
 }
@@ -274,7 +151,7 @@ struct ParkedChat {
     queue_edit: Option<usize>,
     composer_stash: Option<Edit>,
     pending: Vec<String>,
-    children: Vec<SideChild>,
+    bench: Workbench,
     monitors: Vec<SideMon>,
     backgrounds: Vec<SideBg>,
     inspector: Option<Inspector>,

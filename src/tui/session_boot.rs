@@ -95,7 +95,7 @@ fn fresh_chat(session: SessionMeta) -> ParkedChat {
         queue_edit: None,
         composer_stash: None,
             pending: Vec::new(),
-            children: Vec::new(),
+            bench: Workbench::default(),
             monitors: Vec::new(),
             backgrounds: Vec::new(),
             inspector: None,
