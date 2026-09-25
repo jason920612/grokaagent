@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::events::{AgentEvent, EventMeta, EventSink};
 use crate::procgroup::ProcessGuard;
 use crate::shellguard::{self, CommandReviewer};
-use crate::tools::{hide_window, resolve_in_workspace, shell_command, ClientTool, ToolCallFut, ToolSpec};
+use crate::tools::{hide_window, resolve_in_workspace, shell_command_in, ClientTool, ToolCallFut, ToolSpec};
 use crate::wintrack::{self, WindowHub};
 
 pub const MAX_BACKGROUNDS: usize = 4;
@@ -107,6 +107,17 @@ impl BackgroundHub {
         cwd: Option<&str>,
         sink: Arc<dyn EventSink>,
     ) -> Result<String> {
+        self.start_in(crate::shellrt::default_shell(), command, name, cwd, sink)
+    }
+
+    pub fn start_in(
+        self: &Arc<Self>,
+        shell: crate::shellrt::Shell,
+        command: &str,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<String> {
         let command = command.trim();
         if command.is_empty() {
             return Err(Error::Tool("command is required".into()));
@@ -123,7 +134,7 @@ impl BackgroundHub {
         }
         let name = self.take_name(name)?;
 
-        let mut cmd = shell_command(command);
+        let mut cmd = shell_command_in(shell, command)?;
         cmd.current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -464,11 +475,12 @@ impl ClientTool for RunBackgroundTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_background".into(),
-            description: "Start a workspace shell command in the background and return immediately. Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.".into(),
+            description: format!("Start a workspace shell command in the background and return immediately. {} Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.", crate::shellrt::describe()),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command (cwd = workspace unless cwd is set)"},
+                    "shell": {"type": "string", "enum": ["bash", "cmd", "powershell"], "description": "Shell to run in. Default bash; use cmd/powershell only for Windows-native commands."},
                     "name": {"type": "string", "description": "Optional process name (ascii, dash, underscore)"},
                     "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"},
                     "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result includes windows[].pid; pass the same name to screenshot."}
@@ -488,19 +500,21 @@ impl ClientTool for RunBackgroundTool {
         let name = args.get("name").and_then(Value::as_str).map(str::to_string);
         let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
         let window = args.get("window").and_then(Value::as_str).map(str::to_string);
+        let shell = crate::shellrt::shell_arg(args);
         let hub = self.hub.clone();
         let sink = self.sink.clone();
         let guard = self.guard.clone();
         let windows = self.windows.clone();
         Box::pin(async move {
-            shellguard::enforce(guard.as_ref(), &command, cwd.as_deref().unwrap_or(".")).await?;
+            let shell = shell?;
+            shellguard::enforce(guard.as_ref(), &command, cwd.as_deref().unwrap_or("."), shellguard::ShellKind::of(shell)).await?;
             let window = wintrack::optional_name(window.as_deref())?;
             let before = if window.is_some() {
                 wintrack::snapshot().await
             } else {
                 Default::default()
             };
-            let raw = hub.start(&command, name.as_deref(), cwd.as_deref(), sink)?;
+            let raw = hub.start_in(shell, &command, name.as_deref(), cwd.as_deref(), sink)?;
             let mut body: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
             if let Some(label) = window {
                 let found = wintrack::watch(before).await;

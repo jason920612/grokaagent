@@ -100,6 +100,16 @@ impl MonitorHub {
         name: Option<&str>,
         sink: Arc<dyn EventSink>,
     ) -> Result<String> {
+        self.attach_in(crate::shellrt::default_shell(), command, name, sink)
+    }
+
+    pub fn attach_in(
+        self: &Arc<Self>,
+        shell: crate::shellrt::Shell,
+        command: &str,
+        name: Option<&str>,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<String> {
         let command = command.trim();
         if command.is_empty() {
             return Err(Error::Tool("command is required".into()));
@@ -114,7 +124,7 @@ impl MonitorHub {
             return Err(Error::Tool("workspace is not a directory".into()));
         }
 
-        let mut cmd = crate::tools::shell_command(command);
+        let mut cmd = crate::tools::shell_command_in(shell, command)?;
         cmd.current_dir(&cwd)
             .env("GROKA_EVENTS_PATH", &events_path)
             .env("GROKA_MONITOR_NAME", &name)
@@ -217,7 +227,12 @@ impl MonitorHub {
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if kills.is_empty() {
+            return;
+        }
+        // stdin is closed; give hooks (bash startup on Windows is slow) time
+        // to drain it before they are killed.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         for tx in kills {
             let _ = tx.send(());
         }
@@ -313,6 +328,7 @@ impl ClientTool for AttachMonitorTool {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run (cwd = workspace). Reads JSONL events from stdin."},
+                    "shell": {"type": "string", "enum": ["bash", "cmd", "powershell"], "description": "Shell to run in. Default bash; use cmd/powershell only for Windows-native commands."},
                     "name": {"type": "string", "description": "Optional hook name (ascii, dash, underscore)"}
                 },
                 "required": ["command"],
@@ -331,12 +347,14 @@ impl ClientTool for AttachMonitorTool {
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let shell = crate::shellrt::shell_arg(args);
         let hub = self.hub.clone();
         let sink = self.sink.clone();
         let guard = self.guard.clone();
         Box::pin(async move {
-            shellguard::enforce(guard.as_ref(), &command, ".").await?;
-            hub.attach(&command, name.as_deref(), sink)
+            let shell = shell?;
+            shellguard::enforce(guard.as_ref(), &command, ".", shellguard::ShellKind::of(shell)).await?;
+            hub.attach_in(shell, &command, name.as_deref(), sink)
         })
     }
 }
@@ -354,13 +372,10 @@ mod tests {
     }
 
     fn hook_copy_cmd(rel: &str) -> String {
-        #[cfg(windows)]
-        {
-            format!("findstr /R \".*\" > {rel}")
-        }
-        #[cfg(not(windows))]
-        {
+        if crate::shellrt::default_shell() == crate::shellrt::Shell::Bash {
             format!("cat > {rel}")
+        } else {
+            format!("findstr /R \".*\" > {rel}")
         }
     }
 

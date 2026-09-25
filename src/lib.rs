@@ -28,6 +28,7 @@ pub mod session;
 pub mod skills;
 pub mod task;
 pub mod shellguard;
+pub mod shellrt;
 pub mod shot;
 pub mod diff;
 pub mod tools;

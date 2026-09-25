@@ -98,19 +98,9 @@ pub(crate) fn hide_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
-pub(crate) fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    }
+/// The process for `command` in `shell` (bash by default; see [`crate::shellrt`]).
+pub(crate) fn shell_command_in(shell: crate::shellrt::Shell, command: &str) -> Result<Command> {
+    crate::shellrt::command(shell, command)
 }
 
 pub struct NowTool;
@@ -993,6 +983,7 @@ impl RunCommandTool {
             .ok_or_else(|| Error::Tool("command is required".into()))?;
         let cwd = args.get("cwd").and_then(Value::as_str);
         let window = args.get("window").and_then(Value::as_str);
+        let shell = crate::shellrt::shell_arg(args)?;
         run_workspace_command_ex(
             &self.workspace,
             command,
@@ -1000,6 +991,7 @@ impl RunCommandTool {
             self.guard.as_ref(),
             window,
             self.windows.clone(),
+            shell,
         )
         .await
     }
@@ -1012,7 +1004,8 @@ pub(crate) async fn run_workspace_command(
     cwd: Option<&str>,
     guard: Option<&Arc<dyn CommandReviewer>>,
 ) -> Result<String> {
-    run_workspace_command_ex(workspace, command, cwd, guard, None, None).await
+    let shell = crate::shellrt::default_shell();
+    run_workspace_command_ex(workspace, command, cwd, guard, None, None, shell).await
 }
 
 pub(crate) async fn run_workspace_command_ex(
@@ -1022,6 +1015,7 @@ pub(crate) async fn run_workspace_command_ex(
     guard: Option<&Arc<dyn CommandReviewer>>,
     window: Option<&str>,
     windows: Option<Arc<WindowHub>>,
+    shell: crate::shellrt::Shell,
 ) -> Result<String> {
     let command = command.trim();
     if command.is_empty() {
@@ -1036,10 +1030,10 @@ pub(crate) async fn run_workspace_command_ex(
     if !cwd.is_dir() {
         return Err(Error::Tool("cwd is not a directory".into()));
     }
-    shellguard::enforce(guard, command, &cwd.to_string_lossy()).await?;
+    shellguard::enforce(guard, command, &cwd.to_string_lossy(), shellguard::ShellKind::of(shell)).await?;
     let window = wintrack::optional_name(window)?;
 
-    let mut cmd = shell_command(command);
+    let mut cmd = shell_command_in(shell, command)?;
     cmd.current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1084,8 +1078,8 @@ pub(crate) async fn run_workspace_command_ex(
             return Ok(body.to_string());
         }
     };
-    let stdout = clip_text(&String::from_utf8_lossy(&output.stdout), 32 * 1024);
-    let stderr = clip_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024);
+    let stdout = clip_text(&crate::shellrt::decode_output(&output.stdout), 32 * 1024);
+    let stderr = clip_text(&crate::shellrt::decode_output(&output.stderr), 16 * 1024);
     let git_cwd = cwd.clone();
     let files = tokio::task::spawn_blocking(move || diff::git_file_changes(&git_cwd))
         .await
@@ -1107,11 +1101,12 @@ impl ClientTool for RunCommandTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".into(),
-            description: "Run a shell command with cwd in the workspace (Windows cmd / Unix sh). Compound or nested commands are reviewed against this OS shell's quoting rules before they run. Returns stdout, stderr, exit_code, and git-style file diffs when the workspace is a git repo. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.".into(),
+            description: format!("Run a shell command with cwd in the workspace (60s timeout). {} Compound or nested commands that could leave the workspace are reviewed before they run; read-only pipelines are not. Returns stdout, stderr, exit_code, and git-style file diffs when the workspace is a git repo. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.", crate::shellrt::describe()),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run"},
+                    "shell": {"type": "string", "enum": ["bash", "cmd", "powershell"], "description": "Shell to run in. Default bash; use cmd/powershell only for Windows-native commands."},
                     "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"},
                     "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result includes windows[].pid; pass the same name to screenshot."}
                 },
@@ -2024,6 +2019,7 @@ mod tests {
             &'a self,
             _command: &'a str,
             _cwd: &'a str,
+            _shell: crate::shellguard::ShellKind,
         ) -> Pin<Box<dyn Future<Output = Result<crate::shellguard::Verdict>> + Send + 'a>> {
             Box::pin(async {
                 Ok(crate::shellguard::Verdict::Deny {

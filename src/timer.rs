@@ -345,6 +345,7 @@ impl TimerTool {
                 self.guard.as_ref(),
                 cmd,
                 cwd.as_deref().unwrap_or("."),
+                crate::shellguard::ShellKind::current(),
             )
             .await?;
         }
@@ -549,6 +550,7 @@ mod tests {
             &'a self,
             _command: &'a str,
             _cwd: &'a str,
+            _shell: crate::shellguard::ShellKind,
         ) -> Pin<Box<dyn Future<Output = Result<crate::shellguard::Verdict>> + Send + 'a>> {
             Box::pin(async {
                 Ok(crate::shellguard::Verdict::Deny {

@@ -61,7 +61,7 @@ def default_bin() -> Path:
 
 
 def model_env(base: dict, m: dict, home: Path) -> dict:
-    env = {k: v for k, v in base.items() if not k.startswith(("GROKA_", "OPENAI_"))}
+    env = {k: v for k, v in base.items() if not k.startswith(("GROKA_", "OPENAI_")) or k == "GROKA_BASH"}
     env.update({
         "GROKA_HOME": str(home / "cfg"),
         "GROKA_SESSIONS_DIR": str(home / "sessions"),

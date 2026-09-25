@@ -75,6 +75,8 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     } else {
         spec.run_id.clone()
     };
+    // Resolve bash (Git Bash, or fetch busybox-w32 on Windows) before any command.
+    crate::shellrt::prepare().await;
     let hub = MonitorHub::new(
         spec.workspace.clone(),
         spec.events_file.clone(),
