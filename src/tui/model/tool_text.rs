@@ -3,6 +3,20 @@
 
 use serde_json::Value;
 
+/// One line for a context fold: how, how much, and how full it was.
+pub(crate) fn compact_line(method: &str, dropped: usize, kept: usize, used: u32, window: u32) -> String {
+    let how = match method {
+        "lived" => "模型寫長期記憶",
+        "lived-slim" => "模型寫長期記憶（先精簡大型輸出）",
+        "lived-chunked" => "模型分段寫長期記憶",
+        "emergency" => "緊急壓縮（未經模型）",
+        "trim" => "精簡大型輸出",
+        other => other,
+    };
+    let pct = if window > 0 { format!(" · 當時 {}%", (used as u64 * 100 / window as u64)) } else { String::new() };
+    format!("上下文壓縮：{how} · 收起 {dropped} 項、原文保留 {kept} 項{pct}")
+}
+
 fn arg<'a>(args: &'a Value, key: &str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or("")
 }

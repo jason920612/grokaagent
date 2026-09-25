@@ -379,9 +379,15 @@ impl Transcript {
                 method,
                 dropped_items,
                 kept_items,
+                input_tokens,
+                window,
                 ..
-            } => self.push(Row::meta(format!(
-                "壓縮 ({method}) 丟 {dropped_items} 留 {kept_items}"
+            } => self.push(Row::meta(super::tool_text::compact_line(
+                method,
+                *dropped_items,
+                *kept_items,
+                *input_tokens,
+                *window,
             ))),
             AgentEvent::Notice { message, .. } => self.push(Row::meta(message.clone())),
             AgentEvent::Error { message, .. } => {

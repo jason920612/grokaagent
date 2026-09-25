@@ -19,5 +19,19 @@
     "key_env": "DEEPSEEK_API_KEY",
     "context": "1M",
     "reasoning": "high"
+  },
+  "deepseek-flash-32k": {
+    "model": "deepseek-flash",
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com/v1",
+    "key_env": "DEEPSEEK_API_KEY",
+    "context": "32K",
+    "reasoning": "high"
+  },
+  "grok-4.7-32k": {
+    "model": "grok-4.7",
+    "provider": "xai",
+    "reasoning": "high",
+    "context": "32K"
   }
 }

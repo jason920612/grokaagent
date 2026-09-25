@@ -74,6 +74,9 @@ pub enum AgentEvent {
         dropped_items: usize,
         kept_items: usize,
         method: String,
+        /// The long-term memory the fold wrote (empty for a plain trim).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        memory: String,
     },
     Error {
         #[serde(flatten)]

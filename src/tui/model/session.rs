@@ -565,10 +565,10 @@ impl Session {
             }
             AgentEvent::Error { message, .. } => t.log("", EventKind::Error, message.clone()),
             AgentEvent::Notice { message, .. } => t.log("", EventKind::Notice, message.clone()),
-            AgentEvent::ContextCompacted { method, dropped_items, kept_items, .. } => t.log(
+            AgentEvent::ContextCompacted { method, dropped_items, kept_items, input_tokens, window, .. } => t.log(
                 "",
                 EventKind::Notice,
-                format!("壓縮 ({method}) 丟 {dropped_items} 留 {kept_items}"),
+                super::tool_text::compact_line(method, *dropped_items, *kept_items, *input_tokens, *window),
             ),
             AgentEvent::BackgroundStarted { name, command, .. } => {
                 t.log("", EventKind::Background, format!("背景 {name} 開始  $ {command}"))

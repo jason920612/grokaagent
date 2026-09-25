@@ -12,7 +12,7 @@ use crate::compact;
 use crate::error::{Error, Result};
 use crate::events::{AgentEvent, EventMeta, EventSink};
 use crate::provider::{prompt_cache_key, CacheUsage, CompleteRequest, Provider, ReasoningEffort};
-use crate::tools::{ToolRegistry, ToolSpec};
+use crate::tools::ToolRegistry;
 
 /// Live model / effort / server tools for a long-lived TUI session. Read each turn.
 #[derive(Clone)]
@@ -533,17 +533,8 @@ fn transient_backoff(attempt: u32) -> Duration {
 
 /// Stop retrying the same failing request so we do not hammer the API.
 const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
-/// Lived fold is retried until it succeeds. Wait so a 400 does not spin.
-const COMPACT_RETRY: Duration = if cfg!(test) {
-    Duration::from_millis(5)
-} else {
-    Duration::from_secs(2)
-};
-/// Give up on this compaction after this many failed folds. Compaction starts
-/// at half the window, so the turn can still go out uncompacted.
-const MAX_COMPACT_ATTEMPTS: u32 = 5;
-/// Turns to skip compaction after giving up, so a persistent failure does not
-/// cost `MAX_COMPACT_ATTEMPTS` requests on every turn.
+/// Turns to wait after a fold failed below the hard limit, so a persistent
+/// failure does not cost fold requests on every turn.
 const COMPACT_BACKOFF_TURNS: u32 = 3;
 
 /// Tell the model why the request failed and keep the loop going.
@@ -670,50 +661,6 @@ fn append_missing_function_calls(history: &mut Vec<Value>, calls: &[crate::provi
     }
 }
 
-/// The working model writes long-term memory because it lived the turns.
-/// Not streamed to the TUI and not kept as a chat turn. `store: false` and no
-/// `previous_response_id`. Uses the working conversation cache key so the
-/// fold stays on the same replica; the body is still a different prefix.
-async fn ask_lived_memory<P: Provider>(
-    provider: &P,
-    instructions: &str,
-    goal: &str,
-    model: &str,
-    effort: ReasoningEffort,
-    send_reasoning: bool,
-    cache_key: &str,
-    head: &[Value],
-    client_tools: Vec<ToolSpec>,
-    server_tools: Vec<String>,
-) -> Result<String> {
-    if head.is_empty() {
-        return Err(Error::Provider("nothing to fold".into()));
-    }
-    let req = CompleteRequest {
-        instructions: instructions.to_string(),
-        input: compact::fold_input(head, goal),
-        client_tools,
-        server_tools,
-        cache_key: cache_key.to_string(),
-        previous_response_id: None,
-        store: false,
-        reasoning_effort: effort,
-        send_reasoning,
-        model: model.to_string(),
-        tool_choice: Some("none".into()),
-    };
-    let r = provider.complete(req).await?;
-    if !r.function_calls.is_empty() {
-        return Err(Error::Provider("lived fold called tools".into()));
-    }
-    let text = compact::lived_text_from_complete(&r.text, &r.output_items);
-    if compact::lived_brief_usable(&text) {
-        Ok(text)
-    } else {
-        Err(Error::Provider("lived gist unusable".into()))
-    }
-}
-
 pub async fn run<P: Provider>(
     provider: &P,
     tools: &ToolRegistry,
@@ -736,11 +683,9 @@ pub async fn run<P: Provider>(
     } else {
         cfg.context_window
     };
-    let keep_recent = if cfg.compact_keep_recent == 0 {
-        compact::DEFAULT_KEEP_RECENT
-    } else {
-        cfg.compact_keep_recent
-    };
+    let budget = compact::Budget::new(window);
+    // 0 = the tail is sized by tokens only.
+    let max_tail_items = (cfg.compact_keep_recent > 0).then_some(cfg.compact_keep_recent);
 
     let mut history = snapshot_for_resume(&cfg.prior_history);
     if !history.is_empty() {
@@ -924,137 +869,77 @@ pub async fn run<P: Provider>(
         let used = last_usage
             .input_tokens
             .max(compact::estimate_tokens(&live_instructions(&cfg), &history));
-        let want_compact = compact::should_compact(used, window, &history, keep_recent);
-        if want_compact && compact_backoff > 0 {
+        if used >= budget.trigger && compact_backoff > 0 && used < budget.hard {
             compact_backoff -= 1;
-        } else if want_compact {
-            let head = compact::split_head_tail(&history, keep_recent).0.to_vec();
-            let mut attempts: u32 = 0;
-            loop {
-                attempts += 1;
-                if attempts > MAX_COMPACT_ATTEMPTS {
-                    compact_backoff = COMPACT_BACKOFF_TURNS;
-                    notice(
-                        sink,
-                        &cfg.agent_name,
-                        &run_id,
-                        cfg.parent_run_id.as_deref(),
-                        format!(
-                            "壓縮連續失敗 {MAX_COMPACT_ATTEMPTS} 次，先不壓縮送出；{COMPACT_BACKOFF_TURNS} 輪後再試"
-                        ),
-                    );
-                    break;
+        } else if used >= budget.trigger {
+            let instructions = live_instructions(&cfg);
+            let agent_name = cfg.agent_name.clone();
+            let parent = cfg.parent_run_id.clone();
+            let say = |m: String| notice(sink, &agent_name, &run_id, parent.as_deref(), m);
+            let ctx = compact::FoldCtx {
+                provider,
+                instructions: &instructions,
+                goal: &cfg.prompt,
+                model: &model,
+                effort,
+                send_reasoning,
+                cache_key: &cache_key,
+                client_tools: tools.specs_for(&server_tools),
+                server_tools: server_tools.clone(),
+                budget,
+                max_tail_items,
+                notice: &say,
+            };
+            let result = race_cancel(&cfg.cancel, compact::fold(&ctx, &history)).await;
+            let folded = match result {
+                Err(()) => {
+                    if !take_interrupt(&mut cfg, sink, &run_id, &last_text, &mut history, &mut pending).await {
+                        return Ok(outcome(&cfg, &history, run_id, last_text, total_turns, cache_turns, compacted));
+                    }
+                    turn = 0;
+                    continue 'run;
                 }
-                match race_cancel(
-                    &cfg.cancel,
-                    ask_lived_memory(
-                        provider,
-                        &live_instructions(&cfg),
-                        &cfg.prompt,
-                        &model,
-                        effort,
-                        send_reasoning,
-                        &cache_key,
-                        &head,
-                        tools.specs_for(&server_tools),
-                        server_tools.clone(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(text)) => {
-                        match compact::compact_history(&cfg.prompt, &history, keep_recent, &text) {
-                            Ok(c) => {
-                                compacted += 1;
-                                sink.emit(&AgentEvent::ContextCompacted {
-                                    meta: meta(
-                                        &cfg.agent_name,
-                                        &run_id,
-                                        cfg.parent_run_id.as_deref(),
-                                    ),
-                                    input_tokens: used,
-                                    window,
-                                    dropped_items: c.dropped,
-                                    kept_items: c.kept,
-                                    method: c.method,
-                                });
-                                history = c.items;
-                                pending = history.clone();
-                                checkpoint(&cfg, &history);
-                                break;
-                            }
-                            Err(e) => {
-                                notice(
-                                    sink,
-                                    &cfg.agent_name,
-                                    &run_id,
-                                    cfg.parent_run_id.as_deref(),
-                                    format!("壓縮重試: {e}"),
-                                );
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        notice(
-                            sink,
-                            &cfg.agent_name,
-                            &run_id,
-                            cfg.parent_run_id.as_deref(),
-                            format!("壓縮重試: {e}"),
-                        );
-                    }
-                    Err(()) => {
-                        if !take_interrupt(
-                            &mut cfg,
-                            sink,
-                            &run_id,
-                            &last_text,
-                            &mut history,
-                            &mut pending,
-                        )
-                        .await
-                        {
-                            return Ok(outcome(
-                                &cfg,
-                                &history,
-                                run_id,
-                                last_text,
-                                total_turns,
-                                cache_turns,
-                                compacted,
-                            ));
-                        }
-                        turn = 0;
-                        continue 'run;
+                Ok(Ok(f)) => Some(f),
+                Ok(Err(compact::FoldError::Nothing)) => {
+                    // The verbatim tail alone is this big: slim huge outputs.
+                    if used >= budget.hard {
+                        compact::trim_history(&history)
+                    } else {
+                        None
                     }
                 }
-                match race_cancel(&cfg.cancel, tokio::time::sleep(COMPACT_RETRY)).await {
-                    Ok(()) => {}
-                    Err(()) => {
-                        if !take_interrupt(
-                            &mut cfg,
-                            sink,
-                            &run_id,
-                            &last_text,
-                            &mut history,
-                            &mut pending,
-                        )
-                        .await
-                        {
-                            return Ok(outcome(
-                                &cfg,
-                                &history,
-                                run_id,
-                                last_text,
-                                total_turns,
-                                cache_turns,
-                                compacted,
-                            ));
-                        }
-                        turn = 0;
-                        continue 'run;
+                Ok(Err(compact::FoldError::Failed(e))) => {
+                    if used >= budget.hard {
+                        say(format!("壓縮失敗（{e}），上下文將滿：改用不經模型的緊急壓縮"));
+                        Some(compact::emergency_fold(&cfg.prompt, &history, &budget, max_tail_items))
+                    } else {
+                        compact_backoff = COMPACT_BACKOFF_TURNS;
+                        say(format!(
+                            "壓縮失敗（{e}），先不壓縮送出；{COMPACT_BACKOFF_TURNS} 輪後再試"
+                        ));
+                        None
                     }
                 }
+            };
+            if let Some(c) = folded {
+                compacted += 1;
+                sink.emit(&AgentEvent::ContextCompacted {
+                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                    input_tokens: used,
+                    window,
+                    dropped_items: c.dropped,
+                    kept_items: c.kept,
+                    memory: if c.method == "trim" {
+                        String::new()
+                    } else {
+                        c.items.first().and_then(|i| i.get("content")).and_then(Value::as_str).unwrap_or("").to_string()
+                    },
+                    method: c.method,
+                });
+                history = c.items;
+                pending = history.clone();
+                last_usage = CacheUsage::default();
+                checkpoint(&cfg, &history);
             }
         }
 
@@ -2580,7 +2465,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             usage: CacheUsage {
-                input_tokens: 60,
+                input_tokens: 6_000,
                 cached_tokens: 0,
             },
             output_items: vec![
@@ -2616,7 +2501,7 @@ mod tests {
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
         let mut config = cfg("ship the kernel", 4);
-        config.context_window = 100;
+        config.context_window = 10_000;
         config.compact_keep_recent = 2;
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
@@ -2719,7 +2604,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             usage: CacheUsage {
-                input_tokens: 60,
+                input_tokens: 6_000,
                 cached_tokens: 0,
             },
             output_items: vec![
@@ -2750,7 +2635,7 @@ mod tests {
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
         let mut config = cfg("ship the kernel", 4);
-        config.context_window = 100;
+        config.context_window = 10_000;
         config.compact_keep_recent = 2;
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
@@ -2818,7 +2703,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             usage: CacheUsage {
-                input_tokens: 60,
+                input_tokens: 6_000,
                 cached_tokens: 0,
             },
             output_items: vec![
@@ -2849,7 +2734,7 @@ mod tests {
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
         let mut config = cfg("ship the kernel", 4);
-        config.context_window = 100;
+        config.context_window = 10_000;
         config.compact_keep_recent = 2;
         let out = tokio::time::timeout(Duration::from_secs(10), run(&provider, &tools, &rec, config))
             .await
@@ -2857,10 +2742,10 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(out.compacted, 0);
-        assert_eq!(*provider.fold_attempts.lock().unwrap(), MAX_COMPACT_ATTEMPTS);
+        assert_eq!(*provider.fold_attempts.lock().unwrap(), compact::FOLD_ATTEMPTS);
         assert!(rec.0.lock().unwrap().iter().any(|e| matches!(
             e,
-            AgentEvent::Notice { message, .. } if message.contains("壓縮連續失敗")
+            AgentEvent::Notice { message, .. } if message.contains("壓縮失敗")
         )));
     }
 
@@ -2952,7 +2837,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             usage: CacheUsage {
-                input_tokens: 60,
+                input_tokens: 6_000,
                 cached_tokens: 0,
             },
             output_items: vec![
@@ -2983,7 +2868,7 @@ mod tests {
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
         let mut config = cfg("ship the kernel", 4);
-        config.context_window = 100;
+        config.context_window = 10_000;
         config.compact_keep_recent = 2;
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");

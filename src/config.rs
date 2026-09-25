@@ -154,7 +154,12 @@ impl ProviderConfig {
     /// custom endpoint; Grok models look their window up from the catalog (0).
     pub fn window_tokens_for(&self, model: &str) -> u32 {
         if !self.route_for(model).is_openai() {
-            return 0;
+            // Grok windows come from the model name; the env var may shrink
+            // one explicitly (to exercise compaction).
+            return std::env::var("GROKA_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|v| crate::compact::parse_window(&v))
+                .unwrap_or(0);
         }
         if self.context_window > 0 {
             self.context_window
