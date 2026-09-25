@@ -1009,7 +1009,8 @@ pub async fn run<P: Provider>(
         let rid = run_id.clone();
         let streamed_server = std::sync::atomic::AtomicBool::new(false);
         let streamed_reasoning = std::sync::atomic::AtomicBool::new(false);
-        let repeat_guard = crate::repeat::Guard::new();
+        let repeat_ctx = crate::repeat::Context::from_items(&history);
+        let repeat_guard = crate::repeat::Guard::with_context(repeat_ctx.clone());
         let on_text = |delta: &str| {
             if delta.is_empty() {
                 return;
@@ -1105,7 +1106,7 @@ pub async fn run<P: Provider>(
                 turn = 0;
                 continue;
             }
-            Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls) {
+            Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls, &repeat_ctx) {
                 None => r,
                 Some(trip) => {
                     handle_loop(&mut cfg, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
