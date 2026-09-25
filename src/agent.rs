@@ -597,6 +597,47 @@ async fn recover_from_provider_error(
     }
 }
 
+/// A response was cut off for degenerate repetition: drop it and retry the
+/// turn with a note. Repeated trips fall back to the provider-error path,
+/// which tells the model and eventually stops.
+#[allow(clippy::too_many_arguments)]
+async fn handle_loop(
+    cfg: &mut RunConfig,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    loop_trips: &mut u32,
+    consecutive: &mut u32,
+    last_text: &str,
+    trip: crate::repeat::Trip,
+) -> Result<()> {
+    *loop_trips += 1;
+    if *loop_trips > MAX_LOOP_RETRIES {
+        *loop_trips = 0;
+        return recover_from_provider_error(cfg, sink, run_id, history, pending, consecutive, last_text, trip.to_error())
+            .await;
+    }
+    notice(
+        sink,
+        &cfg.agent_name,
+        run_id,
+        cfg.parent_run_id.as_deref(),
+        format!(
+            "模型輸出陷入重複（{}：「{}」×{}），已中止這次回應並重試（{}/{MAX_LOOP_RETRIES}）",
+            trip.source,
+            trip.preview(),
+            trip.repeats,
+            *loop_trips
+        ),
+    );
+    append_user(history, pending, &UserTurn::from(crate::repeat::retry_note(&trip)), &cfg.workspace);
+    Ok(())
+}
+
+/// Retries of a turn whose response kept falling into a repetition loop.
+const MAX_LOOP_RETRIES: u32 = 2;
+
 fn emit_file_changes(
     sink: &dyn EventSink,
     agent_name: &str,
@@ -770,6 +811,8 @@ pub async fn run<P: Provider>(
     let mut total_turns: u32 = 0;
     let mut seen_model = false;
     let mut consecutive_provider_errors: u32 = 0;
+    // Responses cut off in a row for degenerate repetition.
+    let mut loop_trips: u32 = 0;
     let mut image_turns: u32 = 0;
     let mut compact_backoff: u32 = 0;
     let mut images_known: usize = 0;
@@ -966,10 +1009,12 @@ pub async fn run<P: Provider>(
         let rid = run_id.clone();
         let streamed_server = std::sync::atomic::AtomicBool::new(false);
         let streamed_reasoning = std::sync::atomic::AtomicBool::new(false);
+        let repeat_guard = crate::repeat::Guard::new();
         let on_text = |delta: &str| {
             if delta.is_empty() {
                 return;
             }
+            repeat_guard.feed_text(delta);
             sink.emit(&AgentEvent::ModelDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -988,6 +1033,7 @@ pub async fn run<P: Provider>(
                 return;
             }
             streamed_reasoning.store(true, std::sync::atomic::Ordering::Relaxed);
+            repeat_guard.feed_reasoning(delta);
             sink.emit(&AgentEvent::ReasoningDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -999,11 +1045,16 @@ pub async fn run<P: Provider>(
         // of the model-visible recoveries below.
         let mut transient_attempt = 0u32;
         let attempt = loop {
-            let r = race_cancel(
-                &cfg.cancel,
-                provider.complete_stream(req.clone(), &on_text, &on_server, &on_reasoning),
-            )
-            .await;
+            repeat_guard.reset();
+            // A response that falls into a repetition loop is stopped as soon
+            // as the loop shows, not when the model hits its output limit.
+            let guarded = async {
+                tokio::select! {
+                    r = provider.complete_stream(req.clone(), &on_text, &on_server, &on_reasoning) => r,
+                    trip = repeat_guard.tripped() => Err(trip.to_error()),
+                }
+            };
+            let r = race_cancel(&cfg.cancel, guarded).await;
             match r {
                 Ok(Err(e))
                     if transient_attempt < MAX_TRANSIENT_RETRIES
@@ -1054,7 +1105,22 @@ pub async fn run<P: Provider>(
                 turn = 0;
                 continue;
             }
-            Ok(Ok(r)) => r,
+            Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls) {
+                None => r,
+                Some(trip) => {
+                    handle_loop(&mut cfg, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
+                    continue;
+                }
+            },
+            Ok(Err(e)) if crate::repeat::is_loop(&e) => {
+                let trip = repeat_guard.trip().unwrap_or(crate::repeat::Trip {
+                    source: "text".into(),
+                    unit: String::new(),
+                    repeats: 0,
+                });
+                handle_loop(&mut cfg, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
+                continue;
+            }
             Ok(Err(e)) => {
                 recover_from_provider_error(
                     &mut cfg,
@@ -1073,6 +1139,7 @@ pub async fn run<P: Provider>(
             }
         };
         consecutive_provider_errors = 0;
+        loop_trips = 0;
 
         last_usage = response.usage.clone();
         cache_turns.push(last_usage.clone());
@@ -2747,6 +2814,58 @@ mod tests {
             e,
             AgentEvent::Notice { message, .. } if message.contains("壓縮失敗")
         )));
+    }
+
+    #[tokio::test]
+    async fn a_looping_stream_is_cut_off_and_the_turn_retried() {
+        struct Looper {
+            calls: Mutex<Vec<CompleteRequest>>,
+        }
+        impl Provider for Looper {
+            async fn complete(&self, _req: CompleteRequest) -> Result<CompleteResponse> {
+                unreachable!("streaming only")
+            }
+            async fn complete_stream<'a>(
+                &'a self,
+                req: CompleteRequest,
+                on_text: &'a (dyn Fn(&str) + Send + Sync),
+                _on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
+                _on_reasoning: &'a (dyn Fn(&str) + Send + Sync),
+            ) -> Result<CompleteResponse> {
+                let first = {
+                    let mut c = self.calls.lock().unwrap();
+                    c.push(req);
+                    c.len() == 1
+                };
+                if first {
+                    // Degenerate: the same sentence forever, never finishing.
+                    loop {
+                        on_text("I will check the file again. ");
+                        tokio::task::yield_now().await;
+                    }
+                }
+                on_text("done");
+                Ok(CompleteResponse { text: "done".into(), ..CompleteResponse::new("2") })
+            }
+            async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+                Err(Error::Provider("no".into()))
+            }
+        }
+        let provider = Looper { calls: Mutex::new(Vec::new()) };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let out = tokio::time::timeout(Duration::from_secs(10), run(&provider, &tools, &rec, cfg("go", 4)))
+            .await
+            .expect("the loop must be cut off")
+            .unwrap();
+        assert_eq!(out.text, "done");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let note = calls[1].input.last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(note.contains("[loop guard]") && note.contains("I will check the file again."), "{note}");
+        let events = rec.0.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("重複"))));
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "a first loop is not an error");
     }
 
     #[tokio::test]

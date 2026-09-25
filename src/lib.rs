@@ -24,6 +24,7 @@ pub mod openai;
 pub mod preview;
 pub mod procgroup;
 pub mod provider;
+pub mod repeat;
 pub mod session;
 pub mod skills;
 pub mod task;
