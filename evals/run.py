@@ -84,8 +84,8 @@ def model_env(base: dict, m: dict, home: Path) -> dict:
             "GROKA_API_KEY": key,
             "GROKA_MODEL": m["model"],
         })
-        if m.get("context"):
-            env["GROKA_CONTEXT_WINDOW"] = m["context"]
+    if m.get("context"):
+        env["GROKA_CONTEXT_WINDOW"] = m["context"]
     return env
 
 
@@ -183,6 +183,9 @@ def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_roo
     home.mkdir(parents=True)
     events = run_dir / "events.jsonl"
     env = model_env(dict(os.environ), m, home)
+    # The workspace lives inside this repo: keep git from reporting the
+    # repo's own changes as the run's file changes.
+    env["GIT_CEILING_DIRECTORIES"] = str(run_dir)
     cmd = [
         str(bin_path), "run",
         "--model", m["model"],

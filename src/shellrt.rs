@@ -68,9 +68,27 @@ const BUSYBOX_URL: &str = "https://frippery.org/files/busybox/busybox-w64u-FRP-6
 const BUSYBOX_SHA256: &str = "6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c";
 const BUSYBOX_FILE: &str = "busybox-w64u-FRP-6075.exe";
 
-/// Windows bash lacks `python3` when only `python` is installed.
-const WINDOWS_PRELUDE: &str =
-    "command -v python3 >/dev/null 2>&1 || python3() { python \"$@\"; }\n";
+/// Windows often has no working `python3` (or only the Microsoft Store stub,
+/// which exits 49): map it to `python` when that one works.
+const WINDOWS_PY3_SHIM: &str = "python3() { python \"$@\"; }\n";
+
+static PY3_WORKS: OnceLock<bool> = OnceLock::new();
+
+/// Checked once per process. Only shim when python3 is broken and python works.
+fn python3_works() -> bool {
+    *PY3_WORKS.get_or_init(|| {
+        let ok = |exe: &str| {
+            std::process::Command::new(exe)
+                .args(["-c", "import sys"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        ok("python3") || !ok("python")
+    })
+}
 
 static RUNTIME: OnceLock<Option<BashRuntime>> = OnceLock::new();
 
@@ -175,8 +193,8 @@ fn bash_command(command: &str) -> Result<Command> {
         c.arg("-c").arg(command);
         return Ok(c);
     };
-    let script = if cfg!(windows) {
-        format!("{WINDOWS_PRELUDE}{command}")
+    let script = if cfg!(windows) && !python3_works() {
+        format!("{WINDOWS_PY3_SHIM}{command}")
     } else {
         command.to_string()
     };

@@ -759,11 +759,9 @@ mod tests {
         let rec = Arc::new(Rec(Mutex::new(Vec::new())));
         let hub = TimerHub::new(dir.path().to_path_buf(), "root".into(), "r".into(), None, None);
         let tool = TimerTool::new(hub, rec, Some(Arc::new(DenyAll)));
-        let command = if cfg!(windows) {
-            "echo pwned>pwned.txt & echo x"
-        } else {
-            "echo pwned > pwned.txt && echo x"
-        };
+        // Compound and not read-only under every shell (bash: touch is not
+        // on the read-only list; cmd: && always needs review).
+        let command = "echo pwned > pwned.txt && touch other.txt";
         let started = std::time::Instant::now();
         let err = tool
             .call(&json!({

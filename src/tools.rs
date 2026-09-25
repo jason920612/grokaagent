@@ -2034,11 +2034,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pwned.txt");
         let tool = RunCommandTool::with_guard(dir.path().to_path_buf(), Arc::new(DenyAll));
-        let command = if cfg!(windows) {
-            "echo pwned>pwned.txt & echo x"
-        } else {
-            "echo pwned > pwned.txt && echo x"
-        };
+        // Compound and not read-only under every shell (bash: touch is not
+        // on the read-only list; cmd: && always needs review).
+        let command = "echo pwned > pwned.txt && touch other.txt";
         let err = tool.run(&json!({"command": command})).await.unwrap_err();
         let s = err.to_string();
         assert!(s.contains("blocked"), "{s}");
