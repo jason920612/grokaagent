@@ -1,106 +1,106 @@
 # grokaagent
 
-Rust agent kernel：事件迴圈、本機工具、xAI Grok OAuth 或 OpenAI 相容 API、A2A 子行程、JSONL 事件管道、終端 TUI。
+在終端機裡工作的 AI 代理：一個主代理規劃並親手改檔、跑指令，需要時開子代理平行處理；終端 TUI 和瀏覽器看到的是同一個工作台。可用 Grok 訂閱登入，或任何 OpenAI 相容 API（DeepSeek 等）。
 
-## 一鍵安裝
+![TUI：主代理指揮兩個子代理，底部是全部代理的工具時間軸](docs/images/tui-agents.png)
 
-不需要先裝 Rust。腳本會下載 GitHub Release 二進位、核對 SHA-256，並放到 `~/.grokaagent/bin`。
+## 特色
 
-**Windows（amd64）** PowerShell：
+- **VS Code 式工作台**：左側代理樹（主代理／子代理／孫代理與即時狀態）、每個子代理一個唯讀分頁、底部工具時間軸。TUI 與網頁即時同步，網頁有深色／淺色主題。
+- **子代理**：主代理用 `spawn_agent` 開子代理後繼續工作；子代理是長壽 session，記得先前的指示，完成後自動回報。
+- **兩種模型來源，可混用**：Grok（SuperGrok／X Premium+ 帳號登入）或 OpenAI 相容端點；主代理與子代理可用不同模型。非 Grok 模型也能透過 `grok_search` 借用 Grok 搜尋網路與 X。
+- **每個系統都用 bash**：Windows 上用 Git Bash，沒裝 Git 時自動下載 busybox；需要時仍可指定 `cmd` 或 `powershell`。
+- **長時間工作**：上下文快滿時，由模型自己把舊內容整理成長期記憶，最近的內容原文保留；模型服務暫時出錯會自動重試。
+- **安全預設**：會離開工作區或有風險的複合指令先經獨立審查；改檔一律用差異或精確取代，不會整檔覆寫。
+
+| 子代理分頁（唯讀，完整工作紀錄） | 網頁工作台（深色主題） |
+|---|---|
+| ![子代理分頁](docs/images/tui-child.png) | ![網頁工作台](docs/images/web-dark.png) |
+
+## 安裝
+
+不需要 Rust。腳本會下載 GitHub Release、核對 SHA-256，安裝到 `~/.grokaagent/bin`。
 
 ```powershell
+# Windows（amd64）
 irm https://github.com/jason920612/grokaagent/releases/latest/download/install.ps1 | iex
 ```
 
-**Linux（amd64）／macOS（Apple Silicon）**：
-
 ```sh
+# Linux（amd64）／macOS（Apple Silicon）
 curl -fsSL https://github.com/jason920612/grokaagent/releases/latest/download/install.sh | sh
 ```
 
-新開一個終端，進到專案目錄後執行：
+之後會自動更新（啟動時檢查，最多每 6 小時一次）；也可以手動 `grokaagent update`。
 
-```text
+## 開始使用
+
+在專案資料夾執行：
+
+```sh
 grokaagent
 ```
 
-目前發佈的平台：Windows amd64、Linux amd64、macOS arm64。可用 `GROKA_INSTALL_DIR` 改安裝路徑。Linux 截圖功能需要系統上的 PipeWire（多數桌面發行版已有）。
+第一次使用按 `F2` 開設定：
 
-## 工作控制台
+- **Grok**：按「登入 Grok」，在瀏覽器核准即可。
+- **自訂 API**：切到「自訂 API」，填端點、金鑰、模型與上下文大小。也可以直接用參數：
 
-TUI 與網頁是同一套 VS Code 式工作台：
+  ```sh
+  grokaagent tui --base-url https://api.deepseek.com/v1 --api-key sk-... --model deepseek-flash --context 1M
+  ```
 
-- **活動列**（最左）：對話、代理、檔案變更、背景工作、任務；底部齒輪開設定。TUI 的活動列是圖示加文字標籤（終端太矮時改為只顯示圖示）；網頁多一個主題按鈕，依序切換「自動（跟隨系統）→ 深色 → 淺色」並記在瀏覽器。
-- **側欄**：目前選的檢視。「代理」以樹狀列出主代理、子代理與孫代理，並顯示狀態（◌ 啟動中、◐ 工作中、✓ 閒置、‖ 暫停、⊘ 已中斷、○ 已結束）。
-- **編輯區分頁**：「主對話」加上每個開啟的子代理。子代理分頁是**唯讀**的完整工作紀錄，包含它收到的指示、思考、每次工具呼叫與差異；子代理只由主代理指揮。TUI 的設定也開成一個分頁（`F2` / `Ctrl+G`）。
-- **底部面板**：「工具」是所有代理的工具時間軸（點選跳到該次呼叫），「輸出」是背景行程輸出，「事件」記錄啟動、訊息、錯誤。
-- **狀態列**：目前進度、代理數、工具數、快取、任務、模型（點選開設定）。
+不開介面、一次性執行：
 
-送出方式：
-
-- **接著做**：目前回覆完成後依序處理。
-- **調整目前工作**：下一輪模型呼叫時處理，不會撤回已執行的工具操作。
-- **停止目前工作**（Esc）：取消目前模型、工具或監督檢查，**正在工作的子代理也會中斷目前回合**（保留記憶，不會被關掉）；待處理佇列保留，等下一個指示。
-
-快捷鍵（TUI 與網頁相同）：`Ctrl+B` 側欄、`Ctrl+J` 面板、`Alt+1`–`Alt+5` 切換側欄檢視、`Alt+0` 回主對話、`Alt+←/→` 切換分頁、`Alt+↑/↓` 依樹狀順序開啟上一個／下一個子代理（TUI）、`Ctrl+W` 關閉子代理分頁（TUI）。TUI 另有 `F3`／`F4` 對應側欄／面板、`F2` 開關設定分頁；在子代理分頁直接打字會切回主對話的輸入框。`Shift+Enter` 換行，`Ctrl+Enter` 調整目前工作。
-
-網頁以增量同步：只送出有變動的列與面板資料，斷線或漏收時自動重新取得完整狀態。網址可帶 `#side=agents&tab=coder&panel=tools` 直接開到指定檢視。網頁的草稿、分頁、面板與詳情視窗各自保留在瀏覽器分頁中；工作切換、問題回答與圖片附件和終端共用。
-
-子代理：主代理用 `spawn_agent` 開子代理後立即繼續；子代理在自己的行程裡是一個長壽 session，後續 `send_message` 會記得先前內容。子代理閒置時，回覆會自動送回主代理（主代理若在等你，也會被喚醒）；需要同步時主代理用 `wait_agents`，`list_agents` 看狀態，`stop_agent` 中斷或結束（`kill=true` 釋放名額）。
-
-## 自動更新
-
-TUI 啟動時會向 GitHub Releases 查最新版（最多每 6 小時一次）。若有新版本會下載、核對 checksum、取代目前的執行檔，然後重啟。也可手動：
-
-```text
-grokaagent update
+```sh
+grokaagent run "列出這個專案的 TODO，整理成 todo.md"
 ```
 
-不想自動更新時設 `GROKA_NO_UPDATE=1`。
+事件會寫到 `groka-events.jsonl`，可以用自己的腳本讀。
 
-## 需要
+## 常用按鍵
 
-- 一鍵安裝：上述三平台之一
-- 從原始碼編譯：Rust 1.75+
-- Grok：有效的 SuperGrok / X Premium+（訂閱推論走 `cli-chat-proxy.grok.com`）
-- 或自訂 OpenAI 相容端點（設定裡切「自訂 API」，或 `--base-url` / `--model` / `--context`）
-- 搜尋：Grok 模型用內建 web / X 搜尋；其他模型（DeepSeek 等）在已登入 Grok 時會拿到 `grok_search` 工具——用自然語言發問，由最新的 Grok 模型代為搜尋 web 與 X 並附來源。設定（F2）的「搜尋」開關同時控制兩者，子代理會繼承；`GROKA_GROK_SEARCH_MODEL` 可指定代查模型
+| 按鍵 | 作用 |
+|---|---|
+| `Enter` / `Shift+Enter` | 送出／換行 |
+| `Ctrl+Enter` | 在模型工作中插入調整（下一輪生效） |
+| `Esc` | 停止目前工作（子代理也會停下，但保留記憶） |
+| `F2` | 設定 |
+| `Ctrl+B` / `Ctrl+J` | 側欄／底部面板 |
+| `Alt+1`–`Alt+5` | 對話、代理、變更、背景、任務 |
+| `Alt+0` / `Alt+↑↓` | 回主對話／切換子代理分頁 |
+| `Ctrl+N` / `Ctrl+Q` | 新對話／離開 |
 
-## 從原始碼安裝
+TUI 啟動時會顯示網頁版網址（只接受本機連線，網址帶每次啟動產生的 token）。
 
-第一次（在這個 repo）：
+## 環境變數
 
-```text
+| 變數 | 用途 |
+|---|---|
+| `GROKA_NO_UPDATE=1` | 關閉自動更新 |
+| `GROKA_BASH` | 指定 bash 路徑，或 `busybox` 強制使用內建 busybox |
+| `GROKA_CONTEXT_WINDOW` | 覆寫上下文大小，例如 `262K` |
+| `GROKA_GROK_SEARCH_MODEL` | `grok_search` 使用的 Grok 模型 |
+| `GROKA_INSTALL_DIR` | 安裝腳本的安裝位置 |
+| `GROKA_XAI_AUTH_FILE` | Grok 登入檔位置（預設 `~/.grokaagent/xai-auth.json`，不要 commit） |
+
+## 開發
+
+```sh
+cargo build
+cargo test
+cargo run            # TUI
 cargo install --path . --force --locked
 ```
 
-之後任意目錄都可以用 `grokaagent`，工作區就是你執行時所在的目錄：
+`evals/` 是真實任務評測（短任務、長任務、專業領域，隱藏評分），用來比較模型與框架改動：
 
-```text
-cd D:\work\some-project
-grokaagent              # TUI
-grokaagent login
-grokaagent run "現在 UTC 幾點？請用 now 工具"
+```sh
+python evals/run.py --models grok-4.7,deepseek-flash-official
+python evals/report.py evals/results/<時間戳記>
 ```
 
-TUI 對話預設不限輪次（`--max-turns 0`）。若你手動設了上限，互動模式撞到時會暫停等人，不會結束 session。
-
-開發時更新 binary：在 repo 再跑一次 `cargo install --path . --force --locked`，或 `cargo run --release -- install`。發佈版請用 `grokaagent update` 或重跑安裝腳本。
-
-```text
-cargo build
-cargo test
-cargo run -- login
-cargo run                 # TUI（無子命令即進入）
-cargo run -- tui
-cargo run -- run "現在 UTC 幾點？請用 now 工具"
-```
-
-子 agent 由模型呼叫 `spawn_agent` / `send_message` 拉起，同一支 binary 的 `worker` 在 loopback 上講 A2A。測試用 echo worker（`--mode echo`，回覆整段對話的使用者訊息），不必打 Grok。子代理事件檔寫在事件檔旁的 `groka-children/`。
-
-登入後 token 存在 `~/.grokaagent/xai-auth.json`（`GROKA_XAI_AUTH_FILE` 可改）。不要 commit。
-
-事件預設寫到目前目錄的 `groka-events.jsonl`。TUI 只是操作面；腳本仍可自己讀 JSONL。
+架構說明在 [docs/adr](docs/adr)。
 
 ## License
 

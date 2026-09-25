@@ -78,8 +78,12 @@ pub(crate) fn prefixed_text(prefix: &'static str, color: Color, s: &str) -> Vec<
     out
 }
 
+/// Author label of the main agent's replies (the model can be any provider).
+const MAIN_LABEL: &str = "agent";
+
 fn agent_lines(a: &AgentMsg, label: &str) -> Vec<Line<'static>> {
-    let head = format!("{:<6}", label);
+    // Long child names still need a gap before the text.
+    let head = if label.chars().count() >= 6 { format!("{label} ") } else { format!("{label:<6}") };
     let bold = Style::default().fg(AGENT).add_modifier(Modifier::BOLD);
     let mut out: Vec<Line<'static>> = md::markdown_lines(&a.text)
         .into_iter()
@@ -380,7 +384,7 @@ fn line_text(line: &Line<'_>) -> String {
 }
 
 fn row_text(row: &Row) -> Option<String> {
-    let lines = row_lines(row, false, "grok")?;
+    let lines = row_lines(row, false, MAIN_LABEL)?;
     Some(lines.iter().map(line_text).collect::<Vec<_>>().join("\n"))
 }
 
@@ -647,7 +651,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let label = if child {
         key.rsplit('/').next().unwrap_or("agent").to_string()
     } else {
-        "grok".to_string()
+        MAIN_LABEL.to_string()
     };
     let workspace = s.meta.workspace.clone();
     let epoch = s.view_transcript().epoch;
