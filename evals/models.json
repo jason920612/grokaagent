@@ -33,5 +33,33 @@
     "provider": "xai",
     "reasoning": "high",
     "context": "32K"
+  },
+  "deepseek-flash-64k": {
+    "model": "deepseek-flash",
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com/v1",
+    "key_env": "DEEPSEEK_API_KEY",
+    "context": "64K",
+    "reasoning": "high"
+  },
+  "deepseek-flash-128k": {
+    "model": "deepseek-flash",
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com/v1",
+    "key_env": "DEEPSEEK_API_KEY",
+    "context": "128K",
+    "reasoning": "high"
+  },
+  "grok-4.7-64k": {
+    "model": "grok-4.7",
+    "provider": "xai",
+    "reasoning": "high",
+    "context": "64K"
+  },
+  "grok-4.7-128k": {
+    "model": "grok-4.7",
+    "provider": "xai",
+    "reasoning": "high",
+    "context": "128K"
   }
 }

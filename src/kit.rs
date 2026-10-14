@@ -290,6 +290,45 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     out
 }
 
+/// Feeds scripted follow-up messages to a headless run: each time the root
+/// agent waits for input, the next message is sent; after the last one the
+/// inbox closes and the run ends.
+pub struct Followups {
+    inner: Arc<dyn EventSink>,
+    queue: Mutex<std::collections::VecDeque<String>>,
+    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::agent::UserTurn>>>,
+}
+
+impl Followups {
+    pub fn new(
+        inner: Arc<dyn EventSink>,
+        messages: Vec<String>,
+    ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<crate::agent::UserTurn>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let me = Arc::new(Self { inner, queue: Mutex::new(messages.into()), tx: Mutex::new(Some(tx)) });
+        (me, rx)
+    }
+}
+
+impl EventSink for Followups {
+    fn emit(&self, event: &crate::events::AgentEvent) {
+        self.inner.emit(event);
+        if let crate::events::AgentEvent::AwaitingInput { meta } = event {
+            if meta.parent_run_id.is_some() || !meta.path.is_empty() {
+                return;
+            }
+            let next = self.queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            let mut tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+            match (next, tx.as_ref()) {
+                (Some(text), Some(sender)) => {
+                    let _ = sender.send(crate::agent::UserTurn::from(text));
+                }
+                _ => *tx = None,
+            }
+        }
+    }
+}
+
 pub fn events_dir(events_file: &Path) -> PathBuf {
     events_file
         .parent()

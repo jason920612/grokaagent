@@ -62,6 +62,10 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        /// Follow-up user message, sent each time the agent waits for input
+        /// (repeatable; in order). For scripted multi-turn runs.
+        #[arg(long = "then")]
+        then: Vec<String>,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -281,6 +285,7 @@ async fn real_main() -> grokaagent::Result<()> {
             web_search,
             workspace,
             reasoning,
+            then,
             api,
         }) => {
             let prompt = match prompt {
@@ -300,7 +305,13 @@ async fn real_main() -> grokaagent::Result<()> {
                 None => std::env::current_dir()?,
             };
             let (cfg, model) = boot_provider(api, model, false)?;
-            let sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
+            let mut sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
+            let mut inbox = None;
+            if !then.is_empty() {
+                let (feeder, rx) = kit::Followups::new(sink, then);
+                sink = feeder;
+                inbox = Some(rx);
+            }
             let provider = AnyProvider::connect(&cfg, Some(model.clone()))?;
             let server_tools = kit::search_tools(
                 web_search,
@@ -328,7 +339,7 @@ async fn real_main() -> grokaagent::Result<()> {
                         .unwrap_or_else(|_| "grok".into()),
                     reasoning_effort: reasoning,
                     knobs: None,
-                    inbox: None,
+                    inbox,
                     images: Vec::new(),
                     ask: None,
                     context_window,

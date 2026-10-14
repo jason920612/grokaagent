@@ -66,8 +66,8 @@ def main() -> None:
     L.append(f"結果目錄：`{out}`；{len(rows)} 次執行，{len(tasks)} 個任務。\n")
 
     L.append("## 總覽與分級\n")
-    L.append("| 模型 | " + " | ".join(n for _, n in CATS) + " | 總分 | 等級 | 平均耗時 | 平均輪數 | 工具錯誤率 | 快取命中 | 逾時 |")
-    L.append("|" + "---|" * (len(CATS) + 8))
+    L.append("| 模型 | " + " | ".join(n for _, n in CATS) + " | 總分 | 等級 | 平均耗時 | 平均輪數 | 平均壓縮 | 工具錯誤率 | 快取命中 | 逾時 |")
+    L.append("|" + "---|" * (len(CATS) + 9))
     for m in models:
         mr = [r for r in rows if r["model"] == m]
         cells = []
@@ -81,6 +81,7 @@ def main() -> None:
         cached = sum(r["metrics"]["cached_tokens"] for r in mr)
         L.append(f"| {m} | " + " | ".join(cells) + f" | {overall:.2f} | **{tier(overall)}** | "
                  f"{mean(r['wall_s'] for r in mr):.0f}s | {mean(r['metrics']['turns'] for r in mr):.1f} | "
+                 f"{mean(r['metrics'].get('compactions', 0) for r in mr):.1f} | "
                  f"{(errs / calls if calls else 0):.1%} | {(cached / inp if inp else 0):.0%} | "
                  f"{sum(r['timed_out'] for r in mr)} |")
     L.append("\n等級：S ≥ 0.95、A ≥ 0.85、B ≥ 0.70、C ≥ 0.50、D < 0.50（各類別平均分）。\n")
@@ -102,7 +103,9 @@ def main() -> None:
             e = sum(r["metrics"]["tool_errors"] for r in rs)
             c = sum(r["metrics"]["tool_calls"] for r in rs)
             flag = " ⏱" if any(r["timed_out"] for r in rs) else ""
-            cells.append(f"**{s:.2f}** · {w:.0f}s · {turns:.0f} 輪 · 錯 {e}/{c}{flag}")
+            folds = mean(r["metrics"].get("compactions", 0) for r in rs)
+            fold = f" · 壓縮 {folds:.1f}" if folds else ""
+            cells.append(f"**{s:.2f}** · {w:.0f}s · {turns:.0f} 輪 · 錯 {e}/{c}{fold}{flag}")
         L.append(f"| {t} | {cat} | " + " | ".join(cells) + " |")
 
     L.append("\n## 框架適應度\n")

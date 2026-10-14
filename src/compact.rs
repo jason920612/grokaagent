@@ -7,6 +7,16 @@
 //! verbatim as short-term memory. The encrypted xAI `/responses/compact` blob
 //! is not used.
 //!
+//! What the model may paraphrase and what the harness keeps exactly:
+//! - the user's own messages are kept verbatim (newest first, within
+//!   [`USER_RATIO`] of the window) and put back before the memory;
+//! - the original request comes from history (the first real user message,
+//!   or the one an earlier memory pinned), never from "the first message of
+//!   this run";
+//! - the git status at fold time is attached by the harness;
+//! - only direction changes, facts, where-you-were and open work are the
+//!   model's own words.
+//!
 //! Everything is budgeted in tokens against the model window:
 //! - fold when the context reaches [`TRIGGER_RATIO`] of the window;
 //! - short-term memory (the verbatim tail) gets at most [`TAIL_RATIO`];
@@ -31,8 +41,14 @@ pub const HARD_RATIO: f32 = 0.9;
 /// Aim for this much of the window right after a fold (instructions, tools,
 /// memory and tail together), so the next fold is not one turn away.
 pub const AFTER_RATIO: f32 = 0.35;
-/// Room reserved for the rendered memory when sizing the tail.
-const MEMORY_RESERVE_TOKENS: u32 = 2_500;
+/// The user's own earlier messages, kept verbatim through folds.
+pub const USER_RATIO: f32 = 0.08;
+const USER_TOKENS_MAX: u32 = 20_000;
+/// Start folding in the background (alongside the working request) here,
+/// so the fold is ready when the trigger is reached.
+pub const PREFOLD_RATIO: f32 = 0.42;
+/// Old tool outputs are slimmed before any model fold; the newest few stay.
+const KEEP_RECENT_OUTPUTS: usize = 4;
 /// A fold needs at least this many old items besides a previous memory.
 pub const MIN_HEAD_ITEMS: usize = 2;
 
@@ -45,7 +61,6 @@ const GROK4_WINDOW: u32 = 500_000;
 pub const DEFAULT_WINDOW: u32 = 128_000;
 /// The original request is kept whole up to this size (task specs live there).
 const GOAL_CHARS: usize = 6_000;
-const MEMORY_CHARS: usize = 8_000;
 const MIN_MEMORY_CHARS: usize = 40;
 /// Tool outputs longer than this are trimmed when a head must be slimmed.
 const SLIM_OUTPUT_CHARS: usize = 4_000;
@@ -105,13 +120,19 @@ pub struct Budget {
     pub fold_input: u32,
     pub hard: u32,
     pub after: u32,
+    /// Cap of the model-written memory (the original request and git status
+    /// do not count).
+    pub memory: u32,
+    /// The user's verbatim messages.
+    pub user: u32,
+    pub prefold: u32,
 }
 
 impl Budget {
     /// The tail budget once fixed costs (instructions, tool schemas) and
     /// the memory are counted, so a fold lands near [`AFTER_RATIO`].
     pub fn with_fixed(mut self, fixed: u32) -> Self {
-        let room = self.after.saturating_sub(fixed.saturating_add(MEMORY_RESERVE_TOKENS));
+        let room = self.after.saturating_sub(fixed.saturating_add(self.memory).saturating_add(self.user));
         self.tail = self.tail.min(room).max(self.window / 20).max(1);
         self
     }
@@ -125,6 +146,9 @@ impl Budget {
             fold_input: at(FOLD_INPUT_RATIO),
             hard: at(HARD_RATIO),
             after: at(AFTER_RATIO),
+            memory: (window / 32).clamp(800, 6_000),
+            user: at(USER_RATIO).min(USER_TOKENS_MAX),
+            prefold: at(PREFOLD_RATIO),
         }
     }
 }
@@ -242,6 +266,8 @@ fn is_notice_user(text: &str) -> bool {
         || t.starts_with(crate::background::EXIT_NOTICE_PREFIX)
         || t.starts_with(crate::background::CLOSED_NOTICE_PREFIX)
         || t.starts_with(crate::timer::FIRED_NOTICE_PREFIX)
+        || t.starts_with("[loop guard]")
+        || t.starts_with("The previous model request failed")
 }
 
 fn is_real_user(item: &Value) -> bool {
@@ -330,6 +356,8 @@ pub struct Memory {
     pub facts: String,
     pub where_were: String,
     pub open_work: String,
+    /// `git status` at fold time, written by the harness.
+    pub git: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -339,11 +367,16 @@ enum Section {
     Facts,
     Where,
     Open,
+    /// Harness-owned; regenerated at every fold.
+    Git,
 }
 
 fn section_for(heading: &str) -> Option<Section> {
     let h = heading.to_lowercase();
     let any = |keys: &[&str]| keys.iter().any(|k| h.contains(k));
+    if h.contains("git status") {
+        return Some(Section::Git);
+    }
     if any(&["open", "todo", "next", "unfinished", "pending", "未完成", "待辦", "下一步", "待處理", "未解決"]) {
         Some(Section::Open)
     } else if any(&["where", "progress", "status", "state", "進度", "目前", "現況", "位置", "狀態"]) {
@@ -391,6 +424,10 @@ pub fn parse_memory(text: &str) -> Memory {
         Some(i) => &text[i + COMPACT_MARK.len()..],
         None => text.as_str(),
     };
+    // Our own framing is not memory: without this the footer was read back
+    // into the last section and repeated at every fold.
+    let text = text.replace(MEMORY_FOOTER, "");
+    let text = text.as_str();
     let mut current: Option<(Option<Section>, String)> = None;
     let mut body = String::new();
     let mut preface = String::new();
@@ -402,7 +439,11 @@ pub fn parse_memory(text: &str) -> Memory {
             return;
         }
         let body = body.trim();
+        if matches!(sec, Some(Section::Git)) {
+            return;
+        }
         let slot = match sec {
+            Some(Section::Git) => return,
             Some(Section::Original) => &mut mem.original,
             Some(Section::Direction) => &mut mem.direction,
             Some(Section::Facts) | None => &mut mem.facts,
@@ -431,7 +472,7 @@ pub fn parse_memory(text: &str) -> Memory {
     flush(&current, &body, &mut mem);
     // Our own wrapper prose before the first heading is not memory.
     let preface = preface.trim();
-    if !preface.is_empty() && !preface.starts_with("This is your long-term memory") && !is_empty_body(preface) {
+    if !preface.is_empty() && !preface.starts_with(MEMORY_INTRO_START) && !is_empty_body(preface) {
         mem.facts = if mem.facts.is_empty() {
             preface.to_string()
         } else {
@@ -465,23 +506,81 @@ pub fn merge_memory(goal: &str, prev: &Memory, new: &Memory) -> Memory {
         facts: pick(&new.facts, &prev.facts),
         where_were: pick(&new.where_were, &prev.where_were),
         open_work: pick(&new.open_work, &prev.open_work),
+        git: String::new(),
     }
 }
 
-const MEMORY_INTRO: &str = "This is your long-term memory of the earlier turns, written by you after living them — not a transcript and not a new user request.\nOnly key details are kept. Fill gaps with reasoning and common sense; re-read files or re-run commands when you need exact contents. Do not restart and do not invent a different mission.";
+/// The original request: the one an earlier memory pinned, else the first
+/// real user message in the history, else `goal`. The same string goes to
+/// the fold request and into the memory.
+pub fn original_request(history: &[Value], goal: &str) -> String {
+    if let Some(prev) = previous_memory(history) {
+        let o = parse_memory(&prev).original;
+        if !is_empty_body(&o) {
+            return o;
+        }
+    }
+    history
+        .iter()
+        .find(|i| is_real_user(i))
+        .map(item_text)
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| clip_goal(&t))
+        .unwrap_or_else(|| clip_goal(goal))
+}
+
+/// The user's own messages from `head`, verbatim, newest first within
+/// `budget` tokens (the oldest kept one may be clipped), returned oldest
+/// first. Images are dropped; system notices are not the user.
+pub fn keep_user_words(head: &[Value], budget: u32) -> Vec<Value> {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used = 0u32;
+    for item in head.iter().rev().filter(|i| is_real_user(i)) {
+        let mut one = vec![item.clone()];
+        crate::vision::strip_attached_images(&mut one);
+        let item = one.remove(0);
+        let t = item_tokens(&item);
+        if used.saturating_add(t) <= budget {
+            used += t;
+            kept.push(item);
+            continue;
+        }
+        let room = budget.saturating_sub(used);
+        if room >= 200 {
+            // Characters ≤ tokens for any script, so `room` chars fit.
+            let text = item_text(&item);
+            let n = text.chars().count();
+            let keep = (room as usize).saturating_sub(40);
+            if keep > 0 && n > keep {
+                let head: String = text.chars().take(keep / 2).collect();
+                let tail: String = text.chars().skip(n - keep / 2).collect();
+                kept.push(json!({"role": "user", "content": format!("{head}\n[… middle of this message trimmed to fit …]\n{tail}")}));
+            }
+        }
+        break;
+    }
+    kept.reverse();
+    kept
+}
+
+const MEMORY_INTRO_START: &str = "This is your long-term memory";
+const MEMORY_INTRO: &str = "This is your long-term memory of the earlier turns, written by you after living them — not a transcript and not a new user request.\nThe user's own earlier messages are kept verbatim just before this block; they are history, not new requests, and their constraints still hold. Only key details are kept here. Fill gaps with reasoning and common sense; re-read files or re-run commands when you need exact contents. Do not restart and do not invent a different mission.";
 const MEMORY_FOOTER: &str = "The verbatim items after this block are your short-term memory and the live thread; they outrank this summary. Finish the open work before starting something new.";
 
-/// Render with the size cap. Over the cap, the oldest lines of facts and
-/// direction changes go first; lines are never cut in the middle.
-pub fn render_memory(mem: &Memory) -> String {
-    // The original request does not count against the cap: it is the spec.
-    let cap = MEMORY_CHARS + mem.original.chars().count();
+/// Render within `cap` tokens of model-written text. Over the cap, the
+/// oldest lines of facts and direction changes go first; lines are never
+/// cut in the middle. The original request and git status do not count.
+pub fn render_memory(mem: &Memory, cap: u32) -> String {
+    let cap = cap
+        .saturating_add(text_tokens(&mem.original))
+        .saturating_add(text_tokens(&mem.git))
+        .saturating_add(text_tokens(MEMORY_INTRO) + text_tokens(MEMORY_FOOTER) + 64);
     let mut facts: Vec<String> = mem.facts.lines().map(str::to_string).collect();
     let mut direction: Vec<String> = mem.direction.lines().map(str::to_string).collect();
     let mut dropped = 0usize;
     loop {
         let out = render_with(mem, &direction.join("\n"), &facts.join("\n"), dropped);
-        if out.chars().count() <= cap {
+        if text_tokens(&out) <= cap {
             return out;
         }
         if facts.len() > 3 {
@@ -494,13 +593,17 @@ pub fn render_memory(mem: &Memory) -> String {
             direction.remove(0);
         } else {
             // Only single huge sections remain: clip them by characters.
-            let clip = |s: &str| s.chars().take(MEMORY_CHARS / 4).collect::<String>() + "…";
+            let quarter = (cap as usize / 4).max(200);
+            let clip = |s: &str| {
+                if s.chars().count() <= quarter { s.to_string() } else { s.chars().take(quarter).collect::<String>() + "…" }
+            };
             let slim = Memory {
-                original: clip(&mem.original),
+                original: mem.original.clone(),
                 direction: String::new(),
                 facts: String::new(),
                 where_were: clip(&mem.where_were),
                 open_work: clip(&mem.open_work),
+                git: mem.git.clone(),
             };
             return render_with(&slim, "", "", dropped);
         }
@@ -523,6 +626,7 @@ fn render_with(mem: &Memory, direction: &str, facts: &str, dropped: usize) -> St
         facts.to_string()
     };
     section("Load-bearing facts", &facts);
+    section("Git status at fold time", &mem.git);
     section("Where you were", &mem.where_were);
     section("Open work", &mem.open_work);
     out.push('\n');
@@ -564,7 +668,7 @@ pub fn memory_ask(goal: &str, previous: Option<&str>) -> String {
 You lived the turns above. Write sparse long-term memory for them; the newest turns stay verbatim as short-term memory, so do not repeat those.\n\n\
 Keep only what you judge the next you needs:\n\
 1. Original request (kept for you): {}\n\
-2. Direction changes — user constraints or corrections that rewrote the plan, surprises, failures that forced a new approach. A later user request that started a new task goes here, newest last; the newest one is what you are doing now.\n\
+2. Direction changes — turns you took: surprises, failures that forced a new approach, decisions you made. The user's own messages are kept for you verbatim, so do not copy their wording here; if a later user message started a new task, say which one you are on now.\n\
 3. Load-bearing facts — decisions, invariants, file paths, APIs, commands, numbers you would need to rebuild the work by reasoning. Not a log of tool calls.\n\
 4. Where you were — the state of the work in a few lines.\n\
 5. Open work — the exact unfinished thread: the last failing check, the bug being chased, the next concrete step already in flight. Do not declare the work finished to start something new.\n\n\
@@ -660,6 +764,28 @@ pub fn slim_items(items: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Slim tool outputs except the newest `keep` ones. `None` when nothing
+/// would change.
+pub fn trim_old_outputs(items: &[Value], keep: usize) -> Option<Vec<Value>> {
+    let outputs: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| item_type(i) == "function_call_output")
+        .map(|(n, _)| n)
+        .collect();
+    let old: std::collections::HashSet<usize> = outputs.iter().rev().skip(keep).copied().collect();
+    let mut out = items.to_vec();
+    let mut changed = false;
+    for n in old {
+        let slim = slim_items(&items[n..=n]).remove(0);
+        if slim != items[n] {
+            out[n] = slim;
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
 /// Split `items` into consecutive chunks of at most `budget` tokens each,
 /// only at boundaries that keep tool steps whole.
 fn chunk_ranges(items: &[Value], budget: u32) -> Vec<std::ops::Range<usize>> {
@@ -722,6 +848,10 @@ pub struct FoldCtx<'a, P: Provider> {
     pub server_tools: Vec<String>,
     pub budget: Budget,
     pub max_tail_items: Option<usize>,
+    /// For the git status attached to the memory.
+    pub workspace: Option<&'a std::path::Path>,
+    /// Background fold: skip the model-free trim (applied later anyway).
+    pub prefold: bool,
     /// Progress for the user (retries, fallbacks).
     pub notice: &'a (dyn Fn(String) + Send + Sync),
 }
@@ -731,7 +861,8 @@ pub struct Folded {
     pub items: Vec<Value>,
     pub dropped: usize,
     pub kept: usize,
-    /// `lived`, `lived-slim`, `lived-chunked`, `trim`, `emergency`.
+    /// `trim-outputs`, `lived`, `lived-slim`, `lived-chunked`, `trim`,
+    /// `emergency`.
     pub method: String,
 }
 
@@ -745,14 +876,25 @@ pub enum FoldError {
 /// working model.
 pub async fn fold<P: Provider>(ctx: &FoldCtx<'_, P>, history: &[Value]) -> std::result::Result<Folded, FoldError> {
     let fixed = text_tokens(ctx.instructions) + tools_tokens(&ctx.client_tools);
-    let cut = plan_cut(history, &ctx.budget.with_fixed(fixed), ctx.max_tail_items);
+    // 0) No model: slim old tool outputs. Often that alone is enough.
+    if !ctx.prefold {
+        if let Some(trimmed) = trim_old_outputs(history, KEEP_RECENT_OUTPUTS) {
+            if fixed.saturating_add(estimate_tokens("", &trimmed)) <= ctx.budget.after {
+                return Ok(Folded { kept: trimmed.len(), items: trimmed, dropped: 0, method: "trim-outputs".into() });
+            }
+        }
+    }
+    let budget = ctx.budget.with_fixed(fixed);
+    let cut = plan_cut(history, &budget, ctx.max_tail_items);
     if cut == 0 {
         return Err(FoldError::Nothing);
     }
     let (head, tail) = history.split_at(cut);
+    let original = original_request(history, ctx.goal);
+    let users = keep_user_words(head, ctx.budget.user);
     let prev = previous_memory(head).map(|t| parse_memory(&t)).unwrap_or_default();
     // What every fold request carries besides the turns themselves.
-    let overhead = fixed + text_tokens(&memory_ask(ctx.goal, previous_memory(head).as_deref()));
+    let overhead = fixed + text_tokens(&memory_ask(&original, previous_memory(head).as_deref()));
     let fits = |items: &[Value]| estimate_tokens("", items).saturating_add(overhead) <= ctx.budget.fold_input;
 
     // 1) The old turns as they are: same prefix as the conversation, cached.
@@ -763,14 +905,14 @@ pub async fn fold<P: Provider>(ctx: &FoldCtx<'_, P>, history: &[Value]) -> std::
         method = "lived-slim";
     }
     let text = if fits(&attempt_head) {
-        match ask_memory(ctx, fold_input(&attempt_head, ctx.goal)).await {
+        match ask_memory(ctx, fold_input(&attempt_head, &original)).await {
             Ok(t) => Some(t),
             Err(e) if context_overflow(&e) && method == "lived" => {
                 (ctx.notice)("壓縮：舊內容超出模型上下文，改用精簡版".into());
                 attempt_head = slim_items(head);
                 method = "lived-slim";
                 if fits(&attempt_head) {
-                    match ask_memory(ctx, fold_input(&attempt_head, ctx.goal)).await {
+                    match ask_memory(ctx, fold_input(&attempt_head, &original)).await {
                         Ok(t) => Some(t),
                         Err(e) if context_overflow(&e) => None,
                         Err(e) => return Err(FoldError::Failed(e)),
@@ -785,12 +927,13 @@ pub async fn fold<P: Provider>(ctx: &FoldCtx<'_, P>, history: &[Value]) -> std::
     } else {
         None
     };
-    let (memory, method) = match text {
-        Some(t) => (merge_memory(ctx.goal, &prev, &parse_memory(&t)), method),
+    let (mut memory, method) = match text {
+        Some(t) => (merge_memory(&original, &prev, &parse_memory(&t)), method),
         // 2) Still too big: fold in chunks, oldest first, carrying memory.
-        None => (fold_chunks(ctx, head, prev, overhead).await?, "lived-chunked"),
+        None => (fold_chunks(ctx, head, prev, overhead, &original).await?, "lived-chunked"),
     };
-    Ok(splice(memory, head.len(), tail, method))
+    memory.git = ctx.workspace.and_then(crate::diff::status_summary).unwrap_or_default();
+    Ok(splice(memory, users, head.len(), tail, method, ctx.budget.memory))
 }
 
 async fn fold_chunks<P: Provider>(
@@ -798,19 +941,20 @@ async fn fold_chunks<P: Provider>(
     head: &[Value],
     mut memory: Memory,
     overhead: u32,
+    original: &str,
 ) -> std::result::Result<Memory, FoldError> {
     let body: Vec<Value> = slim_items(head).into_iter().filter(|i| !is_memory(i)).collect();
     let room = ctx
         .budget
         .fold_input
         .saturating_sub(overhead)
-        .saturating_sub(text_tokens(&render_memory(&memory)))
+        .saturating_sub(text_tokens(&render_memory(&memory, ctx.budget.memory)))
         .max(1_000);
     let ranges = chunk_ranges(&body, room);
     (ctx.notice)(format!("壓縮：舊內容分 {} 段整理", ranges.len()));
     for range in ranges {
         let mut chunk = Vec::new();
-        let rendered = render_memory(&memory);
+        let rendered = render_memory(&memory, ctx.budget.memory);
         let has_prev = !memory.is_blank();
         if has_prev {
             chunk.push(json!({"role": "user", "content": rendered.clone()}));
@@ -819,10 +963,10 @@ async fn fold_chunks<P: Provider>(
         let mut input = close_fold_head(&chunk);
         input.push(json!({
             "role": "user",
-            "content": memory_ask(ctx.goal, has_prev.then_some(rendered.as_str())),
+            "content": memory_ask(original, has_prev.then_some(rendered.as_str())),
         }));
         let text = ask_memory(ctx, input).await.map_err(FoldError::Failed)?;
-        memory = merge_memory(ctx.goal, &memory, &parse_memory(&text));
+        memory = merge_memory(original, &memory, &parse_memory(&text));
     }
     Ok(memory)
 }
@@ -890,8 +1034,11 @@ pub fn memory_text_from(text: &str, output_items: &[Value]) -> String {
     }
 }
 
-fn splice(memory: Memory, dropped: usize, tail: &[Value], method: &str) -> Folded {
-    let mut items = vec![json!({"role": "user", "content": render_memory(&memory)})];
+/// The folded history: the user's own words (verbatim, oldest first), the
+/// memory, then the verbatim tail.
+fn splice(memory: Memory, users: Vec<Value>, dropped: usize, tail: &[Value], method: &str, cap: u32) -> Folded {
+    let mut items = users;
+    items.push(json!({"role": "user", "content": render_memory(&memory, cap)}));
     items.extend(tail.iter().cloned());
     Folded { items, dropped, kept: tail.len(), method: method.to_string() }
 }
@@ -906,8 +1053,10 @@ pub fn emergency_fold(goal: &str, history: &[Value], budget: &Budget, max_tail_i
         return Folded { kept: items.len(), items, dropped: 0, method: "trim".into() };
     }
     let (head, tail) = history.split_at(cut);
+    let original = original_request(history, goal);
+    let users = keep_user_words(head, budget.user);
     let mut memory = previous_memory(head).map(|t| parse_memory(&t)).unwrap_or_default();
-    memory = merge_memory(goal, &memory, &Memory::default());
+    memory = merge_memory(&original, &memory, &Memory::default());
     if let Some(last) = head.iter().rev().filter(|i| is_assistant(i)).map(item_text).find(|t| !t.trim().is_empty()) {
         let last: String = last.chars().take(600).collect();
         memory.where_were = format!("(last thing you said before the fold) {last}");
@@ -917,7 +1066,7 @@ pub fn emergency_fold(goal: &str, history: &[Value], budget: &Budget, max_tail_i
         head.len()
     );
     memory.facts = if memory.facts.is_empty() { note } else { format!("{}\n{note}", memory.facts) };
-    let mut folded = splice(memory, head.len(), tail, "emergency");
+    let mut folded = splice(memory, users, head.len(), tail, "emergency", budget.memory);
     if estimate_tokens("", &folded.items) > budget.hard {
         folded.items = slim_items(&folded.items);
     }
@@ -1044,6 +1193,7 @@ mod tests {
             facts: "- old fact".into(),
             where_were: "was at step 2".into(),
             open_work: "fix a".into(),
+            git: String::new(),
         };
         let new = parse_memory("## Direction changes\nnone\n## Load-bearing facts\n- reconsolidated fact\n## Where you were\nstep 5\n## Open work\nfix b");
         let m = merge_memory("ship v1", &prev, &new);
@@ -1057,8 +1207,9 @@ mod tests {
     fn render_drops_oldest_lines_whole_and_says_so() {
         let facts: Vec<String> = (0..600).map(|i| format!("- fact number {i:04} with some detail")).collect();
         let m = Memory { original: "goal".into(), facts: facts.join("\n"), open_work: "keep me".into(), ..Default::default() };
-        let out = render_memory(&m);
-        assert!(out.chars().count() <= MEMORY_CHARS + 4);
+        let cap = 2_000;
+        let out = render_memory(&m, cap);
+        assert!(text_tokens(&out) <= cap + text_tokens(MEMORY_INTRO) + text_tokens(MEMORY_FOOTER) + 80, "{}", text_tokens(&out));
         assert!(out.contains("fact number 0599 with some detail"), "newest kept whole");
         assert!(!out.contains("fact number 0000"), "oldest dropped");
         assert!(out.contains("older lines dropped"));
@@ -1075,8 +1226,117 @@ mod tests {
         let spec: String = (0..120).map(|i| format!("- rule {i:03}: key q{i} must be named exactly k{i}
 ")).collect();
         let m = merge_memory(&spec, &Memory::default(), &Memory::default());
-        let out = render_memory(&m);
+        let out = render_memory(&m, 800);
         assert!(out.contains("rule 060: key q60 must be named exactly k60"), "middle of the spec survives");
+    }
+
+    // ---- issue #2: what the harness keeps exactly
+
+    #[test]
+    fn earlier_user_constraints_survive_verbatim_whatever_the_model_writes() {
+        let head = vec![
+            user("做登入功能"),
+            assistant("ok"),
+            user("不要動 migrations/"),
+            call("a", "{}"),
+            out("a", "ok"),
+            user("改用 pnpm"),
+            assistant("noted"),
+        ];
+        let kept = keep_user_words(&head, 2_000);
+        let texts: Vec<String> = kept.iter().map(item_text).collect();
+        assert_eq!(texts, ["做登入功能", "不要動 migrations/", "改用 pnpm"], "verbatim, oldest first");
+        // Even if the model forgets it in its memory, the words are kept.
+        let forgetful = parse_memory("## Direction changes\n- 改用 pnpm\n");
+        let folded = splice(merge_memory("做登入功能", &Memory::default(), &forgetful), kept, head.len(), &[], "lived", 2_000);
+        let all: Vec<String> = folded.items.iter().map(item_text).collect();
+        assert!(all.iter().any(|t| t == "不要動 migrations/"), "{all:?}");
+        assert!(is_memory(folded.items.last().unwrap()), "memory comes after the user's words");
+    }
+
+    #[test]
+    fn user_words_are_kept_newest_first_within_budget_and_skip_notices() {
+        let head = vec![
+            user(&"舊需求很長".repeat(400)),
+            user(&format!("{} exited", crate::background::EXIT_NOTICE_PREFIX)),
+            user("[loop guard] Your previous response was cut off"),
+            user("最新的約束：輸出用英文"),
+        ];
+        let kept = keep_user_words(&head, 600);
+        let texts: Vec<String> = kept.iter().map(item_text).collect();
+        assert_eq!(texts.last().unwrap(), "最新的約束：輸出用英文");
+        assert!(!texts.iter().any(|t| t.contains("exited") || t.contains("loop guard")), "{texts:?}");
+        assert!(texts[0].contains("trimmed to fit"), "the oldest is clipped, not dropped silently: {texts:?}");
+        let tokens: u32 = kept.iter().map(item_tokens).sum();
+        assert!(tokens <= 600 + 50, "{tokens}");
+    }
+
+    #[test]
+    fn the_memory_ask_no_longer_asks_to_restate_user_constraints() {
+        let ask = memory_ask("做登入功能", None);
+        assert!(ask.contains("kept for you verbatim"), "{ask}");
+        assert!(!ask.contains("user constraints or corrections"), "{ask}");
+    }
+
+    #[test]
+    fn original_request_comes_from_history_not_the_first_message_of_this_run() {
+        // A resumed session: old context, then the new run's first message.
+        let resumed = vec![user("做一個 todo CLI"), assistant("好"), user("繼續")];
+        assert_eq!(original_request(&resumed, "繼續"), "做一個 todo CLI");
+        // With an earlier memory, its pinned request wins, and the fold
+        // request and the merge use the same string.
+        let prev = Memory { original: "做一個 todo CLI".into(), open_work: "- 加測試".into(), ..Default::default() };
+        let with_memory = vec![user(&render_memory(&prev, 2_000)), user("繼續")];
+        let original = original_request(&with_memory, "繼續");
+        assert_eq!(original, "做一個 todo CLI");
+        let ask = memory_ask(&original, Some(&render_memory(&prev, 2_000)));
+        assert!(ask.contains("Original request (kept for you): 做一個 todo CLI"));
+        let merged = merge_memory(&original, &prev, &parse_memory("## Open work\n- 加測試\n"));
+        assert_eq!(merged.original, "做一個 todo CLI");
+    }
+
+    #[test]
+    fn the_memory_cap_is_in_tokens_and_scales_with_the_window() {
+        assert!(Budget::new(32 * 1024).memory < Budget::new(128_000).memory);
+        assert_eq!(Budget::new(500_000).memory, 6_000);
+        // The same cap holds for Chinese and English memories.
+        let zh = Memory { facts: (0..400).map(|i| format!("- 第{i}條中文事實，內容比較長一些")).collect::<Vec<_>>().join("\n"), ..Default::default() };
+        let en = Memory { facts: (0..400).map(|i| format!("- english fact number {i} with detail")).collect::<Vec<_>>().join("\n"), ..Default::default() };
+        let cap = 1_500;
+        let slack = text_tokens(MEMORY_INTRO) + text_tokens(MEMORY_FOOTER) + 80;
+        assert!(text_tokens(&render_memory(&zh, cap)) <= cap + slack);
+        assert!(text_tokens(&render_memory(&en, cap)) <= cap + slack);
+    }
+
+    #[test]
+    fn rendered_memory_parses_back_without_the_footer_or_git_status() {
+        let m = Memory { open_work: "fix test_login".into(), git: "M src/a.rs".into(), ..Default::default() };
+        let back = parse_memory(&render_memory(&m, 2_000));
+        assert_eq!(back.open_work, "fix test_login", "the footer is not read into the last section");
+        assert!(back.git.is_empty() && !back.facts.contains("src/a.rs"), "git status is regenerated, not carried");
+    }
+
+    #[test]
+    fn old_tool_outputs_are_slimmed_first_and_the_newest_stay() {
+        let big = "x".repeat(20_000);
+        let mut items = vec![user("go")];
+        for i in 0..6 {
+            items.push(call(&format!("c{i}"), "{}"));
+            items.push(out(&format!("c{i}"), &big));
+        }
+        let trimmed = trim_old_outputs(&items, 4).expect("two old outputs slimmed");
+        let sizes: Vec<usize> = trimmed.iter().filter(|i| item_type(i) == "function_call_output").map(|i| item_text(i).len()).collect();
+        assert!(sizes[0] < 6_000 && sizes[1] < 6_000, "{sizes:?}");
+        assert!(sizes[2..].iter().all(|&n| n == 20_000), "{sizes:?}");
+        assert!(trim_old_outputs(&trimmed, 4).is_none(), "nothing left to slim");
+    }
+
+    #[test]
+    fn small_windows_keep_a_usable_tail() {
+        let b = Budget::new(32 * 1024).with_fixed(8_000);
+        assert!(b.tail >= 32 * 1024 / 20);
+        assert_eq!(b.trigger, 16_384);
+        assert!(b.prefold < b.trigger);
     }
 
     #[test]
@@ -1179,8 +1439,26 @@ mod tests {
             server_tools: Vec::new(),
             budget: Budget::new(window),
             max_tail_items: Some(2),
+            workspace: None,
+            prefold: false,
             notice: notes,
         }
+    }
+
+    #[tokio::test]
+    async fn trimming_old_outputs_can_replace_a_model_fold() {
+        let p = Scripted { replies: Mutex::new(vec![]), inputs: Mutex::new(vec![]) };
+        let notes = |_: String| {};
+        let mut history = vec![user("ship the kernel")];
+        for i in 0..8 {
+            history.push(call(&format!("c{i}"), "{}"));
+            history.push(out(&format!("c{i}"), &"y".repeat(40_000)));
+        }
+        let mut c = ctx(&p, &notes, 128_000);
+        c.max_tail_items = None;
+        let f = fold(&c, &history).await.ok().unwrap();
+        assert_eq!(f.method, "trim-outputs");
+        assert!(p.inputs.lock().unwrap().is_empty(), "no model call");
     }
 
     #[tokio::test]
@@ -1192,7 +1470,7 @@ mod tests {
         assert_eq!(f.method, "lived");
         let sent = p.inputs.lock().unwrap()[0].clone();
         assert_eq!(&sent[..4], &history[..4], "head verbatim keeps the cache prefix");
-        let mem = item_text(&f.items[0]);
+        let mem = previous_memory(&f.items).expect("a memory item");
         assert!(mem.contains("keep ABI stable") && mem.contains("ship the kernel"));
     }
 
@@ -1219,7 +1497,7 @@ mod tests {
         }
         let f = fold(&ctx(&p, &notes, 8_000), &history).await.ok().unwrap();
         assert!(f.method == "lived-chunked" || f.method == "lived-slim", "{}", f.method);
-        let mem = item_text(&f.items[0]);
+        let mem = previous_memory(&f.items).expect("a memory item");
         assert!(mem.contains("fact from chunk"), "{mem}");
     }
 }

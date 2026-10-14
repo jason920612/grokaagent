@@ -193,8 +193,11 @@ def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_roo
         "--workspace", str(ws),
         "--max-turns", str(task.get("max_turns", 40)),
         "--reasoning", m.get("reasoning", "high"),
-        task["prompt"],
     ]
+    # Later user messages, each sent when the agent waits for input.
+    for msg in task.get("followups", []):
+        cmd += ["--then", msg]
+    cmd.append(task["prompt"])
     timeout = task.get("timeout_s", 600)
     log(f"start  {alias:22s} {task['id']} t{trial}")
     t0 = time.time()
@@ -219,7 +222,8 @@ def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_roo
     }
     (run_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"done   {alias:22s} {task['id']} t{trial}  score={result['score']:.2f}  {wall:.0f}s"
-        f"{'  TIMEOUT' if timed_out else ''}  turns={metrics['turns']} tool_err={metrics['tool_errors']}/{metrics['tool_calls']}")
+        f"{'  TIMEOUT' if timed_out else ''}  turns={metrics['turns']} tool_err={metrics['tool_errors']}/{metrics['tool_calls']}"
+        f"  folds={metrics['compactions']}")
     return result
 
 

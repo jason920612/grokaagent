@@ -483,6 +483,28 @@ fn status_entries(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `git status --short` (capped) plus the diff size, for a memory fold.
+/// `None` outside a git repo or when the tree is clean.
+pub fn status_summary(workspace: &Path) -> Option<String> {
+    let root = git_toplevel(workspace).ok()?;
+    let entries = status_entries(&root);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = entries.iter().take(40).map(|(code, path)| format!("{} {path}", code.trim())).collect();
+    if entries.len() > 40 {
+        out.push(format!("… {} more", entries.len() - 40));
+    }
+    if let Ok(stat) = git_output(&root, &["diff", "--shortstat", "HEAD"]) {
+        let stat = stat.trim();
+        if !stat.is_empty() {
+            out.push(stat.to_string());
+        }
+    }
+    Some(out.join("
+"))
+}
+
 /// Take a snapshot before running a command. `None` outside a git repo.
 pub fn snapshot(workspace: &Path) -> Option<Snapshot> {
     let root = git_toplevel(workspace).ok()?;
