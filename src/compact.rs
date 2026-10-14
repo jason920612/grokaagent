@@ -314,6 +314,19 @@ fn align_cut(items: &[Value], mut cut: usize) -> usize {
         if cut > 0 && item_type(&items[cut - 1]) == "reasoning" {
             cut -= 1;
         }
+        // One response is `reasoning, message…, function_call…`: a cut at
+        // its calls or text keeps its reasoning too. Calls of the current
+        // turn without their reasoning cost DeepSeek ~10K extra tokens per
+        // request (and lose the model its own train of thought).
+        if cut < items.len() && (item_type(&items[cut]) == "function_call" || is_assistant(&items[cut])) {
+            let mut j = cut;
+            while j > 0 && is_assistant(&items[j - 1]) {
+                j -= 1;
+            }
+            if j > 0 && j < cut && item_type(&items[j - 1]) == "reasoning" {
+                cut = j - 1;
+            }
+        }
         // Parallel calls: keep a run of function_calls together.
         while cut > 0 && cut < items.len() && item_type(&items[cut]) == "function_call"
             && item_type(&items[cut - 1]) == "function_call"
@@ -812,6 +825,35 @@ pub fn trim_old_outputs(items: &[Value], keep: usize) -> Option<Vec<Value>> {
     changed.then_some(out)
 }
 
+/// The model-free first layer of a fold: old tool outputs slimmed, kept
+/// only if that alone brings `history` plus `fixed` within `after` (all in
+/// local units). The turns themselves stay word for word.
+pub fn trim_fold(history: &[Value], fixed: u32, after: u32) -> Option<Folded> {
+    let trimmed = trim_old_outputs(history, KEEP_RECENT_OUTPUTS)?;
+    (fixed.saturating_add(estimate_tokens("", &trimmed)) <= after)
+        .then(|| Folded { kept: trimmed.len(), items: trimmed, dropped: 0, method: "trim-outputs".into() })
+}
+
+/// About how big the history would be after a model fold made now (local
+/// units, `budget` already in local units): the user's words, a memory of
+/// `memory` tokens (framing, original request and git status included) and
+/// the tail the fold would keep. `None` when there is nothing to fold.
+pub fn fold_floor(history: &[Value], fixed: u32, memory: u32, budget: &Budget, max_tail_items: Option<usize>) -> Option<u32> {
+    let cut = plan_cut(history, &budget.with_fixed(fixed), max_tail_items);
+    if cut == 0 {
+        return None;
+    }
+    let (head, tail) = history.split_at(cut);
+    let users: u32 = keep_user_words(head, budget.user).iter().map(item_tokens).sum();
+    let tail: u32 = tail.iter().map(|i| item_tokens(&clip_reasoning(i, KEPT_REASONING_TOKENS))).sum();
+    Some(fixed.saturating_add(users).saturating_add(memory).saturating_add(tail))
+}
+
+/// Tokens of the memory item in `items`, as rendered (framing included).
+pub fn memory_item_tokens(items: &[Value]) -> Option<u32> {
+    items.iter().rev().find(|i| is_memory(i)).map(item_tokens)
+}
+
 /// Split `items` into consecutive chunks of at most `budget` tokens each,
 /// only at boundaries that keep tool steps whole.
 fn chunk_ranges(items: &[Value], budget: u32) -> Vec<std::ops::Range<usize>> {
@@ -836,6 +878,11 @@ fn chunk_ranges(items: &[Value], budget: u32) -> Vec<std::ops::Range<usize>> {
         out.push(start..items.len());
     }
     out
+}
+
+/// What every request carries besides the conversation (local units).
+pub fn fixed_tokens(instructions: &str, tools: &[ToolSpec]) -> u32 {
+    text_tokens(instructions).saturating_add(tools_tokens(tools))
 }
 
 pub fn tools_tokens(tools: &[ToolSpec]) -> u32 {
@@ -876,7 +923,8 @@ pub struct FoldCtx<'a, P: Provider> {
     pub max_tail_items: Option<usize>,
     /// For the git status attached to the memory.
     pub workspace: Option<&'a std::path::Path>,
-    /// Background fold: skip the model-free trim (applied later anyway).
+    /// Background fold: skip the model-free trim. The caller tries
+    /// [`trim_fold`] itself, before starting one and again at the trigger.
     pub prefold: bool,
     /// Progress for the user (retries, fallbacks).
     pub notice: &'a (dyn Fn(String) + Send + Sync),
@@ -901,13 +949,11 @@ pub enum FoldError {
 /// Fold the old part of `history` into long-term memory written by the
 /// working model.
 pub async fn fold<P: Provider>(ctx: &FoldCtx<'_, P>, history: &[Value]) -> std::result::Result<Folded, FoldError> {
-    let fixed = text_tokens(ctx.instructions) + tools_tokens(&ctx.client_tools);
+    let fixed = fixed_tokens(ctx.instructions, &ctx.client_tools);
     // 0) No model: slim old tool outputs. Often that alone is enough.
     if !ctx.prefold {
-        if let Some(trimmed) = trim_old_outputs(history, KEEP_RECENT_OUTPUTS) {
-            if fixed.saturating_add(estimate_tokens("", &trimmed)) <= ctx.budget.after {
-                return Ok(Folded { kept: trimmed.len(), items: trimmed, dropped: 0, method: "trim-outputs".into() });
-            }
+        if let Some(trimmed) = trim_fold(history, fixed, ctx.budget.after) {
+            return Ok(trimmed);
         }
     }
     let budget = ctx.budget.with_fixed(fixed);
@@ -1204,6 +1250,30 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_never_separates_tool_calls_from_their_reasoning() {
+        // DeepSeek's responses: reasoning, a short message, then the calls.
+        let think = |n: usize| json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": format!("plan {n} {}", "think ".repeat(300))}]});
+        let mut items = vec![user("build it")];
+        for i in 0..8 {
+            items.push(think(i));
+            items.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": format!("step {i}")}]}));
+            items.push(call(&format!("c{i}"), "{}"));
+            items.push(call(&format!("d{i}"), "{}"));
+            items.push(out(&format!("c{i}"), &"x".repeat(6_000)));
+            items.push(out(&format!("d{i}"), &"y".repeat(6_000)));
+        }
+        for window in [20_000, 32_768, 64_000] {
+            let cut = plan_cut(&items, &Budget::new(window).with_fixed(2_000), None);
+            assert!(cut > 0, "{window}");
+            assert_eq!(item_type(&items[cut]), "reasoning", "window {window}: the tail starts at a whole response");
+        }
+        // Any cut point at a call or at the text moves back to the reasoning.
+        assert_eq!(align_cut(&items, 3), 1);
+        assert_eq!(align_cut(&items, 2), 1);
+        assert_eq!(align_cut(&items, 4), 1);
+    }
+
+    #[test]
     fn tail_reaches_back_to_the_last_user_turn_when_cheap() {
         let mut items = vec![user("old task"), assistant("ok"), user("new direction: use sqlite")];
         for i in 0..8 {
@@ -1343,6 +1413,54 @@ mod tests {
         let folded = splice(Memory::default(), Vec::new(), 3, &[long, call.clone()], "lived", 1_000);
         assert!(folded.items.iter().map(item_tokens).sum::<u32>() < 2_500);
         assert_eq!(folded.items.last().unwrap(), &call);
+    }
+
+    #[test]
+    fn trimming_old_outputs_counts_as_a_fold_only_when_it_is_enough() {
+        let big = |id: &str| {
+            vec![
+                json!({"type": "function_call", "call_id": id, "name": "cat", "arguments": "{}"}),
+                json!({"type": "function_call_output", "call_id": id, "output": "log line\n".repeat(2_000)}),
+            ]
+        };
+        let mut history = vec![user("看一下 log")];
+        for n in 0..6 {
+            history.extend(big(&format!("c{n}")));
+        }
+        let all = estimate_tokens("", &history);
+        let t = trim_fold(&history, 100, all).expect("slimming the two oldest outputs is enough");
+        assert_eq!(t.method, "trim-outputs");
+        assert_eq!(t.items.len(), history.len(), "nothing dropped: every turn stays");
+        assert!(estimate_tokens("", &t.items) < all);
+        assert!(trim_fold(&history, 100, 1_000).is_none(), "not enough: leave it to the model fold");
+    }
+
+    #[test]
+    fn the_fold_floor_counts_what_a_fold_would_keep() {
+        let mut history = vec![user(&"登入".repeat(600))];
+        for n in 0..12 {
+            history.push(assistant(&format!("step {n} {}", "detail ".repeat(2_000))));
+        }
+        // The last response thought at length: the floor counts its
+        // reasoning clipped, as the fold keeps it.
+        history.push(json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "think ".repeat(8_000)}]}));
+        history.push(call("c-last", "{}"));
+        history.push(out("c-last", "ok"));
+        let b = Budget::new(32_768);
+        let fixed = 2_000;
+        // What a fold of this history keeps, built the way fold() builds it.
+        let cut = plan_cut(&history, &b.with_fixed(fixed), None);
+        assert!(cut > 0);
+        let (head, tail) = history.split_at(cut);
+        let users = keep_user_words(head, b.user);
+        assert!(!users.is_empty() && !tail.is_empty());
+        assert_eq!(item_type(&tail[0]), "reasoning", "the tail keeps the reasoning with its call");
+        let memory = Memory { original: original_request(&history, "做登入"), facts: "- a fact".into(), ..Default::default() };
+        let folded = splice(memory, users, head.len(), tail, "lived", b.memory);
+        let mem = memory_item_tokens(&folded.items).unwrap();
+        // The floor is exactly the size of that fold, framing included.
+        assert_eq!(fold_floor(&history, fixed, mem, &b, None), Some(fixed + estimate_tokens("", &folded.items)));
+        assert_eq!(fold_floor(&history[..2], fixed, mem, &b, None), None, "too little to fold");
     }
 
     #[test]
