@@ -58,7 +58,8 @@ fn ask(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position> {
     let fill_h = if filling { 3 } else { 0 };
     let h = (q_rows + n as u16 + fill_h + 6).min(area.height.saturating_sub(2)).max(10);
     let r = centered(area, inner_w + 4, h);
-    let body = panel(f, app, r, "問卷");
+    let title = if prompt.starts_with("代理要求把這個資料夾加入工作區") { "工作區存取請求" } else { "問卷" };
+    let body = panel(f, app, r, title);
     f.render_widget(
         Paragraph::new(prompt).style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)).wrap(Wrap { trim: true }),
         Rect::new(body.x, body.y, body.width, q_rows),

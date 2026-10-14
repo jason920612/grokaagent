@@ -41,6 +41,12 @@ enum Command {
     Login,
     /// Delete the saved xAI OAuth tokens.
     Logout,
+    /// List folders granted to projects beyond their workspace, or revoke one.
+    Grants {
+        /// Remove this folder from every project's grants.
+        #[arg(long)]
+        revoke: Option<PathBuf>,
+    },
     /// Run one agent turn-loop (headless).
     Run {
         prompt: Option<String>,
@@ -221,6 +227,26 @@ async fn real_main() -> grokaagent::Result<()> {
         Some(Command::Logout) => {
             auth::delete_auth_file(&auth_path)?;
             println!("logged out");
+        }
+        Some(Command::Grants { revoke }) => {
+            let Some(store) = grokaagent::grants::Store::default_store() else {
+                return Ok(());
+            };
+            if let Some(path) = revoke {
+                let n = store.revoke(None, &path)?;
+                println!("revoked {n} grant(s) for {}", path.display());
+            } else {
+                let all = store.list_all();
+                if all.is_empty() {
+                    println!("no permanent grants (session grants end with their conversation)");
+                }
+                for (ws, list) in all {
+                    println!("{ws}");
+                    for g in list {
+                        println!("  + {}  ({})", g.path.display(), g.reason);
+                    }
+                }
+            }
         }
         Some(Command::Tui {
             model,

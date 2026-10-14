@@ -10,6 +10,7 @@ pub mod cmdrisk;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod grants;
 pub mod grok_search;
 pub mod folderpick;
 pub mod hostio;

@@ -24,11 +24,13 @@ pub struct Scope<'a> {
     pub cwd: &'a Path,
     /// Scratch folders that count as harmless (`/tmp`, the user temp dir).
     pub temp: Vec<PathBuf>,
+    /// Folders the user granted (see [`crate::grants`]): inside, too.
+    pub extra: Vec<PathBuf>,
 }
 
 impl<'a> Scope<'a> {
     pub fn new(workspace: &'a Path, cwd: &'a Path) -> Self {
-        Self { workspace, cwd, temp: temp_roots() }
+        Self { workspace, cwd, temp: temp_roots(), extra: crate::grants::roots(workspace) }
     }
 }
 
@@ -448,7 +450,7 @@ fn outside_as(w: &Word, scope: &Scope, strict: bool) -> Option<String> {
     }
     let path = if absolute { native(t) } else { scope.cwd.join(t) };
     let resolved = lexical(&path);
-    if same_root(&resolved, scope.workspace) {
+    if same_root(&resolved, scope.workspace) || scope.extra.iter().any(|r| same_root(&resolved, r)) {
         return None;
     }
     if absolute {
@@ -875,7 +877,7 @@ mod tests {
 
     fn reasons(f: &Fx, cmd: &str) -> Vec<String> {
         // The fixture itself lives in the temp folder: no temp exemption here.
-        assess(cmd, &Scope { workspace: &f.ws, cwd: &f.ws, temp: Vec::new() })
+        assess(cmd, &Scope { workspace: &f.ws, cwd: &f.ws, temp: Vec::new(), extra: Vec::new() })
     }
 
     /// The path as a model would type it (no `\\?\` verbatim prefix).
@@ -1007,18 +1009,29 @@ mod tests {
     fn dotdot_inside_the_workspace_is_fine_but_escaping_is_not() {
         let f = fx();
         let sub = f.ws.join("src");
-        let inside = assess("cat ../Cargo.toml", &Scope { workspace: &f.ws, cwd: &sub, temp: Vec::new() });
+        let inside = assess("cat ../Cargo.toml", &Scope { workspace: &f.ws, cwd: &sub, temp: Vec::new(), extra: Vec::new() });
         assert!(inside.is_empty(), "{inside:?}");
-        let out = assess("cat ../../secret", &Scope { workspace: &f.ws, cwd: &sub, temp: Vec::new() });
+        let out = assess("cat ../../secret", &Scope { workspace: &f.ws, cwd: &sub, temp: Vec::new(), extra: Vec::new() });
         assert!(!out.is_empty());
     }
 
     #[test]
     fn the_temp_folder_is_scratch_space() {
         let f = fx();
-        let scope = Scope { workspace: &f.ws, cwd: &f.ws, temp: vec![PathBuf::from("/tmp"), std::env::temp_dir()] };
+        let scope = Scope { workspace: &f.ws, cwd: &f.ws, temp: vec![PathBuf::from("/tmp"), std::env::temp_dir()], extra: Vec::new() };
         assert!(assess("ls -la /tmp && echo x > /tmp/scratch.txt", &scope).is_empty());
         assert!(!assess("rm -rf /tmp/*", &scope).is_empty(), "recursive deletes are still flagged");
+    }
+
+    #[test]
+    fn granted_folders_count_as_inside() {
+        let f = fx();
+        let other = slash(&f.other);
+        let cmd = format!("cp data.csv {other}/data.csv && cat {other}/notes.txt");
+        let plain = Scope { workspace: &f.ws, cwd: &f.ws, temp: Vec::new(), extra: Vec::new() };
+        assert!(!assess(&cmd, &plain).is_empty());
+        let granted = Scope { workspace: &f.ws, cwd: &f.ws, temp: Vec::new(), extra: vec![f.other.clone()] };
+        assert!(assess(&cmd, &granted).is_empty(), "{:?}", assess(&cmd, &granted));
     }
 
     #[test]

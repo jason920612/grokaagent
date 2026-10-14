@@ -348,6 +348,10 @@ impl Nursery {
             .arg(&self.workspace)
             .arg("--model")
             .arg(&model);
+        let extra = crate::grants::env_value(&self.workspace);
+        if !extra.is_empty() {
+            cmd.env(crate::grants::ENV, extra);
+        }
         if self.child_search() {
             cmd.arg("--search");
         }

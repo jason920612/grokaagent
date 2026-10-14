@@ -343,13 +343,46 @@ pub fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf
     let canonical = target
         .canonicalize()
         .map_err(|_| Error::Tool(format!("file not found: {requested}")))?;
-    let workspace = workspace
+    let workspace_c = workspace
         .canonicalize()
         .map_err(|e| Error::Tool(format!("workspace not found: {e}")))?;
-    if !canonical.starts_with(&workspace) {
-        return Err(Error::Tool("path escapes workspace".into()));
+    if !canonical.starts_with(&workspace_c) && !crate::grants::within(&canonical, &crate::grants::roots(workspace)) {
+        return Err(Error::Tool(escape_message(requested)));
     }
     Ok(canonical)
+}
+
+fn escape_message(requested: &str) -> String {
+    format!(
+        "path escapes workspace: {requested} is outside it. If the task needs that folder, ask the user with request_workspace_access (give the reason)."
+    )
+}
+
+/// A path outside the workspace that lands in a folder the user granted.
+fn granted_target(workspace: &Path, requested: &str) -> Option<PathBuf> {
+    let roots = crate::grants::roots(workspace);
+    if roots.is_empty() {
+        return None;
+    }
+    let joined = if Path::new(requested).is_absolute() { PathBuf::from(requested) } else { workspace.join(requested) };
+    // Resolve `..` lexically, then canonicalize what exists (symlinks).
+    let mut lexical = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::CurDir => {}
+            other => lexical.push(other.as_os_str()),
+        }
+    }
+    let resolved = if lexical.exists() {
+        lexical.canonicalize().ok()?
+    } else {
+        let parent = lexical.parent()?.canonicalize().ok()?;
+        parent.join(lexical.file_name()?)
+    };
+    crate::grants::within(&resolved, &roots).then_some(resolved)
 }
 
 /// Resolve a path that may not exist yet (write/create).
@@ -359,6 +392,9 @@ pub fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf
 pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf> {
     if requested.is_empty() {
         return Err(Error::Tool("path is required".into()));
+    }
+    if let Some(p) = granted_target(workspace, requested) {
+        return Ok(p);
     }
     let workspace = workspace
         .canonicalize()
@@ -371,11 +407,11 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
                 .canonicalize()
                 .map_err(|_| Error::Tool(format!("path not found: {requested}")))?;
             if !parent.starts_with(&workspace) {
-                return Err(Error::Tool("path escapes workspace".into()));
+                return Err(Error::Tool(escape_message(requested)));
             }
             return Ok(parent.join(joined.file_name().unwrap_or_default()));
         }
-        return Err(Error::Tool("path escapes workspace".into()));
+        return Err(Error::Tool(escape_message(requested)));
     }
     let mut out = workspace.clone();
     for c in Path::new(requested).components() {
@@ -383,7 +419,7 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
             Component::CurDir => {}
             Component::ParentDir => {
                 if !out.pop() || !out.starts_with(&workspace) {
-                    return Err(Error::Tool("path escapes workspace".into()));
+                    return Err(Error::Tool(escape_message(requested)));
                 }
                 if out.exists() {
                     out = canonicalize_in_workspace(&workspace, &out)?;
@@ -396,7 +432,7 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
                 }
             }
             Component::Prefix(_) | Component::RootDir => {
-                return Err(Error::Tool("path escapes workspace".into()));
+                return Err(Error::Tool(escape_message(requested)));
             }
         }
     }
@@ -410,7 +446,7 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
         }
     }
     if !out.starts_with(&workspace) {
-        return Err(Error::Tool("path escapes workspace".into()));
+        return Err(Error::Tool(escape_message(requested)));
     }
     Ok(out)
 }

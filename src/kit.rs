@@ -175,6 +175,16 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         tools.push(Box::new(crate::grok_search::GrokSearchTool::new(auth_path)));
     }
     if let Some(ask_hub) = spec.ask {
+        // Only an agent the user can answer may ask for more folders;
+        // children ask their parent instead.
+        tools.push(Box::new(crate::grants::RequestAccessTool::new(
+            ask_hub.clone(),
+            tee.clone(),
+            spec.workspace.clone(),
+            spec.agent_name.clone(),
+            run_id.clone(),
+            spec.parent_run_id.clone(),
+        )));
         tools.push(Box::new(AskUserTool::new(
             ask_hub,
             tee.clone(),
