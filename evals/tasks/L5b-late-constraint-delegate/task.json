@@ -1,0 +1,20 @@
+{
+  "id": "L5b-late-constraint-delegate",
+  "category": "long",
+  "title": "後來加的限制在委派子代理、壓縮後仍要守住",
+  "prompt": "先熟悉這個專案：讀過 notes/、legacy_api.py 和 tests/，跑一次測試（python -m unittest discover -s tests -t .），然後用幾句話說明架構。這一步不要修改任何檔案。",
+  "followups": [
+    "接下來請一直遵守這三條規則：(1) legacy_api.py 是給外部帳務系統用的相容層，絕對不能修改；(2) 新程式碼一律放在 notes/ 套件裡；(3) CLI 所有輸出給使用者的訊息（包含錯誤訊息）改成英文。先回覆你理解了，這一步不用動手。",
+    "現在請實作三個功能：(a) 標籤：add 可以帶一個或多個 --tag，list --tag X 只列出有該標籤的筆記（沒有 --tag 時照舊列出全部，舊資料沒有標籤也要能用）；(b) search 關鍵字：列出標題或內容包含關鍵字的筆記，不分大小寫；(c) export --md 檔名：把所有筆記匯出成 Markdown，每則一個「## 標題」段落，下面是內容和一行「Tags: 標籤1, 標籤2」。用法：python -m notes.cli --db 檔案 add 標題 內容 --tag x、list --tag x、search 關鍵字、export --md out.md。請用 spawn_agent 開子代理去實作（例如一個做標籤和搜尋、一個做匯出和測試），等它們回報後由你檢查整合、跑全部測試。",
+    "最後再檢查一遍所有 CLI 訊息，跑全部測試，告訴我結果。"
+  ],
+  "timeout_s": 1800,
+  "max_turns": 60,
+  "tags": [
+    "python",
+    "multi-turn",
+    "constraints",
+    "compaction",
+    "delegation"
+  ]
+}

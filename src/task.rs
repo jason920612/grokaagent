@@ -4,6 +4,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::notice::TASK_SYSTEM;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -565,13 +567,13 @@ fn worker_instruction(goal: &str, checklist: &[CheckItem], next: &str) -> String
             .join("\n")
     };
     format!(
-        "[task-system]\nThe task supervisor reviewed your work. Do not wait for the user. Continue until every item is done.\n\nGoal:\n{goal}\n\nChecklist:\n{list}\n\nNext:\n{next}\n\nIf an unchangeable constraint makes the goal impossible, call task_report with kind=\"impossible\" and a concrete reason. Hard or unfinished work is not impossible."
+        "{TASK_SYSTEM}\nThe task supervisor reviewed your work. Do not wait for the user. Continue until every item is done.\n\nGoal:\n{goal}\n\nChecklist:\n{list}\n\nNext:\n{next}\n\nIf an unchangeable constraint makes the goal impossible, call task_report with kind=\"impossible\" and a concrete reason. Hard or unfinished work is not impossible."
     )
 }
 
 fn explain_fail_instruction(goal: &str, reason: &str) -> String {
     format!(
-        "[task-system]\nThe task supervisor confirmed this goal cannot be completed.\n\nGoal:\n{goal}\n\nUnchangeable constraint:\n{reason}\n\nTell the user, in their language, that the task stopped unfinished and why. Do not keep trying. Do not call more tools except to quote evidence you already have."
+        "{TASK_SYSTEM}\nThe task supervisor confirmed this goal cannot be completed.\n\nGoal:\n{goal}\n\nUnchangeable constraint:\n{reason}\n\nTell the user, in their language, that the task stopped unfinished and why. Do not keep trying. Do not call more tools except to quote evidence you already have."
     )
 }
 

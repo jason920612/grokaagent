@@ -293,25 +293,38 @@ fn sh_read_only_pipeline(command: &str) -> bool {
     if expect_target {
         return false;
     }
-    // Per-program traps.
-    let mut prog = "";
+    // Per-program traps: options and arguments that make a reader write.
+    let mut cmds: Vec<Vec<&str>> = vec![Vec::new()];
     for w in &words {
         match w {
-            ShWord::Op(op) if !op.contains('>') && op != "<" => prog = "",
-            ShWord::Word(t) if prog.is_empty() => prog = t.rsplit('/').next().unwrap_or(t),
-            ShWord::Word(t) => {
-                let bad = match prog {
-                    "sed" => t.starts_with("-i") || t.contains("w ") || t.ends_with('e') && t.starts_with('s'),
-                    "awk" => t.contains("system") || t.contains('|') || t.contains("> ") || t.contains(">\""),
-                    "tee" => t.starts_with('/') && t != "/dev/null",
-                    "env" => true,
-                    _ => false,
-                };
-                if bad {
-                    return false;
-                }
-            }
+            ShWord::Op(op) if !op.contains('>') && op != "<" => cmds.push(Vec::new()),
+            ShWord::Word(t) => cmds.last_mut().expect("one command").push(t),
             _ => {}
+        }
+    }
+    for cmd in &cmds {
+        let Some((first, args)) = cmd.split_first() else { continue };
+        let prog = first.rsplit('/').next().unwrap_or(first);
+        let operands = || args.iter().filter(|a| !a.starts_with('-') || **a == "-");
+        let bad = match prog {
+            "sed" => {
+                args.iter().any(|a| a.starts_with("-i") || a.starts_with("--in-place"))
+                    || crate::cmdrisk::sed_effect(args).is_some()
+            }
+            "awk" => args.iter().any(|t| t.contains("system") || t.contains('|') || t.contains("> ") || t.contains(">\"")),
+            // `tee FILE` writes FILE.
+            "tee" => operands().any(|t| *t != "/dev/null" && *t != "-"),
+            // `sort -o FILE`, `sort --output=FILE`.
+            "sort" => args.iter().any(|a| {
+                a.starts_with("--output") || (a.starts_with('-') && !a.starts_with("--") && a.contains('o'))
+            }),
+            // `uniq IN OUT` writes OUT.
+            "uniq" => operands().count() >= 2,
+            "env" => true,
+            _ => false,
+        };
+        if bad {
+            return false;
         }
     }
     true
@@ -805,6 +818,22 @@ mod tests {
         assert!(read_only("git log --oneline | head"));
         assert!(!read_only("cargo test"));
         assert!(!read_only("cat a > b.txt"));
+        assert!(read_only("cat a.log | tee /dev/null | sort -n | uniq -c"));
+    }
+
+    #[test]
+    fn commands_that_write_are_not_read_only() {
+        for c in [
+            "cat a.log | grep ERROR | tee errors.txt",
+            "sort data.txt -o data.txt",
+            "sort --output=data.txt data.txt",
+            "uniq raw.txt deduped.txt",
+            "sed -n 'w out.txt' notes.txt",
+            "sed 's/a/b/w changed.txt' notes.txt",
+            "sed '1e touch x' notes.txt",
+        ] {
+            assert!(!read_only(c), "{c}");
+        }
     }
 
     #[test]

@@ -1134,7 +1134,35 @@ fn save_full_output(workspace: &Path, command: &str, stdout: &str, stderr: &str)
     let name = format!("cmd-{}.log", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
     let body = format!("$ {command}\n\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
     fs::write(out.join(&name), body).ok()?;
+    prune_saved_outputs(&out, SAVED_OUTPUT_KEEP, SAVED_OUTPUT_MAX_BYTES);
     Some(format!(".groka/output/{name}"))
+}
+
+/// Saved outputs kept: the newest files, up to a count and a total size.
+const SAVED_OUTPUT_KEEP: usize = 50;
+const SAVED_OUTPUT_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Drop the oldest `cmd-*.log` files beyond `keep` files or `max_bytes`
+/// in all. The newest file always stays.
+fn prune_saved_outputs(dir: &Path, keep: usize, max_bytes: u64) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut logs: Vec<(String, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let meta = e.metadata().ok()?;
+            (meta.is_file() && name.starts_with("cmd-") && name.ends_with(".log")).then(|| (name, meta.len(), e.path()))
+        })
+        .collect();
+    // Names carry the timestamp: newest first.
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut total = 0u64;
+    for (i, (_, len, path)) in logs.iter().enumerate() {
+        total += len;
+        if i > 0 && (i >= keep || total > max_bytes) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1692,6 +1720,29 @@ impl ClientTool for ReadImageTool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn saved_outputs_keep_only_the_newest_within_count_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("cmd-2026010{i}.log")), vec![b'x'; 100]).unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), "not ours").unwrap();
+        prune_saved_outputs(dir.path(), 4, u64::MAX);
+        let mut left: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["cmd-20260102.log", "cmd-20260103.log", "cmd-20260104.log", "cmd-20260105.log", "notes.txt"]);
+        // The size cap: 250 bytes keeps two of 100 bytes.
+        prune_saved_outputs(dir.path(), 50, 250);
+        assert!(dir.path().join("cmd-20260105.log").exists());
+        assert!(dir.path().join("cmd-20260104.log").exists());
+        assert!(!dir.path().join("cmd-20260103.log").exists());
+        // The newest stays even when it alone is over the cap.
+        prune_saved_outputs(dir.path(), 50, 10);
+        assert!(dir.path().join("cmd-20260105.log").exists());
+        assert!(!dir.path().join("cmd-20260104.log").exists());
+    }
 
     #[test]
     fn now_returns_rfc3339() {

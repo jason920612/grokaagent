@@ -157,6 +157,7 @@ fn parse(s: &str) -> Result<(Vec<Cmd>, Vec<String>), &'static str> {
                         '`' => {
                             let end = chars[j + 1..].iter().position(|&y| y == '`').ok_or("unbalanced backtick")? + j + 1;
                             subs.push(chars[j + 1..end].iter().collect());
+                            word.text.push_str(SUBST);
                             j = end + 1;
                             continue;
                         }
@@ -185,6 +186,7 @@ fn parse(s: &str) -> Result<(Vec<Cmd>, Vec<String>), &'static str> {
             '`' => {
                 let end = chars[i + 1..].iter().position(|&y| y == '`').ok_or("unbalanced backtick")? + i + 1;
                 subs.push(chars[i + 1..end].iter().collect());
+                word.text.push_str(SUBST);
                 in_word = true;
                 i = end + 1;
             }
@@ -325,6 +327,33 @@ fn parse(s: &str) -> Result<(Vec<Cmd>, Vec<String>), &'static str> {
 /// index after it.
 fn read_dollar(chars: &[char], i: usize, word: &mut Word, subs: &mut Vec<String>) -> Result<usize, &'static str> {
     match chars.get(i + 1) {
+        // `$'…'`: a literal string with backslash escapes.
+        Some('\'') => {
+            let mut j = i + 2;
+            loop {
+                match chars.get(j) {
+                    None => return Err("unbalanced $'"),
+                    Some('\'') => break,
+                    Some('\\') => {
+                        let n = chars.get(j + 1).copied().unwrap_or('\\');
+                        word.text.push(match n {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '0' => '\0',
+                            'e' | 'E' => '\u{1b}',
+                            other => other,
+                        });
+                        j += 2;
+                    }
+                    Some(&c) => {
+                        word.text.push(c);
+                        j += 1;
+                    }
+                }
+            }
+            Ok(j + 1)
+        }
         Some('(') => {
             let math = chars.get(i + 2) == Some(&'(');
             let mut depth = 0i32;
@@ -348,7 +377,7 @@ fn read_dollar(chars: &[char], i: usize, word: &mut Word, subs: &mut Vec<String>
             if !math {
                 subs.push(chars[i + 2..j].iter().collect());
             }
-            word.text.push_str("$(…)");
+            word.text.push_str(SUBST);
             Ok(j + 1)
         }
         Some('{') => {
@@ -375,6 +404,9 @@ fn read_dollar(chars: &[char], i: usize, word: &mut Word, subs: &mut Vec<String>
         }
     }
 }
+
+/// Stands in for the output of `$(…)` or backticks inside a word.
+const SUBST: &str = "$(…)";
 
 // ------------------------------------------------------------------ paths
 
@@ -567,7 +599,7 @@ fn check_cmd(cmd: &Cmd, scope: &Scope, out: &mut Vec<String>, depth: usize) {
                 let t = w.text.trim_end_matches(['/', '\\']);
                 matches!(t, "" | "." | ".." | "*" | ".*" | "./*" | ".git" | "~" | "/")
                     || t.starts_with("..")
-                    || (recursive && !w.vars.is_empty())
+                    || (recursive && (!w.vars.is_empty() || w.text.contains(SUBST)))
                     || (recursive && t.contains('*') && (!t.contains('/') || t.starts_with('/') || t.starts_with('~')))
             });
             if sweeping {
@@ -683,6 +715,11 @@ fn check_cmd(cmd: &Cmd, scope: &Scope, out: &mut Vec<String>, depth: usize) {
                 inline_code(&prog, &args, cmd, scope, out, depth);
             }
         }
+        "sed" => {
+            if let Some(what) = sed_effect(&args) {
+                flag(format!("`sed` script {what}"));
+            }
+        }
         "cp" | "mv" | "tee" | "install" | "ln" => {
             if let Some(w) = rest.iter().rev().find(|w| !w.text.starts_with('-')) {
                 if writes_git_internals(&w.text) {
@@ -705,6 +742,115 @@ fn check_cmd(cmd: &Cmd, scope: &Scope, out: &mut Vec<String>, depth: usize) {
         p if INTERPRETERS.contains(&p) => inline_code(p, &args, cmd, scope, out, depth),
         _ => {}
     }
+}
+
+/// What a sed invocation does beyond printing: its script's `w`/`W`
+/// (write a file) and `e` (run a command) commands, or the `w`/`e` flags
+/// of `s`. In-place editing (`-i`) is judged elsewhere.
+pub(crate) fn sed_effect(args: &[&str]) -> Option<&'static str> {
+    let mut scripts = Vec::new();
+    let mut explicit = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "-e" || a == "--expression" {
+            explicit = true;
+            if let Some(s) = args.get(i + 1) {
+                scripts.push(*s);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(s) = a.strip_prefix("--expression=") {
+            explicit = true;
+            scripts.push(s);
+        } else if matches!(a, "-f" | "--file" | "-l" | "--line-length") {
+            explicit |= matches!(a, "-f" | "--file");
+            i += 2;
+            continue;
+        } else if !a.starts_with('-') && !explicit && scripts.is_empty() {
+            scripts.push(a);
+        }
+        i += 1;
+    }
+    scripts.into_iter().find_map(sed_script_effect)
+}
+
+fn sed_script_effect(script: &str) -> Option<&'static str> {
+    const WRITES: &str = "writes files (`w`)";
+    const RUNS: &str = "runs commands (`e`)";
+    let c: Vec<char> = script.chars().collect();
+    // Skip a delimited part (`re/`), honouring backslash escapes; returns
+    // the index after the closing delimiter.
+    let delimited = |mut j: usize, d: char| -> usize {
+        while j < c.len() && c[j] != d {
+            j += if c[j] == '\\' { 2 } else { 1 };
+        }
+        j + 1
+    };
+    let address = |mut j: usize| -> usize {
+        match c.get(j) {
+            Some(d) if d.is_ascii_digit() || *d == '+' || *d == '~' => {
+                j += 1;
+                while c.get(j).is_some_and(|d| d.is_ascii_digit() || *d == '~') {
+                    j += 1;
+                }
+                j
+            }
+            Some('$') => j + 1,
+            Some('/') => delimited(j + 1, '/'),
+            Some('\\') => c.get(j + 1).map_or(j + 1, |d| delimited(j + 2, *d)),
+            _ => j,
+        }
+    };
+    let to_end = |mut j: usize, stops: &[char]| -> usize {
+        while j < c.len() && !stops.contains(&c[j]) {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < c.len() {
+        if c[i].is_whitespace() || matches!(c[i], ';' | '{' | '}') {
+            i += 1;
+            continue;
+        }
+        i = address(i);
+        if c.get(i) == Some(&',') {
+            i = address(i + 1);
+        }
+        // Regex address flags and negation.
+        while c.get(i).is_some_and(|x| x.is_whitespace() || matches!(x, '!' | 'I' | 'M')) {
+            i += 1;
+        }
+        let Some(&cmd) = c.get(i) else { break };
+        match cmd {
+            'w' | 'W' => return Some(WRITES),
+            'e' => return Some(RUNS),
+            's' => {
+                let Some(&d) = c.get(i + 1) else { break };
+                i = delimited(delimited(i + 2, d), d).min(c.len());
+                let end = to_end(i, &[';', '\n', '}']);
+                let flags: String = c[i..end].iter().collect();
+                // `w FILE` ends the flags; an `e` before it runs the result.
+                if flags.split('w').next().unwrap_or("").contains('e') {
+                    return Some(RUNS);
+                }
+                if flags.contains('w') {
+                    return Some(WRITES);
+                }
+                i = end;
+            }
+            'y' => {
+                let Some(&d) = c.get(i + 1) else { break };
+                i = delimited(delimited(i + 2, d), d);
+            }
+            'a' | 'i' | 'c' | 'r' | 'R' | '#' => i = to_end(i, &['\n']),
+            'b' | 't' | 'T' | ':' => i = to_end(i, &[';', '\n']),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn method_writes(args: &[&str], keys: &[&str]) -> bool {
@@ -764,6 +910,11 @@ fn scan_code(prog: &str, code: &str, scope: &Scope) -> Vec<String> {
         ("removedirs", "deletes folders"),
         ("fs.rm", "deletes files"),
         ("fs.unlink", "deletes files"),
+        ("rmsync", "deletes files"),
+        ("rmdirsync", "deletes folders"),
+        ("unlinksync", "deletes files"),
+        ("fs.promises.rm", "deletes files"),
+        ("homedir(", "reaches the home folder"),
         ("rimraf", "deletes a tree"),
         ("file::delete", "deletes files"),
         ("requests.", "uses the network"),
@@ -1032,6 +1183,41 @@ mod tests {
         assert!(!assess(&cmd, &plain).is_empty());
         let granted = Scope { workspace: &f.ws, cwd: &f.ws, temp: Vec::new(), extra: vec![f.other.clone()] };
         assert!(assess(&cmd, &granted).is_empty(), "{:?}", assess(&cmd, &granted));
+    }
+
+    #[test]
+    fn followup_dynamic_and_quoted_delete_targets_are_flagged() {
+        let f = fx();
+        let other = slash(&f.other);
+        for cmd in [
+            "rm -rf \"$(dirname \"$PWD\")\"".to_string(),
+            "rm -rf `dirname $PWD`".to_string(),
+            format!("rm -rf $'{other}'"),
+            "node -e \"require('fs').rmSync(require('os').homedir(), {recursive: true})\"".to_string(),
+            format!("sed -n 'w {other}/out' notes.txt"),
+            "sed '1e touch ~/pwned' notes.txt".to_string(),
+            "sed -e 's/a/b/' -e '/x/w log.txt' notes.txt".to_string(),
+            "sed 's/^/date /e' notes.txt".to_string(),
+        ] {
+            assert!(!reasons(&f, &cmd).is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn ordinary_sed_scripts_still_run() {
+        let f = fx();
+        for cmd in [
+            "sed -n '1,20p' src/main.rs",
+            "sed 's/foo/bar/g' words.txt",
+            "sed -n '/^fn /p' examples.txt",
+            "sed -e 's/a/b/' wfile.txt",
+            "sed '/start/,/end/d; s/x/y/2' notes.txt",
+            "sed 'y/abc/xyz/' notes.txt",
+            "sed -n '/where/Ip' notes.txt",
+        ] {
+            let r = reasons(&f, cmd);
+            assert!(r.is_empty(), "{cmd}: {r:?}");
+        }
     }
 
     #[test]

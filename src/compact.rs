@@ -137,6 +137,19 @@ impl Budget {
         self
     }
 
+    /// The budgets a fold measures with local estimates, in local units:
+    /// `ratio` is real tokens per estimated token (see
+    /// [`calibration`]). The window and the trigger stay in real tokens.
+    pub fn in_local_units(mut self, ratio: f32) -> Self {
+        let f = |v: u32| ((v as f32) / ratio) as u32;
+        self.after = f(self.after);
+        self.tail = f(self.tail).max(1);
+        self.fold_input = f(self.fold_input);
+        self.memory = f(self.memory);
+        self.user = f(self.user);
+        self
+    }
+
     pub fn new(window: u32) -> Self {
         let at = |r: f32| ((window as f32) * r) as u32;
         Self {
@@ -154,6 +167,18 @@ impl Budget {
 }
 
 // ---------------------------------------------------------------- estimates
+
+/// Real tokens per locally estimated token, from a request the server
+/// counted: the estimate misses JSON framing and differs per tokenizer, and
+/// a fold aimed in local units would land above its target. Clamped so one
+/// odd count cannot swing it far.
+pub fn calibration(server_tokens: u32, instructions: &str, tools: &[ToolSpec], items: &[Value]) -> f32 {
+    let local = estimate_tokens(instructions, items).saturating_add(tools_tokens(tools));
+    if server_tokens == 0 || local == 0 {
+        return 1.0;
+    }
+    (server_tokens as f32 / local as f32).clamp(0.8, 2.5)
+}
 
 /// Local token estimate: ASCII ≈ 4 chars/token, other scripts (CJK) ≈ 1
 /// char/token, images ≈ one vision tile. Used when the provider has not
@@ -261,13 +286,7 @@ fn is_memory(item: &Value) -> bool {
 /// System notices that look like user turns but are not the user.
 fn is_notice_user(text: &str) -> bool {
     let t = text.trim_start();
-    has_mark(t)
-        || t.starts_with(MEMORY_FOLD_MARK)
-        || t.starts_with(crate::background::EXIT_NOTICE_PREFIX)
-        || t.starts_with(crate::background::CLOSED_NOTICE_PREFIX)
-        || t.starts_with(crate::timer::FIRED_NOTICE_PREFIX)
-        || t.starts_with("[loop guard]")
-        || t.starts_with("The previous model request failed")
+    has_mark(t) || t.starts_with(MEMORY_FOLD_MARK) || crate::notice::is_harness(t)
 }
 
 fn is_real_user(item: &Value) -> bool {
@@ -526,6 +545,13 @@ pub fn original_request(history: &[Value], goal: &str) -> String {
         .map(item_text)
         .filter(|t| !t.trim().is_empty())
         .map(|t| clip_goal(&t))
+        .or_else(|| {
+            // Task mode resumed without a prompt: the goal is the user's.
+            history.iter().filter(|i| is_user(i)).map(item_text).find_map(|t| {
+                let goal = t.trim_start().strip_prefix(crate::notice::TASK_MODE)?;
+                Some(clip_goal(goal.trim().trim_end_matches("Work toward it.").trim()))
+            })
+        })
         .unwrap_or_else(|| clip_goal(goal))
 }
 
@@ -812,7 +838,7 @@ fn chunk_ranges(items: &[Value], budget: u32) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-fn tools_tokens(tools: &[ToolSpec]) -> u32 {
+pub fn tools_tokens(tools: &[ToolSpec]) -> u32 {
     tools
         .iter()
         .map(|t| text_tokens(&t.description) + text_tokens(&t.parameters.to_string()) + 8)
@@ -1039,8 +1065,39 @@ pub fn memory_text_from(text: &str, output_items: &[Value]) -> String {
 fn splice(memory: Memory, users: Vec<Value>, dropped: usize, tail: &[Value], method: &str, cap: u32) -> Folded {
     let mut items = users;
     items.push(json!({"role": "user", "content": render_memory(&memory, cap)}));
-    items.extend(tail.iter().cloned());
+    items.extend(tail.iter().map(|i| clip_reasoning(i, KEPT_REASONING_TOKENS)));
     Folded { items, dropped, kept: tail.len(), method: method.to_string() }
+}
+
+/// Plain-text reasoning kept in the tail after a fold, at most. A single
+/// thinking block can run past 10K tokens and is resent with its tool call
+/// (DeepSeek); kept whole it can leave a fold above the trigger.
+const KEPT_REASONING_TOKENS: u32 = 1_500;
+
+/// `item` with an over-long plain-text reasoning summary cut to its start
+/// and end. Encrypted reasoning (xAI) is left as it is.
+fn clip_reasoning(item: &Value, cap: u32) -> Value {
+    if item_type(item) != "reasoning" || item.get("encrypted_content").is_some_and(|v| !v.is_null()) {
+        return item.clone();
+    }
+    let Some(parts) = item.get("summary").and_then(Value::as_array) else {
+        return item.clone();
+    };
+    let text: String = parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("
+");
+    if text_tokens(&text) <= cap {
+        return item.clone();
+    }
+    // Characters ≤ tokens for any script, so `cap` characters fit.
+    let chars: Vec<char> = text.chars().collect();
+    let half = (cap as usize / 2).max(1);
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len() - half..].iter().collect();
+    let mut out = item.clone();
+    out["summary"] = json!([{"type": "summary_text", "text": format!("{head}
+[… middle of this reasoning trimmed …]
+{tail}")}]);
+    out
 }
 
 /// No model available (or it keeps failing) and the context is nearly full:
@@ -1269,6 +1326,60 @@ mod tests {
         assert!(texts[0].contains("trimmed to fit"), "the oldest is clipped, not dropped silently: {texts:?}");
         let tokens: u32 = kept.iter().map(item_tokens).sum();
         assert!(tokens <= 600 + 50, "{tokens}");
+    }
+
+    #[test]
+    fn long_plain_reasoning_in_the_kept_tail_is_clipped() {
+        let long = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": format!("START {} END", "think ".repeat(8_000))}]});
+        let clipped = clip_reasoning(&long, 1_500);
+        let text = clipped["summary"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("START") && text.ends_with("END") && text.contains("trimmed"), "{}", &text[..80]);
+        assert!(item_tokens(&clipped) <= 1_600, "{}", item_tokens(&clipped));
+        let short = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "brief"}]});
+        assert_eq!(clip_reasoning(&short, 1_500), short);
+        let sealed = json!({"type": "reasoning", "encrypted_content": "xyz", "summary": [{"type": "summary_text", "text": "think ".repeat(8_000)}]});
+        assert_eq!(clip_reasoning(&sealed, 1_500), sealed, "encrypted reasoning is left alone");
+        let call = json!({"type": "function_call", "call_id": "c", "name": "now", "arguments": "{}"});
+        let folded = splice(Memory::default(), Vec::new(), 3, &[long, call.clone()], "lived", 1_000);
+        assert!(folded.items.iter().map(item_tokens).sum::<u32>() < 2_500);
+        assert_eq!(folded.items.last().unwrap(), &call);
+    }
+
+    #[test]
+    fn calibration_scales_fold_targets_to_real_tokens() {
+        let items = vec![user(&"word ".repeat(800))];
+        let local = estimate_tokens("", &items);
+        assert_eq!(calibration(0, "", &[], &items), 1.0);
+        assert!((calibration(local * 3 / 2, "", &[], &items) - 1.5).abs() < 0.01);
+        assert_eq!(calibration(local * 10, "", &[], &items), 2.5, "clamped");
+        let b = Budget::new(32_768);
+        let local_b = b.in_local_units(1.5);
+        assert_eq!(local_b.after, (b.after as f32 / 1.5) as u32);
+        assert_eq!(local_b.user, (b.user as f32 / 1.5) as u32);
+        assert_eq!((local_b.window, local_b.trigger), (b.window, b.trigger));
+    }
+
+    #[test]
+    fn harness_messages_are_not_kept_as_user_words() {
+        let head = vec![
+            user("不要動 migrations/"),
+            assistant("ok"),
+            user(&format!("{}coder` replied and is now idle]
+{}", crate::notice::CHILD, "子代理的長回覆".repeat(2_800))),
+            user(&format!("{}
+The task supervisor reviewed your work. Do not wait for the user.", crate::notice::TASK_SYSTEM)),
+            user(&format!("{} Do not continue that turn. Follow their next message.", crate::notice::INTERRUPT)),
+            user(&format!("{}
+做登入
+Work toward it.", crate::notice::TASK_MODE)),
+            user(crate::task::KICK),
+        ];
+        let kept = keep_user_words(&head, Budget::new(128_000).user);
+        let texts: Vec<String> = kept.iter().map(item_text).collect();
+        assert_eq!(texts, ["不要動 migrations/"], "{texts:?}");
+        // Task mode with no prompt of its own: the goal is still the request.
+        let task_only = vec![user(crate::task::KICK), user(&format!("{}\n做登入\nWork toward it.", crate::notice::TASK_MODE))];
+        assert_eq!(original_request(&task_only, crate::task::KICK), "做登入");
     }
 
     #[test]

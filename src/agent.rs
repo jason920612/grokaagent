@@ -345,6 +345,37 @@ async fn wait_task_kick(task: &Option<Arc<crate::task::TaskHub>>) {
     }
 }
 
+type FoldFuture<'p> = std::pin::Pin<Box<dyn Future<Output = Option<(usize, compact::Folded)>> + Send + 'p>>;
+
+/// A fold of the history as it stood at some turn, made while the turns
+/// that follow run: started a little before the trigger, spliced in at it.
+enum Prefold<'p> {
+    Running(FoldFuture<'p>),
+    /// Finished: (history length it saw, result), or `None` if it failed.
+    Done(Option<(usize, compact::Folded)>),
+}
+
+/// Run `work`, and keep a running prefold going while it does. The prefold
+/// is not awaited past `work`; it carries on during the next `alongside`.
+async fn alongside<T>(work: impl Future<Output = T>, prefold: &mut Option<Prefold<'_>>) -> T {
+    let Some(Prefold::Running(fold)) = prefold.as_mut() else {
+        return work.await;
+    };
+    tokio::pin!(work);
+    let mut done = None;
+    let out = loop {
+        tokio::select! {
+            biased;
+            out = &mut work => break out,
+            r = fold.as_mut(), if done.is_none() => done = Some(r),
+        }
+    };
+    if let Some(r) = done {
+        *prefold = Some(Prefold::Done(r));
+    }
+    out
+}
+
 async fn race_cancel<T>(
     cancel: &Option<CancelFlag>,
     fut: impl Future<Output = T>,
@@ -359,7 +390,8 @@ async fn race_cancel<T>(
     }
 }
 
-const INTERRUPT_NOTE: &str = "The user pressed Esc and interrupted the previous model turn. Do not continue that turn. Follow their next message.";
+/// Follows [`crate::notice::INTERRUPT`] in the note sent after Esc.
+const INTERRUPT_NOTE: &str = "Do not continue that turn. Follow their next message.";
 
 fn cancelled_tool_output() -> String {
     json!({"error": "interrupted", "cancelled": true}).to_string()
@@ -461,7 +493,7 @@ fn resume_after_interrupt(
     append_user(
         history,
         pending,
-        &UserTurn::from(INTERRUPT_NOTE),
+        &UserTurn::from(format!("{} {INTERRUPT_NOTE}", crate::notice::INTERRUPT)),
         &cfg.workspace,
     );
     for msg in msgs {
@@ -557,7 +589,8 @@ async fn recover_from_provider_error(
     crate::vision::strip_attached_images(history);
     crate::vision::strip_attached_images(pending);
     let note = format!(
-        "The previous model request failed ({err}). Continue the task yourself. If an image was rejected for being below {} pixels, enlarge or regenerate the file in the workspace then read_image again. Do not wait for the user and do not ask the user to upscale it.",
+        "{} ({err}). Continue the task yourself. If an image was rejected for being below {} pixels, enlarge or regenerate the file in the workspace then read_image again. Do not wait for the user and do not ask the user to upscale it.",
+        crate::notice::REQUEST_FAILED,
         crate::vision::MIN_VISION_PIXELS
     );
     append_user(history, pending, &UserTurn::from(note), &cfg.workspace);
@@ -787,7 +820,7 @@ pub async fn run<P: Provider>(
             let goal = hub.snapshot().goal;
             if !goal.is_empty() {
                 history.push(crate::vision::user_message(
-                    &format!("Task mode is on. Goal:\n{goal}\nWork toward it."),
+                    &format!("{}\n{goal}\nWork toward it.", crate::notice::TASK_MODE),
                     &[],
                     &cfg.workspace,
                 ));
@@ -806,9 +839,11 @@ pub async fn run<P: Provider>(
     // History length when the request behind `last_usage` was sent: usage
     // is that reported count plus an estimate of what was added since.
     let mut usage_base_len = 0usize;
-    // A fold computed alongside an earlier request: (history length it saw,
-    // result). Spliced in when the trigger is reached.
-    let mut prefolded: Option<(usize, compact::Folded)> = None;
+    // Real tokens per locally estimated token, from the last counted request.
+    let mut calib = 1.0f32;
+    // At most one fold made ahead of the trigger, kept going alongside the
+    // working requests and tool calls, and taken only at the trigger.
+    let mut prefold: Option<Prefold<'_>> = None;
     let mut cache_turns = Vec::new();
     let mut compacted = 0u32;
     let max_turns = cfg.max_turns;
@@ -924,10 +959,33 @@ pub async fn run<P: Provider>(
                 .input_tokens
                 .saturating_add(compact::estimate_tokens("", &history[usage_base_len..]))
         } else {
-            compact::estimate_tokens(&live_instructions(&cfg), &history)
+            let local = compact::estimate_tokens(&live_instructions(&cfg), &history)
+                .saturating_add(compact::tools_tokens(&tools.specs_for(&live_knobs(&cfg).3)));
+            (local as f32 * calib) as u32
         };
-        let ready = prefolded.take().filter(|(seen, _)| *seen <= history.len());
-        if used >= budget.trigger && ready.is_some() {
+        let fold_budget = budget.in_local_units(calib);
+        let ready = if used >= budget.trigger {
+            match prefold.take() {
+                Some(Prefold::Done(r)) => r,
+                // Not finished yet: it has a head start, so finish it.
+                Some(Prefold::Running(fold)) => race_cancel(&cfg.cancel, fold).await.ok().flatten(),
+                None => None,
+            }
+            .filter(|(seen, _)| *seen <= history.len())
+            // A lot arrived since it started (a long child reply, a big
+            // output): spliced it would still be over the trigger, so one
+            // fold of everything now does better than two.
+            .filter(|(seen, f)| {
+                let mut after: Vec<Value> = f.items.clone();
+                after.extend(history[*seen..].iter().cloned());
+                let local = compact::estimate_tokens(&live_instructions(&cfg), &after)
+                    .saturating_add(compact::tools_tokens(&tools.specs_for(&live_knobs(&cfg).3)));
+                ((local as f32 * calib) as u32) < budget.trigger
+            })
+        } else {
+            None
+        };
+        if ready.is_some() {
             // The fold made alongside an earlier turn: its head is unchanged
             // (history only grows), so splice it in with what came after.
             let (seen, f) = ready.expect("checked");
@@ -964,7 +1022,7 @@ pub async fn run<P: Provider>(
                 cache_key: &cache_key,
                 client_tools: tools.specs_for(&server_tools),
                 server_tools: server_tools.clone(),
-                budget,
+                budget: fold_budget,
                 max_tail_items,
                 workspace: Some(&cfg.workspace),
                 prefold: false,
@@ -991,7 +1049,7 @@ pub async fn run<P: Provider>(
                 Ok(Err(compact::FoldError::Failed(e))) => {
                     if used >= budget.hard {
                         say(format!("壓縮失敗（{e}），上下文將滿：改用不經模型的緊急壓縮"));
-                        Some(compact::emergency_fold(&cfg.prompt, &history, &budget, max_tail_items))
+                        Some(compact::emergency_fold(&cfg.prompt, &history, &fold_budget, max_tail_items))
                     } else {
                         compact_backoff = COMPACT_BACKOFF_TURNS;
                         say(format!(
@@ -1027,12 +1085,39 @@ pub async fn run<P: Provider>(
         // Close to the trigger: fold alongside this request so the memory is
         // ready when the trigger is reached. (Images are skipped: stripping
         // them rewrites old items, and the splice assumes it does not.)
-        let prefold_from = (used >= budget.prefold
-            && used < budget.trigger
-            && prefolded.is_none()
-            && compact_backoff == 0
-            && !has_image)
-            .then(|| history.clone());
+        if used >= budget.prefold && used < budget.trigger && prefold.is_none() && compact_backoff == 0 && !has_image {
+            // What arrives before the trigger stays verbatim after the
+            // splice, so this fold aims lower by that much: spliced at the
+            // trigger it lands where a fold made there would.
+            let mut ahead = budget;
+            ahead.after = budget.after.saturating_sub(budget.trigger - used).max(budget.window / 10);
+            let ahead = ahead.in_local_units(calib);
+            let (instructions, goal, model, cache_key) =
+                (live_instructions(&cfg), cfg.prompt.clone(), model.clone(), cache_key.clone());
+            let (client_tools, server_tools, workspace) =
+                (tools.specs_for(&server_tools), server_tools.clone(), cfg.workspace.clone());
+            let seen = history.clone();
+            prefold = Some(Prefold::Running(Box::pin(async move {
+                let quiet = |_: String| {};
+                let ctx = compact::FoldCtx {
+                    provider,
+                    instructions: &instructions,
+                    goal: &goal,
+                    model: &model,
+                    effort,
+                    send_reasoning,
+                    cache_key: &cache_key,
+                    client_tools,
+                    server_tools,
+                    budget: ahead,
+                    max_tail_items,
+                    workspace: Some(&workspace),
+                    prefold: true,
+                    notice: &quiet,
+                };
+                compact::fold(&ctx, &seen).await.ok().map(|f| (seen.len(), f))
+            })));
+        }
         let req = CompleteRequest {
             instructions: live_instructions(&cfg),
             input: history.clone(),
@@ -1087,33 +1172,6 @@ pub async fn run<P: Provider>(
         // Transient provider trouble (rate limits, 5xx, a dropped stream)
         // resends the same request after a backoff instead of spending one
         // of the model-visible recoveries below.
-        let prefold_instructions = live_instructions(&cfg);
-        let quiet = |_: String| {};
-        let prefold_ctx = compact::FoldCtx {
-            provider,
-            instructions: &prefold_instructions,
-            goal: &cfg.prompt,
-            model: &model,
-            effort,
-            send_reasoning,
-            cache_key: &cache_key,
-            client_tools: tools.specs_for(&server_tools),
-            server_tools: server_tools.clone(),
-            budget,
-            max_tail_items,
-            workspace: Some(&cfg.workspace),
-            prefold: true,
-            notice: &quiet,
-        };
-        let prefold = async {
-            let Some(h) = prefold_from.as_ref() else {
-                return None;
-            };
-            match race_cancel(&cfg.cancel, compact::fold(&prefold_ctx, h)).await {
-                Ok(Ok(f)) => Some((h.len(), f)),
-                _ => None,
-            }
-        };
         let main = async {
         let mut transient_attempt = 0u32;
         loop {
@@ -1153,10 +1211,7 @@ pub async fn run<P: Provider>(
             }
         }
         };
-        let (attempt, prefold_done) = tokio::join!(main, prefold);
-        if prefold_done.is_some() {
-            prefolded = prefold_done;
-        }
+        let attempt = alongside(main, &mut prefold).await;
         let response = match attempt {
             Err(()) => {
                 if !take_interrupt(
@@ -1220,6 +1275,9 @@ pub async fn run<P: Provider>(
 
         last_usage = response.usage.clone();
         usage_base_len = sent_len;
+        if last_usage.input_tokens > 0 && !has_image {
+            calib = compact::calibration(last_usage.input_tokens, &req.instructions, &req.client_tools, &history[..sent_len]);
+        }
         cache_turns.push(last_usage.clone());
         if last_usage.below_target(turn) {
             notice(
@@ -1309,7 +1367,7 @@ pub async fn run<P: Provider>(
                     args: args.clone(),
                     kind: "client".into(),
                 });
-                let output = match race_cancel(&cfg.cancel, tools.call(&call.name, &args)).await {
+                let output = match alongside(race_cancel(&cfg.cancel, tools.call(&call.name, &args)), &mut prefold).await {
                     Ok(Ok(o)) => o,
                     Ok(Err(e)) => json!({"error": e.to_string()}).to_string(),
                     Err(()) => {
@@ -2951,6 +3009,160 @@ mod tests {
         let memory = compact::previous_memory(&last.input).unwrap();
         assert!(memory.contains("## Original request
 ship the kernel"), "{memory}");
+    }
+
+    #[tokio::test]
+    async fn a_prefold_progresses_alongside_work_without_holding_it_up() {
+        let folded = || compact::Folded { items: Vec::new(), dropped: 0, kept: 0, method: "lived".into() };
+        // Slow fold: the work returns on its own time, the fold keeps going.
+        let mut pf = Some(Prefold::Running(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Some((3, folded()))
+        })));
+        let t0 = std::time::Instant::now();
+        assert_eq!(alongside(async { 7 }, &mut pf).await, 7);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(matches!(pf, Some(Prefold::Running(_))));
+        // It made progress during that work: a later, longer piece of work
+        // sees it finish.
+        alongside(tokio::time::sleep(Duration::from_millis(500)), &mut pf).await;
+        assert!(matches!(pf, Some(Prefold::Done(Some((3, _))))));
+    }
+
+    #[tokio::test]
+    async fn several_turns_before_the_trigger_share_one_prefold() {
+        let now_call = |id: &str, input_tokens: u32, pads: usize| {
+            let mut output_items: Vec<Value> = (0..pads)
+                .map(|i| json!({"role":"user","content": format!("pad-{id}-{i} {}", "notes ".repeat(330))}))
+                .collect();
+            output_items.push(json!({"type":"function_call","call_id": id,"name":"now","arguments":"{}"}));
+            CompleteResponse {
+                function_calls: vec![FunctionCall { call_id: id.into(), name: "now".into(), arguments: "{}".into() }],
+                usage: CacheUsage { input_tokens, cached_tokens: 0 },
+                output_items,
+                ..CompleteResponse::new(id)
+            }
+        };
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                // turn 1: below the prefold point
+                now_call("c1", 1_200, 6),
+                // turn 2: between prefold (4200) and trigger (5000): a fold
+                // starts alongside.
+                now_call("c2", 4_400, 0),
+                // turns 3 and 4: still before the trigger; the same fold goes on
+                now_call("c3", 4_600, 0),
+                now_call("c4", 5_200, 0),
+                CompleteResponse {
+                    text: "## Load-bearing facts
+- the kernel ABI is frozen
+## Open work
+- port the scheduler".into(),
+                    ..CompleteResponse::new("mem")
+                },
+                // turn 5: at the trigger; the fold finishes and is spliced
+                CompleteResponse { text: "done".into(), ..CompleteResponse::new("end") },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut config = cfg("ship the kernel", 8);
+        config.context_window = 10_000;
+        let out = run(&provider, &tools, &rec, config).await.unwrap();
+        assert_eq!(out.text, "done");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 6, "five working requests and one fold");
+        let folds = calls.iter().filter(|c| c.input.iter().any(|i| i["content"].as_str().is_some_and(|t| t.contains(MEMORY_FOLD_MARK)))).count();
+        assert_eq!(folds, 1);
+        let events = rec.0.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ContextCompacted { method, memory, .. }
+            if method.ends_with("(prefold)") && memory.contains("kernel ABI is frozen"))), "{events:?}");
+        let last = calls.last().unwrap();
+        assert!(last.input.iter().any(|i| i["content"].as_str().is_some_and(|t| t.contains(COMPACT_MARK))), "the final request carries the memory");
+        assert!(
+            last.input.iter().any(|i| i["content"].as_str().is_some_and(|t| t.starts_with("pad-c1-5 "))),
+            "the user's newest folded words are kept verbatim"
+        );
+        let memory = compact::previous_memory(&last.input).unwrap();
+        assert!(memory.contains("## Original request
+ship the kernel"), "{memory}");
+    }
+
+    #[tokio::test]
+    async fn a_prefold_overtaken_by_a_big_arrival_gives_way_to_one_fresh_fold() {
+        let now_call = |id: &str, input_tokens: u32, pads: usize| {
+            let mut output_items: Vec<Value> = (0..pads)
+                .map(|i| json!({"role":"user","content": format!("pad-{id}-{i} {}", "notes ".repeat(330))}))
+                .collect();
+            output_items.push(json!({"type":"function_call","call_id": id,"name":"now","arguments":"{}"}));
+            CompleteResponse {
+                function_calls: vec![FunctionCall { call_id: id.into(), name: "now".into(), arguments: "{}".into() }],
+                usage: CacheUsage { input_tokens, cached_tokens: 0 },
+                output_items,
+                ..CompleteResponse::new(id)
+            }
+        };
+        let provider = Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                // turn 1: below the prefold point
+                now_call("c1", 1_200, 6),
+                // turn 2: between prefold (4200) and trigger (5000): a fold
+                // starts alongside.
+                now_call("c2", 4_400, 0),
+                // turns 3 and 4: still before the trigger; the same fold goes on
+                now_call("c3", 4_600, 0),
+                // A big arrival after the fold started: spliced, it would
+                // still be over the trigger.
+                now_call("c4", 5_200, 8),
+                CompleteResponse {
+                    text: "## Load-bearing facts
+- the kernel ABI is frozen
+## Open work
+- port the scheduler".into(),
+                    ..CompleteResponse::new("mem")
+                },
+                // turn 5: the prefold finishes, is set aside, and a fold of
+                // everything runs instead (in two chunks: the window is small)
+                CompleteResponse {
+                    text: "## Load-bearing facts
+- the kernel ABI is frozen
+## Open work
+- port the scheduler and the pads".into(),
+                    ..CompleteResponse::new("mem2")
+                },
+                CompleteResponse {
+                    text: "## Load-bearing facts
+- the kernel ABI is frozen
+## Open work
+- port the scheduler and the pads".into(),
+                    ..CompleteResponse::new("mem3")
+                },
+                CompleteResponse { text: "done".into(), ..CompleteResponse::new("end") },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        };
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut config = cfg("ship the kernel", 8);
+        config.context_window = 10_000;
+        let out = run(&provider, &tools, &rec, config).await.unwrap();
+        assert_eq!(out.text, "done");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 8, "five working requests, the prefold, and a two-chunk fold");
+        let events = rec.0.lock().unwrap();
+        let methods: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e { AgentEvent::ContextCompacted { method, .. } => Some(method), _ => None })
+            .collect();
+        assert_eq!(methods.len(), 1, "{methods:?}");
+        assert!(!methods[0].ends_with("(prefold)"), "{methods:?}");
+        let memory = compact::previous_memory(&calls.last().unwrap().input).unwrap();
+        assert!(memory.contains("the pads"), "the fresh fold's memory is used: {memory}");
     }
 
     #[tokio::test]

@@ -324,10 +324,11 @@ pub fn check_response(text: &str, calls: &[crate::provider::FunctionCall], ctx: 
 /// What the model is told before the retried turn.
 pub fn retry_note(trip: &Trip) -> String {
     format!(
-        "[loop guard] Your previous response was cut off because its {} kept repeating \"{}\". \
+        "{} Your previous response was cut off because its {} kept repeating \"{}\". \
 That output was discarded. Continue the task from where you were: rethink the next step, \
 phrase it differently, and do not repeat that text. If you need repetitive data in a file, \
 generate it with a short script instead of writing it out.",
+        crate::notice::LOOP_GUARD,
         trip.source,
         trip.preview()
     )

@@ -772,15 +772,21 @@ impl Drop for WaitHold {
 }
 
 fn news_text(name: &str, e: &Entry) -> String {
-    match e.state {
+    news_for(name, e.state, &e.note, &e.reply)
+}
+
+fn news_for(name: &str, state: ChildState, note: &str, reply: &str) -> String {
+    match state {
         ChildState::Paused => format!(
-            "[child agent `{name}` paused without a final reply: {}. send_message to continue it, or stop_agent kill=true to end it.]",
-            if e.note.is_empty() { "no detail" } else { &e.note }
+            "{}{name}` paused without a final reply: {}. send_message to continue it, or stop_agent kill=true to end it.]",
+            crate::notice::CHILD,
+            if note.is_empty() { "no detail" } else { note }
         ),
-        ChildState::Exited => format!("[child agent `{name}` exited: {}]", e.note),
+        ChildState::Exited => format!("{}{name}` exited: {}]", crate::notice::CHILD, note),
         _ => format!(
-            "[child agent `{name}` replied and is now idle]\n{}",
-            cap(&e.reply)
+            "{}{name}` replied and is now idle]\n{}",
+            crate::notice::CHILD,
+            cap(reply)
         ),
     }
 }
@@ -1128,6 +1134,14 @@ impl ClientTool for AgentTool {
 mod tests {
     use super::*;
     use crate::events::FanoutSink;
+
+    #[test]
+    fn child_news_is_marked_as_harness_text() {
+        for state in [ChildState::Idle, ChildState::Paused, ChildState::Exited] {
+            let text = news_for("coder", state, "done", "the reply");
+            assert!(crate::notice::is_harness(&text), "{text}");
+        }
+    }
 
     fn nursery(dir: &Path, depth: u32, knobs: Option<Arc<std::sync::Mutex<crate::agent::SessionKnobs>>>) -> Arc<Nursery> {
         Nursery::new(
