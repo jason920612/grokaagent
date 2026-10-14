@@ -651,8 +651,10 @@ fn emit_file_changes(
     let mut items: Vec<Value> = Vec::new();
     if v.get("path").and_then(Value::as_str).is_some() && v.get("diff").is_some() {
         items.push(v);
+    } else if let Some(diffs) = v.get("_diffs").and_then(Value::as_array) {
+        items.extend(diffs.iter().cloned());
     } else if let Some(files) = v.get("files").and_then(Value::as_array) {
-        items.extend(files.iter().cloned());
+        items.extend(files.iter().filter(|f| f.get("diff").is_some()).cloned());
     }
     for item in items {
         let path = item
@@ -1272,8 +1274,8 @@ pub async fn run<P: Provider>(
                         None
                     }
                 };
-                let item =
-                    crate::vision::function_call_output(&call.call_id, &output, image_uri.as_deref());
+                let shown = crate::tools::model_view(&output);
+                let item = crate::vision::function_call_output(&call.call_id, &shown, image_uri.as_deref());
                 if image_uri.is_some() {
                     attached_new = true;
                 }

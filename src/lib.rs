@@ -6,6 +6,7 @@ pub mod background;
 pub mod catalog;
 pub mod clipimg;
 pub mod compact;
+pub mod cmdrisk;
 pub mod config;
 pub mod error;
 pub mod events;

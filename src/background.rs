@@ -507,7 +507,7 @@ impl ClientTool for RunBackgroundTool {
         let windows = self.windows.clone();
         Box::pin(async move {
             let shell = shell?;
-            shellguard::enforce(guard.as_ref(), &command, cwd.as_deref().unwrap_or("."), shellguard::ShellKind::of(shell)).await?;
+            shellguard::enforce(guard.as_ref(), &command, &hub.workspace, cwd.as_deref().unwrap_or("."), shellguard::ShellKind::of(shell)).await?;
             let window = wintrack::optional_name(window.as_deref())?;
             let before = if window.is_some() {
                 wintrack::snapshot().await

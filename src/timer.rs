@@ -344,6 +344,7 @@ impl TimerTool {
             crate::shellguard::enforce(
                 self.guard.as_ref(),
                 cmd,
+                &self.hub.workspace,
                 cwd.as_deref().unwrap_or("."),
                 crate::shellguard::ShellKind::current(),
             )
@@ -551,6 +552,7 @@ mod tests {
             _command: &'a str,
             _cwd: &'a str,
             _shell: crate::shellguard::ShellKind,
+            _flagged: &'a [String],
         ) -> Pin<Box<dyn Future<Output = Result<crate::shellguard::Verdict>> + Send + 'a>> {
             Box::pin(async {
                 Ok(crate::shellguard::Verdict::Deny {
@@ -759,9 +761,9 @@ mod tests {
         let rec = Arc::new(Rec(Mutex::new(Vec::new())));
         let hub = TimerHub::new(dir.path().to_path_buf(), "root".into(), "r".into(), None, None);
         let tool = TimerTool::new(hub, rec, Some(Arc::new(DenyAll)));
-        // Compound and not read-only under every shell (bash: touch is not
-        // on the read-only list; cmd: && always needs review).
-        let command = "echo pwned > pwned.txt && touch other.txt";
+        // Flagged under every shell: a home-folder secret (bash) and a
+        // compound command (cmd).
+        let command = "echo pwned > pwned.txt && cat ~/.ssh/id_rsa";
         let started = std::time::Instant::now();
         let err = tool
             .call(&json!({

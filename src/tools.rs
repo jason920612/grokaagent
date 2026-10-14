@@ -80,15 +80,6 @@ const MAX_READ_MATCHES_CAP: usize = 200;
 const MAX_CONTEXT_LINES: usize = 20;
 const REGEX_SIZE_LIMIT: usize = 1_048_576;
 
-fn clip_text(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let clipped: String = s.chars().take(max).collect();
-        format!("{clipped}\n[truncated]")
-    }
-}
-
 pub(crate) fn hide_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
@@ -984,6 +975,13 @@ impl RunCommandTool {
         let cwd = args.get("cwd").and_then(Value::as_str);
         let window = args.get("window").and_then(Value::as_str);
         let shell = crate::shellrt::shell_arg(args)?;
+        let timeout = match args.get("timeout") {
+            None | Some(Value::Null) => COMMAND_TIMEOUT_SECS,
+            Some(v) => v
+                .as_u64()
+                .filter(|t| (1..=MAX_COMMAND_TIMEOUT_SECS).contains(t))
+                .ok_or_else(|| Error::Tool(format!("timeout must be 1..={MAX_COMMAND_TIMEOUT_SECS} seconds")))?,
+        };
         run_workspace_command_ex(
             &self.workspace,
             command,
@@ -992,10 +990,23 @@ impl RunCommandTool {
             window,
             self.windows.clone(),
             shell,
+            timeout,
         )
         .await
     }
 }
+
+/// Default and longest wait for one `run_command`.
+pub(crate) const COMMAND_TIMEOUT_SECS: u64 = 60;
+pub(crate) const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
+/// Kept of a long output: some of the start, most of the end (errors and
+/// test summaries come last).
+const STDOUT_HEAD: usize = 4 * 1024;
+const STDOUT_TAIL: usize = 24 * 1024;
+const STDERR_HEAD: usize = 2 * 1024;
+const STDERR_TAIL: usize = 12 * 1024;
+/// Captured per stream before the middle is dropped.
+const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Workspace shell used by `run_command` and by `timer` when a command fires.
 pub(crate) async fn run_workspace_command(
@@ -1005,9 +1016,92 @@ pub(crate) async fn run_workspace_command(
     guard: Option<&Arc<dyn CommandReviewer>>,
 ) -> Result<String> {
     let shell = crate::shellrt::default_shell();
-    run_workspace_command_ex(workspace, command, cwd, guard, None, None, shell).await
+    run_workspace_command_ex(workspace, command, cwd, guard, None, None, shell, COMMAND_TIMEOUT_SECS).await
 }
 
+/// Everything a pipe produced, up to [`CAPTURE_LIMIT`] (then the middle).
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: usize,
+}
+
+impl Capture {
+    fn push(&mut self, bytes: &[u8]) {
+        let half = CAPTURE_LIMIT / 2;
+        for &b in bytes {
+            if self.head.len() < half {
+                self.head.push(b);
+            } else {
+                if self.tail.len() >= half {
+                    self.tail.pop_front();
+                    self.dropped += 1;
+                }
+                self.tail.push_back(b);
+            }
+        }
+    }
+
+    fn text(&self) -> (String, usize) {
+        let mut all = self.head.clone();
+        all.extend(self.tail.iter());
+        (crate::shellrt::decode_output(&all), self.dropped)
+    }
+}
+
+fn spawn_reader<R>(pipe: Option<R>) -> (Arc<Mutex<Capture>>, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let cap = Arc::new(Mutex::new(Capture::default()));
+    let sink = cap.clone();
+    let task = tokio::spawn(async move {
+        let Some(mut pipe) = pipe else { return };
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).push(&buf[..n]),
+            }
+        }
+    });
+    (cap, task)
+}
+
+/// Keep `head` chars of the start and `tail` of the end; say what was cut.
+fn clip_head_tail(s: &str, head: usize, tail: usize, full_at: Option<&str>) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    let more = match full_at {
+        Some(p) => format!("; full output in {p}"),
+        None => String::new(),
+    };
+    format!("{start}\n[… {} characters omitted{more} …]\n{end}", n - head - tail)
+}
+
+/// Save the full output under `.groka/output/` (git-ignored) so the model
+/// can grep it. Returns the workspace-relative path.
+fn save_full_output(workspace: &Path, command: &str, stdout: &str, stderr: &str) -> Option<String> {
+    let dir = workspace.join(".groka");
+    let out = dir.join("output");
+    fs::create_dir_all(&out).ok()?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(&ignore, "*\n");
+    }
+    let name = format!("cmd-{}.log", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+    let body = format!("$ {command}\n\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+    fs::write(out.join(&name), body).ok()?;
+    Some(format!(".groka/output/{name}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_workspace_command_ex(
     workspace: &Path,
     command: &str,
@@ -1016,6 +1110,7 @@ pub(crate) async fn run_workspace_command_ex(
     window: Option<&str>,
     windows: Option<Arc<WindowHub>>,
     shell: crate::shellrt::Shell,
+    timeout_secs: u64,
 ) -> Result<String> {
     let command = command.trim();
     if command.is_empty() {
@@ -1030,15 +1125,21 @@ pub(crate) async fn run_workspace_command_ex(
     if !cwd.is_dir() {
         return Err(Error::Tool("cwd is not a directory".into()));
     }
-    shellguard::enforce(guard, command, &cwd.to_string_lossy(), shellguard::ShellKind::of(shell)).await?;
+    shellguard::enforce(guard, command, workspace, &cwd.to_string_lossy(), shellguard::ShellKind::of(shell)).await?;
     let window = wintrack::optional_name(window)?;
+    let timeout_secs = timeout_secs.clamp(1, MAX_COMMAND_TIMEOUT_SECS);
+
+    // Only commands that may write need a before/after comparison.
+    let looks_only = shell == crate::shellrt::Shell::Bash && shellguard::read_only(command);
+    let before_files = if looks_only {
+        None
+    } else {
+        let at = cwd.clone();
+        tokio::task::spawn_blocking(move || diff::snapshot(&at)).await.ok().flatten()
+    };
 
     let mut cmd = shell_command_in(shell, command)?;
-    cmd.current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_window(&mut cmd);
 
     let before = if window.is_some() {
@@ -1046,9 +1147,10 @@ pub(crate) async fn run_workspace_command_ex(
     } else {
         Default::default()
     };
-    let child = cmd
-        .spawn()
-        .map_err(|e| Error::Tool(format!("spawn failed: {e}")))?;
+    // A process group / Job Object: a timeout stops the whole tree.
+    let mut proc = crate::procgroup::ProcessGuard::spawn(cmd).map_err(|e| Error::Tool(format!("spawn failed: {e}")))?;
+    let (out_cap, out_task) = spawn_reader(proc.child_mut().stdout.take());
+    let (err_cap, err_task) = spawn_reader(proc.child_mut().stderr.take());
     let watch = async {
         let Some(label) = window.as_deref() else {
             return Vec::new();
@@ -1059,55 +1161,101 @@ pub(crate) async fn run_workspace_command_ex(
             None => wintrack::label_appeared(label, &found),
         }
     };
-    let timed = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output());
-    let (timed, bound) = tokio::join!(timed, watch);
-    let (timed_out, output) = match timed {
-        Ok(Ok(o)) => (false, o),
+    let waited = tokio::time::timeout(Duration::from_secs(timeout_secs), proc.child_mut().wait());
+    let (waited, bound) = tokio::join!(waited, watch);
+    let (timed_out, exit_code) = match waited {
+        Ok(Ok(status)) => (false, status.code()),
         Ok(Err(e)) => return Err(Error::Tool(format!("command failed: {e}"))),
-        Err(_) => {
-            let mut body = json!({
-                "timed_out": true,
-                "exit_code": null,
-                "stdout": "",
-                "stderr": "timed out after 60s",
-                "files": []
-            });
-            if window.is_some() {
-                wintrack::attach_to(&mut body, &bound);
-            }
-            return Ok(body.to_string());
-        }
+        Err(_) => (true, None),
     };
-    let stdout = clip_text(&crate::shellrt::decode_output(&output.stdout), 32 * 1024);
-    let stderr = clip_text(&crate::shellrt::decode_output(&output.stderr), 16 * 1024);
-    let git_cwd = cwd.clone();
-    let files = tokio::task::spawn_blocking(move || diff::git_file_changes(&git_cwd))
-        .await
-        .unwrap_or_else(|_| Vec::new());
+    if timed_out {
+        let _ = proc.kill().await;
+    }
+    // Pipes close when the last writer exits; a background `&` job may keep
+    // them open, so do not wait for it forever.
+    let drain = async {
+        let _ = out_task.await;
+        let _ = err_task.await;
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), drain).await;
+    if !timed_out {
+        // Leave what the command started on purpose (a GUI app, `cmd &`).
+        proc.detach();
+    }
+
+    let (stdout_full, out_dropped) = out_cap.lock().unwrap_or_else(|e| e.into_inner()).text();
+    let (stderr_full, err_dropped) = err_cap.lock().unwrap_or_else(|e| e.into_inner()).text();
+    let clipped = out_dropped > 0
+        || err_dropped > 0
+        || stdout_full.chars().count() > STDOUT_HEAD + STDOUT_TAIL
+        || stderr_full.chars().count() > STDERR_HEAD + STDERR_TAIL;
+    let full_at = if clipped { save_full_output(workspace, command, &stdout_full, &stderr_full) } else { None };
+    let stdout = clip_head_tail(&stdout_full, STDOUT_HEAD, STDOUT_TAIL, full_at.as_deref());
+    let stderr = clip_head_tail(&stderr_full, STDERR_HEAD, STDERR_TAIL, full_at.as_deref());
+
+    // Only what this command changed. The model gets paths and counts; the
+    // diffs ride along in `_diffs` for the UI and are stripped before the
+    // output reaches the model.
+    let diffs: Vec<Value> = match before_files {
+        Some(snap) => tokio::task::spawn_blocking(move || diff::changes_since(&snap)).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let files: Vec<Value> = diffs
+        .iter()
+        .map(|d| json!({"path": d["path"], "kind": d["kind"], "plus": d["plus"], "minus": d["minus"]}))
+        .collect();
     let mut body = json!({
         "timed_out": timed_out,
-        "exit_code": output.status.code(),
+        "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
-        "files": files
+        "files": files,
     });
+    if !diffs.is_empty() {
+        body["_diffs"] = Value::Array(diffs);
+    }
+    if let Some(p) = &full_at {
+        body["full_output"] = json!(p);
+    }
+    if timed_out {
+        body["hint"] = json!(format!(
+            "Stopped after {timeout_secs}s; the process tree was killed and the output so far is above. For a longer run pass a larger timeout (up to {MAX_COMMAND_TIMEOUT_SECS}s) or use run_background."
+        ));
+    }
     if window.is_some() {
         wintrack::attach_to(&mut body, &bound);
     }
     Ok(body.to_string())
 }
 
+/// What the model sees of a tool output: drops UI-only fields (`_diffs`).
+pub fn model_view(output: &str) -> std::borrow::Cow<'_, str> {
+    if !output.contains("\"_diffs\"") {
+        return std::borrow::Cow::Borrowed(output);
+    }
+    match serde_json::from_str::<Value>(output) {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("_diffs");
+            }
+            std::borrow::Cow::Owned(v.to_string())
+        }
+        Err(_) => std::borrow::Cow::Borrowed(output),
+    }
+}
+
 impl ClientTool for RunCommandTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".into(),
-            description: format!("Run a shell command with cwd in the workspace (60s timeout). {} Compound or nested commands that could leave the workspace are reviewed before they run; read-only pipelines are not. Returns stdout, stderr, exit_code, and git-style file diffs when the workspace is a git repo. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.", crate::shellrt::describe()),
+            description: format!("Run a shell command starting in the workspace (default timeout 60s, `timeout` up to 600; on timeout the whole process tree is stopped and the output so far is returned). {} Commands are not sandboxed: they can reach anything your user account can. Ones with risky effects (paths outside the workspace, recursive deletes, uploads, inline code that spawns or networks) are checked by an independent reviewer first. Long output keeps the start and most of the end; the full text is saved and its path given in full_output. `files` lists only what this command changed (path, kind, plus/minus) when the workspace is a git repo; read a file to see its diff. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.", crate::shellrt::describe()),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run"},
                     "shell": {"type": "string", "enum": ["bash", "cmd", "powershell"], "description": "Shell to run in. Default bash; use cmd/powershell only for Windows-native commands."},
                     "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Seconds before the command is stopped (default 60). Use more for slow builds; use run_background for servers."},
                     "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result includes windows[].pid; pass the same name to screenshot."}
                 },
                 "required": ["command"],
@@ -2020,6 +2168,7 @@ mod tests {
             _command: &'a str,
             _cwd: &'a str,
             _shell: crate::shellguard::ShellKind,
+            _flagged: &'a [String],
         ) -> Pin<Box<dyn Future<Output = Result<crate::shellguard::Verdict>> + Send + 'a>> {
             Box::pin(async {
                 Ok(crate::shellguard::Verdict::Deny {
@@ -2030,13 +2179,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_timeout_keeps_the_output_so_far_and_stops_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool::new(dir.path().to_path_buf());
+        let started = std::time::Instant::now();
+        let out: Value = serde_json::from_str(
+            &tool
+                .run(&json!({
+                    "command": "echo started; (sleep 4; echo late > late.txt) & sleep 30",
+                    "timeout": 2
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["timed_out"], true);
+        assert!(out["stdout"].as_str().unwrap().contains("started"), "{out}");
+        assert!(out["hint"].as_str().unwrap().contains("process tree"));
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!dir.path().join("late.txt").exists(), "the background child was stopped too");
+    }
+
+    #[tokio::test]
+    async fn long_output_keeps_the_end_and_saves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool::new(dir.path().to_path_buf());
+        let out: Value = serde_json::from_str(
+            &tool.run(&json!({"command": "seq 1 20000; echo FINAL-SUMMARY 1>&2"})).await.unwrap(),
+        )
+        .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.starts_with("1
+2
+"), "keeps the start");
+        assert!(stdout.trim_end().ends_with("20000"), "keeps the end");
+        assert!(stdout.contains("characters omitted"), "says what was cut");
+        assert!(out["stderr"].as_str().unwrap().contains("FINAL-SUMMARY"));
+        let saved = out["full_output"].as_str().expect("full output saved");
+        let text = fs::read_to_string(dir.path().join(saved)).unwrap();
+        assert!(text.contains("
+10000
+"), "the middle is in the file");
+        assert_eq!(fs::read_to_string(dir.path().join(".groka/.gitignore")).unwrap().trim(), "*");
+    }
+
+    #[tokio::test]
+    async fn timeout_argument_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool::new(dir.path().to_path_buf());
+        let err = tool.run(&json!({"command": "echo hi", "timeout": 6000})).await.unwrap_err();
+        assert!(err.to_string().contains("1..=600"), "{err}");
+    }
+
+    #[test]
+    fn the_model_does_not_see_ui_diffs() {
+        let out = r#"{"exit_code":0,"files":[{"path":"a.rs","plus":1,"minus":0}],"_diffs":[{"path":"a.rs","diff":"+x"}]}"#;
+        let shown = model_view(out);
+        assert!(!shown.contains("_diffs") && shown.contains("a.rs"), "{shown}");
+        assert_eq!(model_view("plain"), "plain");
+    }
+
+    #[tokio::test]
     async fn run_command_blocked_does_not_execute() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pwned.txt");
         let tool = RunCommandTool::with_guard(dir.path().to_path_buf(), Arc::new(DenyAll));
-        // Compound and not read-only under every shell (bash: touch is not
-        // on the read-only list; cmd: && always needs review).
-        let command = "echo pwned > pwned.txt && touch other.txt";
+        // Flagged under every shell: a home-folder secret (bash) and a
+        // compound command (cmd).
+        let command = "echo pwned > pwned.txt && cat ~/.ssh/id_rsa";
         let err = tool.run(&json!({"command": command})).await.unwrap_err();
         let s = err.to_string();
         assert!(s.contains("blocked"), "{s}");

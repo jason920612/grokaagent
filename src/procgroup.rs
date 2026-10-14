@@ -9,7 +9,7 @@ mod windows_job {
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
@@ -42,6 +42,26 @@ mod windows_job {
             Ok(Self(handle))
         }
 
+        /// Kill every process in the job now.
+        pub fn terminate(&self) {
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+
+        /// Stop killing the job's processes when the handle closes.
+        pub fn release(&self) {
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            unsafe {
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+            }
+        }
+
         pub fn assign_handle(&self, process: HANDLE) -> io::Result<()> {
             let ok = unsafe { AssignProcessToJobObject(self.0, process) };
             if ok == 0 {
@@ -65,6 +85,8 @@ pub struct ProcessGuard {
     child: tokio::process::Child,
     #[cfg(windows)]
     _job: windows_job::Job,
+    /// Released: dropping no longer kills the process tree.
+    detached: bool,
 }
 
 impl ProcessGuard {
@@ -82,12 +104,20 @@ impl ProcessGuard {
                 .raw_handle()
                 .ok_or_else(|| io::Error::other("child has no process handle"))?;
             job.assign_handle(handle as _)?;
-            Ok(Self { child, _job: job })
+            Ok(Self { child, _job: job, detached: false })
         }
         #[cfg(not(windows))]
         {
-            Ok(Self { child })
+            Ok(Self { child, detached: false })
         }
+    }
+
+    /// The command finished on its own: leave anything it started (a GUI
+    /// app, a `&` background job) running instead of killing the tree.
+    pub fn detach(mut self) {
+        self.detached = true;
+        #[cfg(windows)]
+        self._job.release();
     }
 
     pub fn child_mut(&mut self) -> &mut tokio::process::Child {
@@ -103,6 +133,8 @@ impl ProcessGuard {
                 }
             }
         }
+        #[cfg(windows)]
+        self._job.terminate();
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
         Ok(())
@@ -111,6 +143,9 @@ impl ProcessGuard {
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
         let _ = self.child.start_kill();
         #[cfg(unix)]
         {

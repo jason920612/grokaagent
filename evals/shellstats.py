@@ -50,7 +50,9 @@ def stats(root: Path) -> dict:
                 m[f"shell:{a.get('shell') or 'default'}"] += 1
                 m["bashy"] += bool(BASHY.search(cmd))
                 m["py_inline"] += bool(PY_INLINE.search(cmd))
-                if '"blocked"' in out:
+                if '"review_unavailable"' in out:
+                    m["review_unavailable"] += 1
+                elif '"blocked"' in out:
                     m["blocked"] += 1
                 elif out.startswith('{"error"'):
                     m["error"] += 1
@@ -66,14 +68,14 @@ def stats(root: Path) -> dict:
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     dirs = [Path(a) for a in sys.argv[1:]]
-    print("| 設定 | 模型 | 分數 | 每次指令數 | bash 風格 | python -c/heredoc | 非 0 結束 | 被擋 | 工具錯誤 | shell 參數 | 平均輪數 | 平均耗時 |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| 設定 | 模型 | 分數 | 每次指令數 | bash 風格 | python -c/heredoc | 非 0 結束 | 被擋 | 審查不可用 | 工具錯誤 | shell 參數 | 平均輪數 | 平均耗時 |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for d in dirs:
         for model, m in sorted(stats(d).items()):
             n, c = m["runs"] or 1, m["cmds"] or 1
             shells = ", ".join(f"{k[6:]} {int(v)}" for k, v in sorted(m.items()) if k.startswith("shell:"))
             print(f"| {d.name} | {model} | {m['score'] / n:.3f} | {m['cmds'] / n:.1f} | {m['bashy'] / c:.0%} | "
-                  f"{m['py_inline'] / c:.0%} | {m['nonzero'] / c:.0%} | {int(m['blocked'])} | {int(m['error'])} | {shells} | "
+                  f"{m['py_inline'] / c:.0%} | {m['nonzero'] / c:.0%} | {int(m['blocked'])} | {int(m['review_unavailable'])} | {int(m['error'])} | {shells} | "
                   f"{m['turns'] / n:.1f} | {m['wall'] / n:.0f}s |")
 
 

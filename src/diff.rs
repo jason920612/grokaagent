@@ -454,6 +454,100 @@ pub fn file_change_json(path: &str, before: Option<&str>, after: Option<&str>) -
     })
 }
 
+/// The git-visible state of the workspace before a command: every path
+/// `git status` lists, with its size and modification time.
+pub struct Snapshot {
+    root: PathBuf,
+    stamps: std::collections::HashMap<String, Option<(u64, std::time::SystemTime)>>,
+}
+
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// `.groka/` holds grokaagent's own files (saved command output).
+fn ours(path: &str) -> bool {
+    path == ".groka" || path.starts_with(".groka/")
+}
+
+fn status_entries(root: &Path) -> Vec<(String, String)> {
+    let Ok(status) = git_output(root, &["status", "--porcelain", "-unormal"]) else {
+        return Vec::new();
+    };
+    status
+        .lines()
+        .filter(|l| l.len() >= 4)
+        .map(|l| (l[..2].to_string(), porcelain_path(&l[3..])))
+        .filter(|(_, p)| !p.is_empty() && !ours(p))
+        .collect()
+}
+
+/// Take a snapshot before running a command. `None` outside a git repo.
+pub fn snapshot(workspace: &Path) -> Option<Snapshot> {
+    let root = git_toplevel(workspace).ok()?;
+    let stamps = status_entries(&root)
+        .into_iter()
+        .map(|(_, p)| {
+            let s = stamp(&root.join(&p));
+            (p, s)
+        })
+        .collect();
+    Some(Snapshot { root, stamps })
+}
+
+/// What changed since `before`: only paths this command touched, not the
+/// whole dirty tree. Each entry carries the diff against HEAD.
+pub fn changes_since(before: &Snapshot) -> Vec<Value> {
+    let root = &before.root;
+    let after = status_entries(root);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (code, path) in &after {
+        seen.insert(path.clone());
+        let now = stamp(&root.join(path));
+        if before.stamps.get(path) == Some(&now) {
+            continue;
+        }
+        if out.len() >= MAX_FILES {
+            out.push(json!({"path": "(truncated)", "kind": "modify", "diff": format!("more than {MAX_FILES} changed files; omitted the rest")}));
+            return out;
+        }
+        out.push(change_for(root, code, path));
+    }
+    // Listed before, clean now: reverted, committed or deleted.
+    for path in before.stamps.keys().filter(|p| !seen.contains(*p)) {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let abs = root.join(path);
+        if abs.exists() {
+            out.push(json!({"path": path, "kind": "modify", "diff": "(now matches HEAD: reverted or committed)", "plus": 0, "minus": 0}));
+        } else {
+            out.push(json!({"path": path, "kind": "delete", "diff": "(deleted)", "plus": 0, "minus": 0}));
+        }
+    }
+    out
+}
+
+fn change_for(root: &Path, code: &str, path: &str) -> Value {
+    let abs = root.join(path);
+    if abs.is_dir() {
+        return json!({"path": path, "kind": "create", "diff": "(directory)"});
+    }
+    match code {
+        "??" | "A " | "AM" => change_from_disk(path, &abs, None),
+        " D" | "D " | "AD" => {
+            let before = git_output(root, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+            change_from_text(path, Some(&before), None)
+        }
+        _ => {
+            let before = git_output(root, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+            change_from_disk(path, &abs, Some(before))
+        }
+    }
+}
+
 /// Workspace-relative git changes after a command. Empty if not a git repo.
 pub fn git_file_changes(workspace: &Path) -> Vec<Value> {
     let Ok(root) = git_toplevel(workspace) else {
@@ -696,6 +790,42 @@ mod tests {
         let before = "a\nb\nc\nd\n";
         let patch = "```diff\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -4,1 +4,1 @@\n-d\n+D\n```\n";
         assert_eq!(apply_unified(before, patch).unwrap(), "a\nB\nc\nD\n");
+    }
+
+    #[test]
+    fn changes_since_reports_only_what_the_command_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+        };
+        let Ok(init) = git(&["init"]) else { return };
+        if !init.status.success() {
+            return;
+        }
+        std::fs::write(dir.path().join("tracked.txt"), "a\n").unwrap();
+        let _ = git(&["add", "."]);
+        let _ = git(&["commit", "-m", "i"]);
+        // Earlier, uncommitted work: a big new module.
+        let body: String = (0..120).map(|i| format!("def f{i}(x):\n    return x + {i}\n")).collect();
+        std::fs::write(dir.path().join("parser.py"), &body).unwrap();
+
+        // A command that changes nothing reports nothing.
+        let snap = snapshot(dir.path()).unwrap();
+        assert!(changes_since(&snap).is_empty(), "earlier work is not resent");
+
+        // A command that edits one file reports just that file.
+        let snap = snapshot(dir.path()).unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "a\nb\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".groka/output")).unwrap();
+        std::fs::write(dir.path().join(".groka/output/x.log"), "noise").unwrap();
+        let changes = changes_since(&snap);
+        let paths: Vec<&str> = changes.iter().filter_map(|c| c["path"].as_str()).collect();
+        assert_eq!(paths, ["tracked.txt"], "{changes:?}");
+        assert_eq!(changes[0]["plus"], 1);
     }
 
     #[test]

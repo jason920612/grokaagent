@@ -353,7 +353,7 @@ impl ClientTool for AttachMonitorTool {
         let guard = self.guard.clone();
         Box::pin(async move {
             let shell = shell?;
-            shellguard::enforce(guard.as_ref(), &command, ".", shellguard::ShellKind::of(shell)).await?;
+            shellguard::enforce(guard.as_ref(), &command, &hub.workspace, ".", shellguard::ShellKind::of(shell)).await?;
             hub.attach_in(shell, &command, name.as_deref(), sink)
         })
     }
