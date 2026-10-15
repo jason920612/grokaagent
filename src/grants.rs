@@ -38,7 +38,24 @@ pub struct Grant {
 static SESSION: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
 fn canon(p: &Path) -> PathBuf {
-    let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // A path that does not exist yet (a file about to be written) resolves
+    // through its nearest existing folder, so a symlinked temp folder
+    // (macOS /var -> /private/var) or a Windows short name (RUNNER~1)
+    // compares equal to the canonical root it is under.
+    let mut rest = Vec::new();
+    let mut cur = p;
+    let c = loop {
+        if let Ok(c) = cur.canonicalize() {
+            break rest.iter().rev().fold(c, |acc: PathBuf, name| acc.join(name));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => break p.to_path_buf(),
+        }
+    };
     // Drop the Windows verbatim prefix so comparisons and messages match
     // what people type.
     let s = c.to_string_lossy();
@@ -371,6 +388,26 @@ mod tests {
         assert_eq!(n, 3);
         assert!(within(&other.join("x.json"), &roots(&ws)));
         assert!(env_value(&ws).contains("shared-data"), "children inherit it");
+    }
+
+    #[test]
+    fn a_file_not_written_yet_counts_under_its_granted_folder_however_it_is_spelled() {
+        let (_d, ws, other) = setup();
+        let root = canon(&other);
+        // Not on disk yet, spelled through `..`: resolved via its folder.
+        let new_file = ws.join("..").join("shared-data").join("sub").join("x.json");
+        assert!(within(&new_file, std::slice::from_ref(&root)), "{}", canon(&new_file).display());
+        assert!(!within(&ws.join("y.json"), &[root]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_spelling_of_a_granted_folder_counts_too() {
+        // macOS temp folders live under /var, a symlink to /private/var.
+        let (d, _ws, other) = setup();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert!(within(&link.join("new.json"), &[canon(&other)]));
     }
 
     #[tokio::test]
