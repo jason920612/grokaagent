@@ -5,16 +5,24 @@ use serde_json::Value;
 
 /// One line for a context fold: how, how much, and how full it was.
 pub(crate) fn compact_line(method: &str, dropped: usize, kept: usize, used: u32, window: u32) -> String {
-    let how = match method {
+    // A fold made by a background task: how it got into the context.
+    let (base, background) = match method.split_once(" (") {
+        Some((base, "dynamic)")) => (base, "（背景整理，工作未中斷）"),
+        Some((base, "background, awaited)")) => (base, "（背景整理，到上限時等它完成）"),
+        Some((base, "stand-in)")) => (base, "（重新整理失敗，改用背景整理的結果）"),
+        _ => (method, ""),
+    };
+    let how = match base {
         "lived" => "模型寫長期記憶",
         "lived-slim" => "模型寫長期記憶（先精簡大型輸出）",
         "lived-chunked" => "模型分段寫長期記憶",
         "emergency" => "緊急壓縮（未經模型）",
         "trim" => "精簡大型輸出",
+        "trim-outputs" => "精簡舊的工具輸出（未經模型）",
         other => other,
     };
     let pct = if window > 0 { format!(" · 當時 {}%", (used as u64 * 100 / window as u64)) } else { String::new() };
-    format!("上下文壓縮：{how} · 收起 {dropped} 項、原文保留 {kept} 項{pct}")
+    format!("上下文壓縮：{how}{background} · 收起 {dropped} 項、原文保留 {kept} 項{pct}")
 }
 
 fn arg<'a>(args: &'a Value, key: &str) -> &'a str {

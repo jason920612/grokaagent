@@ -345,57 +345,91 @@ async fn wait_task_kick(task: &Option<Arc<crate::task::TaskHub>>) {
     }
 }
 
-type FoldFuture<'p> = std::pin::Pin<Box<dyn Future<Output = Option<(usize, compact::Folded)>> + Send + 'p>>;
-
-/// A fold of the history as it stood at some turn, made while the turns
-/// that follow run: started a little before the trigger, spliced in at it.
-enum Prefold<'p> {
-    Running(FoldFuture<'p>),
-    /// Finished: (history length it saw, result), or `None` if it failed.
-    Done(Option<(usize, compact::Folded)>),
+/// A fold of the history as it stood at some turn, made by a task of its
+/// own while the work goes on, and spliced in as soon as it is ready.
+struct BgFold {
+    task: tokio::task::JoinHandle<Option<compact::Folded>>,
+    /// History length it folded.
+    seen: usize,
+    /// `history[seen - 1]` then: the splice is valid only while the history
+    /// before `seen` is untouched.
+    boundary: Option<Value>,
 }
 
-/// Run `work`, and keep a running prefold going while it does. The prefold
-/// is not awaited past `work`; it carries on during the next `alongside`.
-async fn alongside<T>(work: impl Future<Output = T>, prefold: &mut Option<Prefold<'_>>) -> T {
-    let Some(Prefold::Running(fold)) = prefold.as_mut() else {
-        return work.await;
-    };
-    tokio::pin!(work);
-    let mut done = None;
-    let out = loop {
-        tokio::select! {
-            biased;
-            out = &mut work => break out,
-            r = fold.as_mut(), if done.is_none() => done = Some(r),
-        }
-    };
-    if let Some(r) = done {
-        *prefold = Some(Prefold::Done(r));
+impl Drop for BgFold {
+    fn drop(&mut self) {
+        // Dropped unused (a compaction got there first, the run ended): stop
+        // its model call.
+        self.task.abort();
     }
-    out
 }
 
-/// Whether a finished prefold, spliced in at the trigger (`spliced` real
-/// tokens), is worth keeping over a fold of everything now, which would
-/// land near `floor` (`None`: nothing to fold).
+impl BgFold {
+    fn valid_for(&self, history: &[Value]) -> bool {
+        self.seen <= history.len() && (self.seen == 0 || history.get(self.seen - 1) == self.boundary.as_ref())
+    }
+
+    /// Wait for it to finish: `None` if Esc came first (it keeps running),
+    /// `Some(None)` if it failed. Not to be called again once it returned
+    /// `Some`.
+    async fn wait(&mut self, cancel: &Option<CancelFlag>) -> Option<Option<compact::Folded>> {
+        race_cancel(cancel, &mut self.task).await.ok().map(|r| r.ok().flatten())
+    }
+}
+
+/// What became of a background fold.
+enum Finished {
+    Ready(usize, compact::Folded),
+    /// The fold itself failed (or its task panicked).
+    Failed,
+    /// It finished, but the history before it has changed since.
+    Stale,
+}
+
+/// The background fold's outcome, if it has finished. A running fold stays
+/// in `slot`.
+fn take_finished(slot: &mut Option<BgFold>, history: &[Value]) -> Option<Finished> {
+    let bg = slot.as_mut()?;
+    if !bg.task.is_finished() {
+        return None;
+    }
+    // Finished, so its handle is ready, unless this task's cooperative
+    // budget is spent: poll it outside the budget, and leave it be if not.
+    let joined = futures::FutureExt::now_or_never(tokio::task::unconstrained(&mut bg.task))?;
+    let bg = slot.take()?;
+    Some(match joined.ok().flatten() {
+        None => Finished::Failed,
+        Some(f) if bg.valid_for(history) => Finished::Ready(bg.seen, f),
+        Some(_) => Finished::Stale,
+    })
+}
+
+/// Whether a finished background fold, spliced in (`spliced` real tokens),
+/// is worth keeping over a fold of everything now, which would land near
+/// `floor` (`None`: nothing to fold).
 fn splice_is_good_enough(spliced: u32, floor: Option<u32>, budget: &compact::Budget) -> bool {
     let Some(floor) = floor else {
         // Nothing left to fold: the splice is all there is.
         return true;
     };
-    spliced < budget.prefold
+    // Landed at most halfway from the target to the start point: a long
+    // stretch of work before the next fold. Higher, the next fold (and cache
+    // miss) would follow within a few turns.
+    spliced <= (budget.after + budget.prefold) / 2
         || (spliced <= floor.saturating_add(budget.window / 20)
             // At or over the trigger the next turn folds again: refuse it
             // when a fold now would get under.
             && (spliced < budget.trigger || floor >= budget.trigger))
 }
 
-/// A finished prefold spliced in: its items, then what came after `seen`.
-fn splice_prefold(f: compact::Folded, seen: usize, history: &[Value]) -> compact::Folded {
+/// A finished background fold spliced in: its items, then what came after
+/// `seen`. `how` tells the user how it got there: `dynamic` (ready while the
+/// work went on), `background, awaited` (waited for at the trigger) or
+/// `stand-in` (a fresh fold failed).
+fn splice_bg(f: compact::Folded, seen: usize, history: &[Value], how: &str) -> compact::Folded {
     let mut items = f.items;
     items.extend(history[seen..].iter().cloned());
-    compact::Folded { kept: items.len(), items, dropped: f.dropped, method: format!("{} (prefold)", f.method) }
+    compact::Folded { kept: items.len(), items, dropped: f.dropped, method: format!("{} ({how})", f.method) }
 }
 
 /// Real tokens of the next request: the server's count for the request it
@@ -409,11 +443,6 @@ fn used_tokens(last_input: u32, added_local: u32, all_local: u32, calib: f32) ->
     } else {
         real(all_local)
     }
-}
-
-/// What arrives before the trigger, in local units.
-fn growth_until(trigger: u32, used: u32, calib: f32) -> u32 {
-    (trigger.saturating_sub(used) as f32 / calib) as u32
 }
 
 async fn race_cancel<T>(
@@ -777,7 +806,7 @@ fn append_missing_function_calls(history: &mut Vec<Value>, calls: &[crate::provi
     }
 }
 
-pub async fn run<P: Provider>(
+pub async fn run<P: Provider + Clone + 'static>(
     provider: &P,
     tools: &ToolRegistry,
     sink: &dyn EventSink,
@@ -881,9 +910,11 @@ pub async fn run<P: Provider>(
     let mut usage_base_len = 0usize;
     // Real tokens per locally estimated token, from the last counted request.
     let mut calib = 1.0f32;
-    // At most one fold made ahead of the trigger, kept going alongside the
-    // working requests and tool calls, and taken only at the trigger.
-    let mut prefold: Option<Prefold<'_>> = None;
+    // At most one fold running in the background (see [`BgFold`]).
+    let mut prefold: Option<BgFold> = None;
+    // A background fold failed: no other until the next compaction (the
+    // trigger then folds in the open).
+    let mut bg_failed = false;
     let mut cache_turns = Vec::new();
     let mut compacted = 0u32;
     let max_turns = cfg.max_turns;
@@ -1002,55 +1033,73 @@ pub async fn run<P: Provider>(
             used_tokens(0, 0, compact::estimate_tokens("", &history).saturating_add(fixed), calib)
         };
         let fold_budget = budget.in_local_units(calib);
-        // At the trigger, in order of preference:
-        // 1. slimming old tool outputs, if that lands where a fold would: no
-        //    model call, every turn kept word for word;
-        // 2. the prefold, if it splices in well;
-        // 3. slimming, if it lands below the prefold point: the next prefold
-        //    then runs in the background instead of a blocking fold now;
-        // 4. a fold of everything now, falling back on a refused prefold if
-        //    that fold fails.
+        let local = |r: u32| (r as f32 / calib) as u32;
+        // Each compaction costs the prompt cache one miss, so it should buy
+        // a long stretch of work. In order of preference:
+        // 1. a background fold that has finished, if it splices in well;
+        // 2. past the start point, slimming old tool outputs, if that alone
+        //    gets halfway from the start point to the fold target: no model
+        //    call, every turn kept word for word;
+        // 3. at the trigger: the background fold still running (waited for),
+        //    then slimming below the start point, then a fold of everything
+        //    now, falling back on a refused background fold if that fails.
         let mut chosen: Option<compact::Folded> = None;
         let mut fallback: Option<(usize, compact::Folded)> = None;
         let mut fold_failed = false;
-        if used >= budget.trigger {
-            chosen = compact::trim_fold(&history, fixed, fold_budget.after);
-            if chosen.is_some() {
-                prefold = None;
+        // Spliced in, a fold lands near its target plus what arrived while it
+        // ran. At or above the start point the next fold would start right
+        // away: a fold of everything now does better, unless it could not get
+        // lower anyway (small windows, where fixed costs dominate).
+        let good = |(seen, f): &(usize, compact::Folded)| {
+            let mut spliced: Vec<Value> = f.items.clone();
+            spliced.extend(history[*seen..].iter().cloned());
+            let spliced = real(compact::estimate_tokens("", &spliced).saturating_add(fixed));
+            let memory = compact::memory_item_tokens(&f.items).unwrap_or(fold_budget.memory);
+            let floor = compact::fold_floor(&history, fixed, memory, &fold_budget, max_tail_items).map(real);
+            splice_is_good_enough(spliced, floor, &budget)
+        };
+        match take_finished(&mut prefold, &history) {
+            Some(Finished::Ready(seen, f)) => {
+                let t = (seen, f);
+                if good(&t) {
+                    chosen = Some(splice_bg(t.1, t.0, &history, "dynamic"));
+                } else {
+                    fallback = Some(t);
+                }
+            }
+            Some(Finished::Failed) => {
+                bg_failed = true;
+                notice(sink, &cfg.agent_name, &run_id, cfg.parent_run_id.as_deref(), "背景整理記憶失敗；到上限時再整理".into());
+            }
+            Some(Finished::Stale) | None => {}
+        }
+        if chosen.is_none() && used >= budget.prefold {
+            chosen = compact::trim_fold(&history, fixed, local((budget.after + budget.prefold) / 2));
+        }
+        if chosen.is_none() && used >= budget.trigger {
+            if let Some(mut bg) = prefold.take() {
+                // It has a head start: finish it rather than start over.
+                let (seen, valid) = (bg.seen, bg.valid_for(&history));
+                match bg.wait(&cfg.cancel).await {
+                    // Esc: it keeps running (the fold step below sees the
+                    // cancel and stops for the user); the next turn can still
+                    // splice it.
+                    None => prefold = Some(bg),
+                    Some(None) => bg_failed = true,
+                    Some(Some(f)) if valid => {
+                        let t = (seen, f);
+                        if good(&t) {
+                            chosen = Some(splice_bg(t.1, t.0, &history, "background, awaited"));
+                        } else {
+                            fallback = Some(t);
+                        }
+                    }
+                    Some(Some(_)) => {}
+                }
             }
         }
         if chosen.is_none() && used >= budget.trigger {
-            let taken = match prefold.take() {
-                Some(Prefold::Done(r)) => r,
-                // Not finished yet: it has a head start, so finish it.
-                Some(Prefold::Running(fold)) => race_cancel(&cfg.cancel, fold).await.ok().flatten(),
-                None => None,
-            }
-            .filter(|(seen, _)| *seen <= history.len());
-            // It aimed to land near `after` at the trigger; what arrived in
-            // the turn that crossed it comes on top. Spliced at or above the
-            // prefold point, the next prefold would start right away: a fold
-            // of everything now does better, unless it could not get lower
-            // anyway (small windows, where fixed costs dominate).
-            let good = |(seen, f): &(usize, compact::Folded)| {
-                let mut spliced: Vec<Value> = f.items.clone();
-                spliced.extend(history[*seen..].iter().cloned());
-                let spliced = real(compact::estimate_tokens("", &spliced).saturating_add(fixed));
-                let memory = compact::memory_item_tokens(&f.items).unwrap_or(fold_budget.memory);
-                let floor = compact::fold_floor(&history, fixed, memory, &fold_budget, max_tail_items).map(real);
-                splice_is_good_enough(spliced, floor, &budget)
-            };
-            match taken {
-                // The fold made alongside an earlier turn: its head is
-                // unchanged (history only grows), so splice it in with what
-                // came after.
-                Some(t) if good(&t) => chosen = Some(splice_prefold(t.1, t.0, &history)),
-                other => fallback = other,
-            }
-        }
-        if chosen.is_none() && used >= budget.trigger {
-            let below_prefold = ((budget.prefold as f32 / calib) as u32).saturating_sub(1);
-            chosen = compact::trim_fold(&history, fixed, below_prefold);
+            chosen = compact::trim_fold(&history, fixed, local(budget.prefold).saturating_sub(1));
         }
         if chosen.is_none() && used >= budget.trigger && compact_backoff > 0 && used < budget.hard {
             compact_backoff -= 1;
@@ -1095,11 +1144,11 @@ pub async fn run<P: Provider>(
                 }
                 Ok(Err(compact::FoldError::Failed(e))) => {
                     fold_failed = true;
-                    // The refused prefold stands in, unless it would leave the
-                    // context about full anyway.
+                    // The refused background fold stands in, unless it would
+                    // leave the context about full anyway.
                     let stand_in = fallback
                         .take()
-                        .map(|(seen, f)| splice_prefold(f, seen, &history))
+                        .map(|(seen, f)| splice_bg(f, seen, &history, "stand-in"))
                         .filter(|c| real(compact::estimate_tokens("", &c.items).saturating_add(fixed)) < budget.hard);
                     if let Some(c) = stand_in {
                         say(format!("壓縮失敗（{e}），改用背景先整理好的記憶"));
@@ -1126,6 +1175,7 @@ pub async fn run<P: Provider>(
                 compact_backoff = 0;
             }
             prefold = None;
+            bg_failed = false;
             compacted += 1;
             sink.emit(&AgentEvent::ContextCompacted {
                 meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
@@ -1148,53 +1198,61 @@ pub async fn run<P: Provider>(
         // turn start with a different prefix, so cached_tokens stays 0.
         let has_image = crate::vision::input_has_image(&history);
         let sent_len = history.len();
-        // Close to the trigger: fold alongside this request so the memory is
-        // ready when the trigger is reached. (Images are skipped: stripping
-        // them rewrites old items, and the splice assumes it does not.)
-        // No prefold when slimming old outputs will be enough at the trigger
-        // (what arrives until then counted): that path needs no model.
-        let trim_will_do = || {
-            let growth = growth_until(budget.trigger, used, calib);
-            compact::trim_fold(&history, fixed, fold_budget.after.saturating_sub(growth)).is_some()
-        };
+        // Past the start point, fold in a task of its own while the work goes
+        // on; the result is spliced in as soon as it is ready (step 1 above).
+        // Not when a fold would gain little (small windows, where fixed costs
+        // dominate): that would cost the cache a miss for little room. Not
+        // with images either: stripping them rewrites old items, and the
+        // splice needs the folded part untouched.
         if used >= budget.prefold
             && used < budget.trigger
             && prefold.is_none()
+            && !bg_failed
             && compact_backoff == 0
             && !has_image
-            && !trim_will_do()
         {
-            // What arrives before the trigger stays verbatim after the
-            // splice, so this fold aims lower by that much: spliced at the
-            // trigger it lands where a fold made there would.
-            let mut ahead = budget;
-            ahead.after = budget.after.saturating_sub(budget.trigger - used).max(budget.window / 10);
-            let ahead = ahead.in_local_units(calib);
-            let (instructions, goal, model, cache_key) =
-                (live_instructions(&cfg), cfg.prompt.clone(), model.clone(), cache_key.clone());
-            let (client_tools, server_tools, workspace) =
-                (tools.specs_for(&server_tools), server_tools.clone(), cfg.workspace.clone());
-            let seen = history.clone();
-            prefold = Some(Prefold::Running(Box::pin(async move {
-                let quiet = |_: String| {};
-                let ctx = compact::FoldCtx {
-                    provider,
-                    instructions: &instructions,
-                    goal: &goal,
-                    model: &model,
-                    effort,
-                    send_reasoning,
-                    cache_key: &cache_key,
-                    client_tools,
-                    server_tools,
-                    budget: ahead,
-                    max_tail_items,
-                    workspace: Some(&workspace),
-                    prefold: true,
-                    notice: &quiet,
-                };
-                compact::fold(&ctx, &seen).await.ok().map(|f| (seen.len(), f))
-            })));
+            let memory = compact::memory_item_tokens(&history).unwrap_or(fold_budget.memory);
+            let worth = compact::fold_floor(&history, fixed, memory, &fold_budget, max_tail_items)
+                .is_some_and(|floor| real(floor).saturating_add(budget.window / 10) <= used);
+            if worth {
+                let snapshot = history.clone();
+                let (seen, boundary) = (snapshot.len(), snapshot.last().cloned());
+                let p = provider.clone();
+                let (instructions, goal, model, cache_key) =
+                    (live_instructions(&cfg), cfg.prompt.clone(), model.clone(), cache_key.clone());
+                let (client_tools, server_tools, workspace) =
+                    (tools.specs_for(&server_tools), server_tools.clone(), cfg.workspace.clone());
+                let task = tokio::spawn(async move {
+                    let quiet = |_: String| {};
+                    let ctx = compact::FoldCtx {
+                        provider: &p,
+                        instructions: &instructions,
+                        goal: &goal,
+                        model: &model,
+                        effort,
+                        send_reasoning,
+                        // The conversation's own key: the fold request starts
+                        // with the same prefix, so it is served from cache.
+                        cache_key: &cache_key,
+                        client_tools,
+                        server_tools,
+                        budget: fold_budget,
+                        max_tail_items,
+                        workspace: Some(&workspace),
+                        prefold: true,
+                        notice: &quiet,
+                    };
+                    compact::fold(&ctx, &snapshot).await.ok()
+                });
+                prefold = Some(BgFold { task, seen, boundary });
+                notice(
+                    sink,
+                    &cfg.agent_name,
+                    &run_id,
+                    cfg.parent_run_id.as_deref(),
+                    format!("背景整理長期記憶中（上下文 {}%），工作不中斷", used as u64 * 100 / window.max(1) as u64),
+                );
+            }
         }
         let req = CompleteRequest {
             instructions: live_instructions(&cfg),
@@ -1289,7 +1347,7 @@ pub async fn run<P: Provider>(
             }
         }
         };
-        let attempt = alongside(main, &mut prefold).await;
+        let attempt = main.await;
         let response = match attempt {
             Err(()) => {
                 if !take_interrupt(
@@ -1445,7 +1503,7 @@ pub async fn run<P: Provider>(
                     args: args.clone(),
                     kind: "client".into(),
                 });
-                let output = match alongside(race_cancel(&cfg.cancel, tools.call(&call.name, &args)), &mut prefold).await {
+                let output = match race_cancel(&cfg.cancel, tools.call(&call.name, &args)).await {
                     Ok(Ok(o)) => o,
                     Ok(Err(e)) => json!({"error": e.to_string()}).to_string(),
                     Err(()) => {
@@ -1814,6 +1872,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("what time?", 4))
             .await
             .unwrap();
@@ -1935,6 +1994,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, cfg("what time?", 4))
             .await
             .unwrap();
@@ -1974,6 +2034,7 @@ mod tests {
             let rec = Rec(Mutex::new(Vec::new()));
             let mut c = cfg("hi", 1);
             c.run_id = id.into();
+            let provider = Arc::new(provider);
             super::run(&provider, &tools, &rec, c).await.unwrap();
             let key = provider.calls.lock().unwrap()[0].cache_key.clone();
             key
@@ -2016,6 +2077,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, cfg("what time?", 4))
             .await
             .unwrap();
@@ -2058,6 +2120,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("why 42?", 2))
             .await
             .unwrap();
@@ -2099,6 +2162,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(WriteFileTool::new(dir.path().to_path_buf()))]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, cfg("write n.txt", 4))
             .await
             .unwrap();
@@ -2152,6 +2216,7 @@ mod tests {
             ws.path().to_path_buf(),
         ))]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "the goal is A2A");
         let calls = provider.calls.lock().unwrap();
@@ -2200,6 +2265,7 @@ mod tests {
             ws.path().to_path_buf(),
         ))]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "noted");
         assert!(!ws.path().join("goal.md").exists());
@@ -2241,6 +2307,7 @@ mod tests {
         c.workspace = dir.path().to_path_buf();
         let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(c.workspace.clone()))]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "I see red");
         let calls = provider.calls.lock().unwrap();
@@ -2307,6 +2374,7 @@ mod tests {
             Box::new(NowTool),
         ]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "done");
         let calls = provider.calls.lock().unwrap();
@@ -2443,6 +2511,7 @@ mod tests {
             Box::new(NowTool),
         ]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(
@@ -2481,6 +2550,7 @@ mod tests {
         c.workspace = dir.path().to_path_buf();
         let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(c.workspace.clone()))]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "I will enlarge it");
         let calls = provider.calls.lock().unwrap();
@@ -2535,6 +2605,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("look", 4)).await.unwrap();
         assert_eq!(out.text, "I will enlarge the image");
         assert_eq!(out.turns, 2);
@@ -2575,6 +2646,7 @@ mod tests {
         c.images = vec![PathBuf::from("a.jpg")];
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "green square");
         let calls = provider.calls.lock().unwrap();
@@ -2609,6 +2681,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let err = run(&provider, &tools, &rec, cfg("loop", 1))
             .await
             .unwrap_err();
@@ -2648,6 +2721,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("loop", 0))
             .await
             .unwrap();
@@ -2689,6 +2763,7 @@ mod tests {
         c.inbox = Some(rx);
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "continued");
         let events = rec.0.lock().unwrap().clone();
@@ -2726,6 +2801,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, cfg("x", 3)).await.unwrap();
         let calls = provider.calls.lock().unwrap();
         let output = calls[1]
@@ -2784,6 +2860,7 @@ mod tests {
         let mut config = cfg("ship the kernel", 4);
         config.context_window = 10_000;
         config.compact_keep_recent = 2;
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(out.compacted, 1);
@@ -2918,6 +2995,7 @@ mod tests {
         let mut config = cfg("ship the kernel", 4);
         config.context_window = 10_000;
         config.compact_keep_recent = 2;
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(out.compacted, 1);
@@ -3017,6 +3095,7 @@ mod tests {
         let mut config = cfg("ship the kernel", 4);
         config.context_window = 10_000;
         config.compact_keep_recent = 2;
+        let provider = Arc::new(provider);
         let out = tokio::time::timeout(Duration::from_secs(10), run(&provider, &tools, &rec, config))
             .await
             .expect("a failing fold must not spin forever")
@@ -3030,41 +3109,85 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn a_prefold_progresses_alongside_work_without_holding_it_up() {
-        let folded = || compact::Folded { items: Vec::new(), dropped: 0, kept: 0, method: "lived".into() };
-        // Slow fold: the work returns on its own time, the fold keeps going.
-        let mut pf = Some(Prefold::Running(Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            Some((3, folded()))
-        })));
-        let t0 = std::time::Instant::now();
-        assert_eq!(alongside(async { 7 }, &mut pf).await, 7);
-        assert!(t0.elapsed() < Duration::from_millis(200));
-        assert!(matches!(pf, Some(Prefold::Running(_))));
-        // It made progress during that work: a later, longer piece of work
-        // sees it finish.
-        alongside(tokio::time::sleep(Duration::from_millis(500)), &mut pf).await;
-        assert!(matches!(pf, Some(Prefold::Done(Some((3, _))))));
-    }
-
     #[test]
-    fn a_splice_near_the_prefold_point_gives_way_unless_a_fold_cannot_do_better() {
+    fn a_splice_near_the_start_point_gives_way_unless_a_fold_cannot_do_better() {
+        // 128K: target 28,160, start 51,200 (halfway 39,680), trigger 64,000.
         let b = compact::Budget::new(128_000);
-        // Landed near `after`: keep it.
-        assert!(splice_is_good_enough(45_000, Some(40_000), &b));
-        // Landed at 45% (a big arrival in the crossing turn): the next
-        // prefold would start at once, and a fresh fold gets to ~35%.
-        assert!(!splice_is_good_enough(57_600, Some(44_800), &b));
+        // Landed at most halfway to the start point: keep it.
+        assert!(splice_is_good_enough(35_000, Some(20_000), &b));
+        // Past halfway, and a fresh fold gets much lower: the next fold (and
+        // cache miss) would follow within a few turns, so refuse.
+        assert!(!splice_is_good_enough(45_000, Some(25_000), &b));
+        assert!(!splice_is_good_enough(57_600, Some(30_000), &b));
         // A fresh fold could not get much lower (fixed costs): keep it.
+        assert!(splice_is_good_enough(45_000, Some(42_000), &b));
         assert!(splice_is_good_enough(57_600, Some(54_000), &b));
         // Nothing left to fold: keep it.
         assert!(splice_is_good_enough(60_000, None, &b));
-        // At or over the trigger (64,000) while a fresh fold gets under it:
-        // refuse, or the next turn folds again.
+        // At or over the trigger while a fresh fold gets under it: refuse,
+        // or the next turn folds again.
         assert!(!splice_is_good_enough(64_500, Some(60_000), &b));
         // Over the trigger and a fresh fold would be too: keep it.
         assert!(splice_is_good_enough(66_000, Some(64_000), &b));
+    }
+
+    #[tokio::test]
+    async fn a_background_fold_is_taken_only_when_finished_and_only_while_the_history_before_it_is_untouched() {
+        let folded = || compact::Folded { items: vec![json!({"role":"user","content":"m"})], dropped: 1, kept: 0, method: "lived".into() };
+        let history = vec![json!({"role":"user","content":"a"}), json!({"role":"assistant","content":"b"})];
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut slot = Some(BgFold {
+            task: tokio::spawn(async move {
+                let _ = wait.await;
+                Some(folded())
+            }),
+            seen: 2,
+            boundary: history.last().cloned(),
+        });
+        assert!(take_finished(&mut slot, &history).is_none(), "still running: left in place");
+        assert!(slot.is_some());
+        go.send(()).unwrap();
+        while !slot.as_ref().unwrap().task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut grown = history.clone();
+        grown.push(json!({"role":"user","content":"c"}));
+        assert!(
+            matches!(take_finished(&mut slot, &grown), Some(Finished::Ready(2, _))),
+            "appended after it: still valid"
+        );
+        assert!(slot.is_none());
+
+        // A fold that failed is told apart from one that went stale.
+        let mut slot = Some(BgFold { task: tokio::spawn(async { None }), seen: 2, boundary: history.last().cloned() });
+        while !slot.as_ref().unwrap().task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(take_finished(&mut slot, &history), Some(Finished::Failed)));
+
+        // Rewritten before `seen`: not usable.
+        let mut slot = Some(BgFold { task: tokio::spawn(async move { Some(folded()) }), seen: 2, boundary: history.last().cloned() });
+        while !slot.as_ref().unwrap().task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut rewritten = history.clone();
+        rewritten[1] = json!({"role":"assistant","content":"changed"});
+        assert!(matches!(take_finished(&mut slot, &rewritten), Some(Finished::Stale)));
+
+        // Dropped unused: its task stops.
+        let (alive, gone) = tokio::sync::oneshot::channel::<()>();
+        let bg = BgFold {
+            task: tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let _ = alive.send(());
+                None
+            }),
+            seen: 0,
+            boundary: None,
+        };
+        tokio::task::yield_now().await;
+        drop(bg);
+        assert!(tokio::time::timeout(Duration::from_secs(5), gone).await.unwrap().is_err(), "aborted before it could send");
     }
 
     /// A tool whose output is big and slims well.
@@ -3107,6 +3230,7 @@ mod tests {
         let rec = Rec(Mutex::new(Vec::new()));
         let mut config = cfg("look through the logs", 20);
         config.context_window = 100_000;
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
         let calls = provider.calls.lock().unwrap();
@@ -3123,372 +3247,20 @@ mod tests {
         assert_eq!(last.input.iter().filter(|i| i["type"] == "function_call").count(), 12);
     }
 
-    // ---- prefold: the fold made in the background ahead of the trigger
-
-    /// Pads in the turn that crosses the trigger that put the splice at
-    /// ~4,460: between the prefold point and the trigger, while a fresh fold
-    /// gets to ~2,640.
-    const PADS_PAST_PREFOLD: usize = 4;
+    // ---- dynamic folds: made by a background task, spliced in when ready
 
     /// A working reply that calls `now`, after `pads` user-role items of
     /// ~500 tokens each (bulk that is cheap to make).
-    fn now_call(id: &str, input_tokens: u32, pads: usize) -> CompleteResponse {
+    fn now_call(id: &str, pads: usize) -> CompleteResponse {
         let mut output_items: Vec<Value> = (0..pads)
             .map(|i| json!({"role":"user","content": format!("pad-{id}-{i} {}", "notes ".repeat(330))}))
             .collect();
         output_items.push(json!({"type":"function_call","call_id": id,"name":"now","arguments":"{}"}));
         CompleteResponse {
             function_calls: vec![FunctionCall { call_id: id.into(), name: "now".into(), arguments: "{}".into() }],
-            usage: CacheUsage { input_tokens, cached_tokens: 0 },
             output_items,
             ..CompleteResponse::new(id)
         }
-    }
-
-    fn memory_reply(id: &str, open_work: &str) -> CompleteResponse {
-        CompleteResponse {
-            text: format!("## Load-bearing facts\n- the kernel ABI is frozen\n## Open work\n- {open_work}"),
-            ..CompleteResponse::new(id)
-        }
-    }
-
-    fn done_reply() -> CompleteResponse {
-        CompleteResponse { text: "done".into(), ..CompleteResponse::new("end") }
-    }
-
-    fn is_fold_request(req: &CompleteRequest) -> bool {
-        req.input.iter().any(|i| i["content"].as_str().is_some_and(|t| t.contains(MEMORY_FOLD_MARK)))
-    }
-
-    /// Counts the fold requests that reach the model. With `fail_folds`
-    /// it answers them itself with nothing usable, leaving the scripted
-    /// replies to the working turns.
-    struct Watched<'a> {
-        inner: &'a Scripted,
-        folds: Arc<std::sync::atomic::AtomicUsize>,
-        fail_folds: bool,
-    }
-
-    impl Provider for Watched<'_> {
-        async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
-            if is_fold_request(&req) {
-                self.folds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if self.fail_folds {
-                    return Ok(CompleteResponse::new("fold-empty"));
-                }
-            }
-            self.inner.complete(req).await
-        }
-
-        async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
-            self.inner.compact(req).await
-        }
-    }
-
-    /// `now` that takes a moment, so a prefold started alongside gets to
-    /// run; each call records how many folds had reached the model by the
-    /// time it finished.
-    struct SlowNow {
-        folds: Arc<std::sync::atomic::AtomicUsize>,
-        seen: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl crate::tools::ClientTool for SlowNow {
-        fn spec(&self) -> crate::tools::ToolSpec {
-            crate::tools::ClientTool::spec(&NowTool)
-        }
-        fn call(&self, _args: &Value) -> crate::tools::ToolCallFut<'_> {
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                self.seen.lock().unwrap().push(self.folds.load(std::sync::atomic::Ordering::SeqCst));
-                Ok(json!({"utc": "2026-10-14T00:00:00Z"}).to_string())
-            })
-        }
-    }
-
-    struct PrefoldRun {
-        out: RunOutcome,
-        calls: Vec<CompleteRequest>,
-        events: Vec<AgentEvent>,
-        /// Folds that had reached the model when each tool call finished.
-        seen: Vec<usize>,
-        folds: usize,
-    }
-
-    async fn prefold_run(replies: Vec<CompleteResponse>, window: u32) -> PrefoldRun {
-        let scripted = Scripted {
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(pop_front(replies)),
-            compact_calls: Mutex::new(Vec::new()),
-            compact_ok: false,
-        };
-        let folds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let provider = Watched { inner: &scripted, folds: folds.clone(), fail_folds: false };
-        let tools = ToolRegistry::new(vec![Box::new(SlowNow { folds: folds.clone(), seen: seen.clone() })]);
-        let rec = Rec(Mutex::new(Vec::new()));
-        let mut config = cfg("ship the kernel", 12);
-        config.context_window = window;
-        let out = run(&provider, &tools, &rec, config).await.unwrap();
-        let calls = scripted.calls.lock().unwrap().clone();
-        let events = rec.0.lock().unwrap().clone();
-        let seen = seen.lock().unwrap().clone();
-        PrefoldRun { out, calls, events, seen, folds: folds.load(std::sync::atomic::Ordering::SeqCst) }
-    }
-
-    fn fold_methods(events: &[AgentEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::ContextCompacted { method, .. } => Some(method.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    // Window 10,000: prefold at 4,200, trigger at 5,000. Turn 1 reports no
-    // usage, so turn 2 is measured locally (~4,600 with nine pads).
-
-    #[tokio::test]
-    async fn a_fold_made_alongside_an_earlier_turn_is_spliced_in_at_the_trigger() {
-        let r = prefold_run(
-            vec![
-                now_call("c1", 0, 9),
-                // turn 2, in the band: the prefold starts and runs during
-                // this turn's tool call
-                now_call("c2", 5_200, 0),
-                memory_reply("mem", "port the scheduler"),
-                // turn 3, at the trigger: spliced, no new fold
-                done_reply(),
-            ],
-            10_000,
-        )
-        .await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(r.seen, [0, 1], "the fold had reached the model before turn 2's tool call ended");
-        assert_eq!(r.folds, 1);
-        assert_eq!(r.calls.len(), 4);
-        let methods = fold_methods(&r.events);
-        assert_eq!(methods, ["lived (prefold)"]);
-        assert!(r.events.iter().any(|e| matches!(e, AgentEvent::ContextCompacted { memory, .. } if memory.contains("kernel ABI is frozen"))));
-        let last = r.calls.last().unwrap();
-        let mem_at = last.input.iter().position(|i| i["content"].as_str().is_some_and(|t| t.contains(COMPACT_MARK))).unwrap();
-        let pad_at = last.input.iter().position(|i| i["content"].as_str().is_some_and(|t| t.starts_with("pad-c1-6 ")));
-        assert!(pad_at.is_some_and(|p| p < mem_at), "the user's newest folded words are kept verbatim, before the memory");
-        let memory = compact::previous_memory(&last.input).unwrap();
-        assert!(memory.contains("## Original request\nship the kernel"), "{memory}");
-    }
-
-    #[tokio::test]
-    async fn several_turns_before_the_trigger_share_one_prefold() {
-        let r = prefold_run(
-            vec![
-                now_call("c1", 0, 9),
-                now_call("c2", 4_400, 0),
-                memory_reply("mem", "port the scheduler"),
-                // turns 3 and 4: still in the band; no second prefold
-                now_call("c3", 4_600, 0),
-                now_call("c4", 5_200, 0),
-                done_reply(),
-            ],
-            10_000,
-        )
-        .await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(r.folds, 1, "one prefold for the whole band");
-        assert_eq!(r.seen, [0, 1, 1, 1]);
-        assert_eq!(fold_methods(&r.events), ["lived (prefold)"]);
-    }
-
-    #[tokio::test]
-    async fn a_prefold_overtaken_by_a_big_arrival_gives_way_to_one_fresh_fold() {
-        let r = prefold_run(
-            vec![
-                now_call("c1", 0, 9),
-                now_call("c2", 4_400, 0),
-                memory_reply("mem", "port the scheduler"),
-                now_call("c3", 4_600, 0),
-                // A big arrival after the fold: spliced, it would be over the
-                // trigger, and a fresh fold gets lower.
-                now_call("c4", 5_200, 8),
-                // turn 5: a fresh fold (two chunks: the window is small)
-                memory_reply("mem2", "port the scheduler and the pads"),
-                memory_reply("mem3", "port the scheduler and the pads"),
-                done_reply(),
-            ],
-            10_000,
-        )
-        .await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(r.folds, 3, "the prefold and a two-chunk fresh fold");
-        let methods = fold_methods(&r.events);
-        assert_eq!(methods.len(), 1, "{methods:?}");
-        assert!(!methods[0].ends_with("(prefold)"), "{methods:?}");
-        let memory = compact::previous_memory(&r.calls.last().unwrap().input).unwrap();
-        assert!(memory.contains("the pads"), "the fresh fold's memory is used: {memory}");
-    }
-
-    #[tokio::test]
-    async fn a_refused_prefold_is_used_when_the_fresh_fold_fails() {
-        let mut replies = vec![
-            now_call("c1", 0, 9),
-            now_call("c2", 4_400, 0),
-            memory_reply("mem", "port the scheduler"),
-            now_call("c3", 4_600, 0),
-            now_call("c4", 5_200, 8),
-        ];
-        // The fresh fold gets nothing usable back, every attempt.
-        for n in 0..compact::FOLD_ATTEMPTS {
-            replies.push(CompleteResponse { text: String::new(), ..CompleteResponse::new(format!("empty{n}")) });
-        }
-        replies.push(done_reply());
-        let r = prefold_run(replies, 10_000).await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(fold_methods(&r.events), ["lived (prefold)"], "the refused splice stands in");
-        assert!(r.events.iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("改用背景先整理好的記憶"))));
-        let memory = compact::previous_memory(&r.calls.last().unwrap().input).unwrap();
-        assert!(memory.contains("port the scheduler"), "{memory}");
-    }
-
-    #[tokio::test]
-    async fn a_splice_landing_past_the_prefold_point_gives_way_when_a_fresh_fold_gets_lower() {
-        // A moderate arrival: the splice lands between the prefold point and
-        // the trigger, well above where a fresh fold would.
-        let r = prefold_run(
-            vec![
-                now_call("c1", 0, 9),
-                now_call("c2", 4_400, 0),
-                memory_reply("mem", "port the scheduler"),
-                now_call("c3", 4_600, 0),
-                now_call("c4", 5_200, PADS_PAST_PREFOLD),
-                // a fresh fold of everything
-                memory_reply("mem2", "port the scheduler and the pads"),
-                done_reply(),
-            ],
-            10_000,
-        )
-        .await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(r.folds, 2, "the prefold and one fresh fold");
-        let methods = fold_methods(&r.events);
-        assert_eq!(methods.len(), 1, "{methods:?}");
-        assert!(!methods[0].ends_with("(prefold)"), "{methods:?}");
-        let memory = compact::previous_memory(&r.calls.last().unwrap().input).unwrap();
-        assert!(memory.contains("the pads"), "the fresh fold's memory is used: {memory}");
-    }
-
-    /// A tool that prints `n` tokens of log (local estimate).
-    struct SizedLog {
-        folds: Arc<std::sync::atomic::AtomicUsize>,
-        seen: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl crate::tools::ClientTool for SizedLog {
-        fn spec(&self) -> crate::tools::ToolSpec {
-            crate::tools::ToolSpec {
-                name: "log".into(),
-                description: "Print n tokens of log.".into(),
-                parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
-            }
-        }
-        fn call(&self, args: &Value) -> crate::tools::ToolCallFut<'_> {
-            let n = args["n"].as_u64().unwrap_or(10) as usize;
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                self.seen.lock().unwrap().push(self.folds.load(std::sync::atomic::Ordering::SeqCst));
-                Ok("log line ok\n".repeat(n / 3))
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn at_the_trigger_trimming_beats_a_waiting_prefold() {
-        // Window 100,000: prefold 42,000, trigger 50,000, after 35,000.
-        // Four ~10K outputs, then small ones. When the band is reached the
-        // big outputs are among the newest four, so trimming is not enough
-        // and a prefold runs; by the trigger they are old, and trimming is.
-        let log = |id: &str, n: u32| CompleteResponse {
-            function_calls: vec![FunctionCall { call_id: id.into(), name: "log".into(), arguments: format!("{{\"n\":{n}}}") }],
-            output_items: vec![json!({"type":"function_call","call_id": id,"name":"log","arguments": format!("{{\"n\":{n}}}")})],
-            ..CompleteResponse::new(id)
-        };
-        let replies = vec![
-            log("b1", 10_000),
-            log("b2", 10_000),
-            log("b3", 10_000),
-            log("b4", 10_000),
-            log("s5", 3_000),
-            // turn 6 starts in the band: the prefold runs during its tool call
-            log("s6", 3_000),
-            memory_reply("mem", "read the logs"),
-            log("s7", 3_000),
-            log("s8", 3_000),
-            // turn 9: at the trigger, trimming the four big outputs is enough
-            done_reply(),
-        ];
-        let scripted = Scripted {
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(pop_front(replies)),
-            compact_calls: Mutex::new(Vec::new()),
-            compact_ok: false,
-        };
-        let folds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let provider = Watched { inner: &scripted, folds: folds.clone(), fail_folds: false };
-        let tools = ToolRegistry::new(vec![Box::new(SizedLog { folds: folds.clone(), seen: seen.clone() })]);
-        let rec = Rec(Mutex::new(Vec::new()));
-        let mut config = cfg("look through the logs", 20);
-        config.context_window = 100_000;
-        let out = run(&provider, &tools, &rec, config).await.unwrap();
-        assert_eq!(out.text, "done");
-        assert_eq!(folds.load(std::sync::atomic::Ordering::SeqCst), 1, "the prefold ran");
-        assert_eq!(seen.lock().unwrap()[5], 1, "during turn 6's tool call");
-        let events = rec.0.lock().unwrap();
-        assert_eq!(fold_methods(&events), ["trim-outputs"], "trimming won; the prefold was dropped");
-        let calls = scripted.calls.lock().unwrap();
-        let last = calls.last().unwrap();
-        assert!(compact::previous_memory(&last.input).is_none(), "no memory: every turn is still there");
-        assert_eq!(last.input.iter().filter(|i| i["type"] == "function_call").count(), 8);
-    }
-
-    #[tokio::test]
-    async fn with_no_prefold_waiting_a_trim_below_the_prefold_point_is_enough() {
-        // Window 100,000. Five 8K outputs bring the history to ~40K (under
-        // the prefold point, so no prefold), then one 11K output jumps past
-        // the trigger. Trimming the two oldest lands at ~37K: above `after`
-        // (35K) but below the prefold point (42K). Without a prefold to fall
-        // back on, that beats a blocking model fold.
-        let log = |id: &str, n: u32| CompleteResponse {
-            function_calls: vec![FunctionCall { call_id: id.into(), name: "log".into(), arguments: format!("{{\"n\":{n}}}") }],
-            output_items: vec![json!({"type":"function_call","call_id": id,"name":"log","arguments": format!("{{\"n\":{n}}}")})],
-            ..CompleteResponse::new(id)
-        };
-        let replies = vec![
-            log("b1", 8_000),
-            log("b2", 8_000),
-            log("b3", 8_000),
-            log("b4", 8_000),
-            log("b5", 8_000),
-            log("s6", 11_000),
-            done_reply(),
-        ];
-        let scripted = Scripted {
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(pop_front(replies)),
-            compact_calls: Mutex::new(Vec::new()),
-            compact_ok: false,
-        };
-        let folds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let provider = Watched { inner: &scripted, folds: folds.clone(), fail_folds: false };
-        let tools = ToolRegistry::new(vec![Box::new(SizedLog { folds: folds.clone(), seen: seen.clone() })]);
-        let rec = Rec(Mutex::new(Vec::new()));
-        let mut config = cfg("look through the logs", 20);
-        config.context_window = 100_000;
-        let out = run(&provider, &tools, &rec, config).await.unwrap();
-        assert_eq!(out.text, "done");
-        assert_eq!(folds.load(std::sync::atomic::Ordering::SeqCst), 0, "no model fold at all");
-        assert_eq!(fold_methods(&rec.0.lock().unwrap()), ["trim-outputs"]);
     }
 
     /// A reply that calls `log` for `n` tokens of output, after `pads`
@@ -3506,128 +3278,446 @@ mod tests {
         }
     }
 
-    async fn log_run(replies: Vec<CompleteResponse>, window: u32, fail_folds: bool) -> PrefoldRun {
-        let scripted = Scripted {
+    /// `k` parallel `log` calls of `n` tokens each.
+    fn parallel_logs(id: &str, k: usize, n: u32) -> CompleteResponse {
+        let ids: Vec<String> = (0..k).map(|i| format!("{id}-{i}")).collect();
+        let args = format!("{{\"n\":{n}}}");
+        CompleteResponse {
+            function_calls: ids.iter().map(|c| FunctionCall { call_id: c.clone(), name: "log".into(), arguments: args.clone() }).collect(),
+            output_items: ids.iter().map(|c| json!({"type":"function_call","call_id": c,"name":"log","arguments": args})).collect(),
+            ..CompleteResponse::new(id)
+        }
+    }
+
+    fn done_reply() -> CompleteResponse {
+        CompleteResponse { text: "done".into(), ..CompleteResponse::new("end") }
+    }
+
+    fn is_fold_request(req: &CompleteRequest) -> bool {
+        req.input.iter().any(|i| i["content"].as_str().is_some_and(|t| t.contains(MEMORY_FOLD_MARK)))
+    }
+
+    /// How fold requests are answered (by [`Watched`], never from the
+    /// scripted queue, so the working replies keep their order whatever
+    /// the timing).
+    #[derive(Clone)]
+    struct FoldScript {
+        /// The memory written; `None`: nothing usable.
+        text: Option<&'static str>,
+        delay: Duration,
+        /// Fold requests after this many get nothing usable.
+        ok_first: usize,
+        /// Answer the first fold request (the background fold) only once this
+        /// many more tool calls have ended: a deterministic "slow" fold.
+        release_after: usize,
+    }
+
+    impl FoldScript {
+        fn ok(text: &'static str) -> Self {
+            Self { text: Some(text), delay: Duration::ZERO, ok_first: usize::MAX, release_after: 0 }
+        }
+        /// Answered only after `tools` more tool calls have ended.
+        fn after_tools(text: &'static str, tools: usize) -> Self {
+            Self { release_after: tools, ..Self::ok(text) }
+        }
+        fn failing() -> Self {
+            Self { text: None, ok_first: 0, ..Self::ok("") }
+        }
+    }
+
+    const MEMORY: &str = "## Load-bearing facts\n- the kernel ABI is frozen\n## Open work\n- port the scheduler";
+
+    #[derive(Clone)]
+    struct Watched {
+        inner: Arc<Scripted>,
+        /// Fold requests made, and answered.
+        folds: Arc<std::sync::atomic::AtomicUsize>,
+        folds_done: Arc<std::sync::atomic::AtomicUsize>,
+        /// Tool calls ended so far.
+        tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fold_reqs: Arc<Mutex<Vec<CompleteRequest>>>,
+        script: FoldScript,
+    }
+
+    impl Provider for Watched {
+        async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+            if is_fold_request(&req) {
+                self.fold_reqs.lock().unwrap().push(req.clone());
+                let n = self.folds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Only the first (the background fold): a blocking fold at
+                // the trigger would wait for tool calls that never come.
+                let release = self.tool_calls.load(std::sync::atomic::Ordering::SeqCst)
+                    + if n == 0 { self.script.release_after } else { 0 };
+                while self.tool_calls.load(std::sync::atomic::Ordering::SeqCst) < release {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                if !self.script.delay.is_zero() {
+                    tokio::time::sleep(self.script.delay).await;
+                }
+                self.folds_done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let text = self.script.text.filter(|_| n < self.script.ok_first).unwrap_or_default();
+                return Ok(CompleteResponse { text: text.to_string(), ..CompleteResponse::new(format!("fold{n}")) });
+            }
+            self.inner.complete(req).await
+        }
+
+        async fn compact(&self, req: CompactRequest) -> Result<CompactResponse> {
+            self.inner.compact(req).await
+        }
+    }
+
+    /// Records, when each tool call ends, how many folds had been answered.
+    #[derive(Clone)]
+    struct Probe {
+        folds_done: Arc<std::sync::atomic::AtomicUsize>,
+        tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Probe {
+        fn mark(&self) {
+            self.seen.lock().unwrap().push(self.folds_done.load(std::sync::atomic::Ordering::SeqCst));
+            self.tool_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `now` that takes a moment, so a background fold gets to run.
+    struct SlowNow(Probe);
+
+    impl crate::tools::ClientTool for SlowNow {
+        fn spec(&self) -> crate::tools::ToolSpec {
+            crate::tools::ClientTool::spec(&NowTool)
+        }
+        fn call(&self, _args: &Value) -> crate::tools::ToolCallFut<'_> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.0.mark();
+                Ok(json!({"utc": "2026-10-14T00:00:00Z"}).to_string())
+            })
+        }
+    }
+
+    /// A tool that prints `n` tokens of log (local estimate).
+    struct SizedLog(Probe);
+
+    impl crate::tools::ClientTool for SizedLog {
+        fn spec(&self) -> crate::tools::ToolSpec {
+            crate::tools::ToolSpec {
+                name: "log".into(),
+                description: "Print n tokens of log.".into(),
+                parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+            }
+        }
+        fn call(&self, args: &Value) -> crate::tools::ToolCallFut<'_> {
+            let n = args["n"].as_u64().unwrap_or(10) as usize;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.0.mark();
+                Ok("log line ok\n".repeat(n / 3))
+            })
+        }
+    }
+
+    struct DynRun {
+        out: RunOutcome,
+        /// Working requests only (folds are answered by `Watched`).
+        calls: Vec<CompleteRequest>,
+        events: Vec<AgentEvent>,
+        /// Folds answered when each tool call ended.
+        seen: Vec<usize>,
+        folds: usize,
+        fold_reqs: Vec<CompleteRequest>,
+    }
+
+    impl DynRun {
+        fn methods(&self) -> Vec<String> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ContextCompacted { method, .. } => Some(method.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn compactions(&self) -> Vec<(String, u32)> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ContextCompacted { method, input_tokens, .. } => Some((method.clone(), *input_tokens)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn noticed(&self, needle: &str) -> bool {
+            self.notices(needle) > 0
+        }
+
+        fn notices(&self, needle: &str) -> usize {
+            self.events.iter().filter(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains(needle))).count()
+        }
+    }
+
+    /// Run with `now` (SlowNow) or `log` (SizedLog) as the only tool.
+    async fn dyn_run(replies: Vec<CompleteResponse>, window: u32, logs: bool, script: FoldScript) -> DynRun {
+        let scripted = Arc::new(Scripted {
             calls: Mutex::new(Vec::new()),
             replies: Mutex::new(pop_front(replies)),
             compact_calls: Mutex::new(Vec::new()),
             compact_ok: false,
-        };
+        });
         let folds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let provider = Watched { inner: &scripted, folds: folds.clone(), fail_folds };
-        let tools = ToolRegistry::new(vec![Box::new(SizedLog { folds: folds.clone(), seen: seen.clone() })]);
+        let folds_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Probe { folds_done: folds_done.clone(), tool_calls: tool_calls.clone(), seen: Arc::new(Mutex::new(Vec::new())) };
+        let fold_reqs = Arc::new(Mutex::new(Vec::new()));
+        let provider = Watched { inner: scripted.clone(), folds: folds.clone(), folds_done, tool_calls, fold_reqs: fold_reqs.clone(), script };
+        let tool: Box<dyn crate::tools::ClientTool> =
+            if logs { Box::new(SizedLog(probe.clone())) } else { Box::new(SlowNow(probe.clone())) };
+        let tools = ToolRegistry::new(vec![tool]);
         let rec = Rec(Mutex::new(Vec::new()));
-        let mut config = cfg("look through the logs", 20);
+        let mut config = cfg("ship the kernel", 20);
         config.context_window = window;
-        let out = run(&provider, &tools, &rec, config).await.unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(20), run(&provider, &tools, &rec, config))
+            .await
+            .expect("the run must not hang on a fold")
+            .unwrap();
         let calls = scripted.calls.lock().unwrap().clone();
         let events = rec.0.lock().unwrap().clone();
-        let seen = seen.lock().unwrap().clone();
-        PrefoldRun { out, calls, events, seen, folds: folds.load(std::sync::atomic::Ordering::SeqCst) }
+        let seen = probe.seen.lock().unwrap().clone();
+        let fold_reqs = fold_reqs.lock().unwrap().clone();
+        DynRun { out, calls, events, seen, folds: folds.load(std::sync::atomic::Ordering::SeqCst), fold_reqs }
     }
 
-    /// Window 100,000 (prefold 42K, trigger 50K, after 35K). 25K of pads
-    /// and two 8K outputs reach ~41K; small outputs then enter the band at
-    /// ~43K, where a prefold starts (nothing is old enough to slim), and
-    /// cross the trigger at ~52K. There, slimming the three oldest outputs
-    /// lands at ~36.5K: above `after`, below the prefold point.
-    fn band_then_trigger(prefold_replies: Vec<CompleteResponse>) -> Vec<CompleteResponse> {
-        let mut r = vec![log_reply("b1", 8_000, 50), log_reply("b2", 8_000, 0), log_reply("s3", 2_000, 0), log_reply("s4", 2_000, 0)];
-        // The prefold runs during turn 4's tool call.
-        r.extend(prefold_replies);
-        r.extend([log_reply("s5", 2_000, 0), log_reply("s6", 2_000, 0), log_reply("s7", 3_000, 0), done_reply()]);
-        r
-    }
+    // Window 10,000: start 4,000, trigger 5,000, target 2,200. Nine pads
+    // bring turn 2 to ~4,600 (no server usage: measured locally).
 
     #[tokio::test]
-    async fn a_good_prefold_beats_slimming_that_only_gets_below_the_prefold_point() {
-        let r = log_run(band_then_trigger(vec![memory_reply("mem", "read the logs")]), 100_000, false).await;
+    async fn a_background_fold_is_spliced_in_as_soon_as_it_is_ready() {
+        let r = dyn_run(vec![now_call("c1", 9), now_call("c2", 0), done_reply()], 10_000, false, FoldScript::ok(MEMORY)).await;
         assert_eq!(r.out.text, "done");
+        assert!(r.noticed("背景整理長期記憶中"), "the user sees it start");
         assert_eq!(r.folds, 1);
-        assert_eq!(r.seen[3], 1, "the prefold ran during turn 4's tool call");
-        assert_eq!(fold_methods(&r.events), ["lived (prefold)"]);
+        assert_eq!(r.seen, [0, 1], "it was answered while turn 2's tool ran: the work did not wait");
+        let compactions = r.compactions();
+        assert_eq!(compactions.len(), 1, "{compactions:?}");
+        assert_eq!(compactions[0].0, "lived (dynamic)");
+        assert!(compactions[0].1 < 5_000, "spliced in before the trigger: {compactions:?}");
+        let last = r.calls.last().unwrap();
+        assert_eq!(compact::previous_memory(&last.input).map(|m| m.contains("kernel ABI is frozen")), Some(true));
+        let mem_at = last.input.iter().position(|i| i["content"].as_str().is_some_and(|t| t.contains(COMPACT_MARK))).unwrap();
+        let pad_at = last.input.iter().position(|i| i["content"].as_str().is_some_and(|t| t.starts_with("pad-c1-7 ")));
+        assert!(pad_at.is_some_and(|p| p < mem_at), "the user's newest folded words are kept verbatim, before the memory");
+        let memory = compact::previous_memory(&last.input).unwrap();
+        assert!(memory.contains("## Original request\nship the kernel"), "{memory}");
+        // The fold request is served from the conversation's cache: same key,
+        // instructions and tools, and it starts with the conversation as sent
+        // in the turn it folded.
+        let (f, w) = (&r.fold_reqs[0], &r.calls[1]);
+        assert_eq!(f.cache_key, w.cache_key);
+        assert_eq!(f.instructions, w.instructions);
+        let names = |q: &CompleteRequest| q.client_tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(f), names(w));
+        let head = f.input.iter().position(|i| i["content"].as_str().is_some_and(|t| t.contains(MEMORY_FOLD_MARK))).unwrap();
+        assert!(head >= 2, "{head}");
+        assert_eq!(&f.input[..head], &w.input[..head], "the folded turns as sent: a cached prefix");
     }
 
     #[tokio::test]
-    async fn without_a_usable_prefold_slimming_below_the_prefold_point_beats_a_blocking_fold() {
-        // The prefold gets nothing usable back: it fails.
-        let r = log_run(band_then_trigger(Vec::new()), 100_000, true).await;
-        assert_eq!(r.out.text, "done");
-        assert_eq!(r.folds as u32, compact::FOLD_ATTEMPTS, "only the failed prefold's attempts; no blocking fold");
-        assert_eq!(fold_methods(&r.events), ["trim-outputs"]);
-    }
-
-    #[tokio::test]
-    async fn a_splice_below_the_prefold_point_is_kept_even_when_a_fresh_fold_would_be_smaller() {
-        // Two pads in the crossing turn: the splice lands at ~3,340, below
-        // the prefold point (4,200) but more than window/20 above where a
-        // fresh fold would (~2,760). Below the prefold point is good enough.
-        let r = prefold_run(
-            vec![
-                now_call("c1", 0, 9),
-                now_call("c2", 4_400, 0),
-                memory_reply("mem", "port the scheduler"),
-                now_call("c3", 4_600, 0),
-                now_call("c4", 5_200, 2),
-                done_reply(),
-            ],
+    async fn the_work_goes_on_while_a_slow_fold_runs_and_one_fold_runs_at_a_time() {
+        // The fold is answered only after three more tool calls: turns 2-4
+        // go on while it runs, each still in the band.
+        let r = dyn_run(
+            vec![now_call("c1", 9), now_call("c2", 0), now_call("c3", 0), now_call("c4", 0), now_call("c5", 0), now_call("c6", 0), done_reply()],
             10_000,
+            false,
+            FoldScript::after_tools(MEMORY, 3),
         )
         .await;
         assert_eq!(r.out.text, "done");
+        assert_eq!(r.folds, 1, "one background fold, not one per turn");
+        assert_eq!(r.methods(), ["lived (dynamic)"]);
+        assert!(r.seen.starts_with(&[0, 0, 0, 0]), "turns went on while it ran: {:?}", r.seen);
+    }
+
+    #[tokio::test]
+    async fn a_background_fold_overtaken_by_a_big_arrival_gives_way_to_a_fresh_fold() {
+        // The fold is slow; meanwhile eight pads arrive and cross the
+        // trigger. Spliced, it would still be over the trigger.
+        let r = dyn_run(
+            vec![now_call("c1", 9), now_call("c2", 8), done_reply()],
+            10_000,
+            false,
+            FoldScript::after_tools(MEMORY, 1),
+        )
+        .await;
+        assert_eq!(r.out.text, "done");
+        let methods = r.methods();
+        assert_eq!(methods.len(), 1, "{methods:?}");
+        assert!(!methods[0].ends_with("(dynamic)"), "{methods:?}");
+        assert!(r.folds >= 2, "the background fold and a fresh one: {}", r.folds);
+    }
+
+    #[tokio::test]
+    async fn a_finished_background_fold_that_would_land_past_the_start_point_is_refused() {
+        // Answered at once (during turn 2's tool call), so turn 3 finds it
+        // finished; the eight pads that arrived meanwhile would leave the
+        // splice over the trigger, while a fresh fold gets much lower.
+        let r = dyn_run(vec![now_call("c1", 9), now_call("c2", 8), done_reply()], 10_000, false, FoldScript::ok(MEMORY)).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.seen, [0, 1], "finished before turn 3 began");
+        let methods = r.methods();
+        assert_eq!(methods.len(), 1, "{methods:?}");
+        assert!(!methods[0].ends_with("(dynamic)"), "{methods:?}");
+        assert!(r.folds >= 2, "the background fold and a fresh one: {}", r.folds);
+    }
+
+    #[tokio::test]
+    async fn no_background_fold_when_it_would_gain_little() {
+        // Two small turns, then one 4.6K output brings turn 4 into the band.
+        // There is something to fold, but a fold must keep that output (it is
+        // the newest turn): it would gain under a tenth of the window, for a
+        // cache miss, so none starts. Turn 4's tool call would have given a
+        // started fold time to reach the model. (By turn 5 the output is no
+        // longer the newest, and a fold is worth it.)
+        let replies = vec![
+            log_reply("s1", 10, 0),
+            log_reply("s2", 10, 0),
+            log_reply("big", 4_600, 0),
+            log_reply("small", 10, 0),
+            done_reply(),
+        ];
+        let r = dyn_run(replies, 10_000, true, FoldScript::ok(MEMORY)).await;
+        assert_eq!(r.out.text, "done");
+        let turn5 = r.events.iter().position(|e| matches!(e, AgentEvent::TurnStarted { turn: 5, .. })).unwrap();
+        assert!(
+            !r.events[..turn5].iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("背景整理長期記憶中"))),
+            "no fold started at turn 4"
+        );
+        assert_eq!(r.folds, 0);
+    }
+
+    #[tokio::test]
+    async fn at_the_trigger_a_running_background_fold_is_waited_for() {
+        // The fold is answered a tool call later; meanwhile one pad crosses
+        // the trigger. The fold has a head start, so it is waited for and
+        // spliced (it lands low enough), not redone.
+        let r = dyn_run(vec![now_call("c1", 9), now_call("c2", 1), done_reply()], 10_000, false, FoldScript::after_tools(MEMORY, 1)).await;
+        assert_eq!(r.out.text, "done");
         assert_eq!(r.folds, 1);
-        assert_eq!(fold_methods(&r.events), ["lived (prefold)"]);
+        assert_eq!(r.methods(), ["lived (background, awaited)"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_background_fold_is_not_restarted_every_turn() {
+        // Every fold fails. In the band for several turns (never reaching
+        // the trigger), only one background fold is tried.
+        let mut replies = vec![now_call("c1", 9)];
+        replies.extend((2..8).map(|n| now_call(&format!("c{n}"), 0)));
+        replies.push(done_reply());
+        let r = dyn_run(replies, 10_000, false, FoldScript::failing()).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.notices("背景整理長期記憶中"), 1, "started once");
+        assert_eq!(r.folds as u32, compact::FOLD_ATTEMPTS, "one fold's attempts, no more");
+        assert_eq!(r.notices("背景整理記憶失敗"), 1);
+        assert!(r.methods().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_finished_refused_background_fold_stands_in_when_the_fresh_fold_fails() {
+        // Finished before turn 3 (step 1 takes it), refused for the eight
+        // pads that arrived; the fresh fold fails, so it stands in.
+        let script = FoldScript { ok_first: 1, ..FoldScript::ok(MEMORY) };
+        let r = dyn_run(vec![now_call("c1", 9), now_call("c2", 8), done_reply()], 10_000, false, script).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.seen, [0, 1], "finished before turn 3 began");
+        assert_eq!(r.methods(), ["lived (stand-in)"]);
+        assert!(r.noticed("改用背景先整理好的記憶"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_background_fold_stands_in_when_the_fresh_fold_fails() {
+        let script = FoldScript { ok_first: 1, ..FoldScript::after_tools(MEMORY, 1) };
+        let r = dyn_run(vec![now_call("c1", 9), now_call("c2", 8), done_reply()], 10_000, false, script).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.methods(), ["lived (stand-in)"], "the refused splice stands in");
+        assert!(r.noticed("改用背景先整理好的記憶"));
+    }
+
+    // Window 100,000: start 40,000, trigger 50,000, target 22,000; slimming
+    // alone is enough in the band when it gets to 31,000.
+
+    #[tokio::test]
+    async fn in_the_band_slimming_old_outputs_replaces_a_fold_when_it_gets_far_enough() {
+        // Pads and two 12K outputs, then small ones, reach ~40K; slimming
+        // the old big ones lands near 17K.
+        let replies = vec![
+            log_reply("b1", 12_000, 10),
+            log_reply("b2", 12_000, 0),
+            log_reply("s3", 2_000, 0),
+            log_reply("s4", 2_000, 0),
+            log_reply("s5", 2_000, 0),
+            log_reply("s6", 2_000, 0),
+            log_reply("s7", 3_000, 0),
+            done_reply(),
+        ];
+        let r = dyn_run(replies, 100_000, true, FoldScript::ok(MEMORY)).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.folds, 0, "no model fold at all");
+        assert_eq!(r.methods(), ["trim-outputs"]);
+        let last = r.calls.last().unwrap();
+        assert!(compact::previous_memory(&last.input).is_none(), "every turn is still there");
+        assert_eq!(last.input.iter().filter(|i| i["type"] == "function_call").count(), 7);
+    }
+
+    #[tokio::test]
+    async fn in_the_band_slimming_that_stops_short_of_halfway_leaves_it_to_a_background_fold() {
+        // 25K of pads and an 8K output (~33K), then four parallel 2K outputs
+        // reach ~41K, in the band. Slimming the old 8K one would land at
+        // ~34K: below the start point, but short of halfway to the target
+        // (31K). Not worth a cache miss on its own: a fold runs instead.
+        let replies = vec![log_reply("b1", 8_000, 50), parallel_logs("p2", 4, 2_000), log_reply("s3", 10, 0), done_reply()];
+        let r = dyn_run(replies, 100_000, true, FoldScript::ok(MEMORY)).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.methods(), ["lived (dynamic)"]);
+    }
+
+    #[tokio::test]
+    async fn at_the_trigger_slimming_below_the_start_point_beats_a_blocking_fold() {
+        // 25K of pads and a 12K output (~37K, under the start point), then
+        // five parallel 3K outputs jump past the trigger. Slimming the old
+        // ones lands at ~38.7K: not far enough to stand for a fold in the
+        // band, but below the start point; with no background fold to wait
+        // for, that beats a blocking fold now.
+        let replies = vec![log_reply("b1", 12_000, 50), parallel_logs("p2", 5, 3_000), done_reply()];
+        let r = dyn_run(replies, 100_000, true, FoldScript::ok(MEMORY)).await;
+        assert_eq!(r.out.text, "done");
+        assert_eq!(r.folds, 0, "no model fold");
+        assert_eq!(r.methods(), ["trim-outputs"]);
     }
 
     #[tokio::test]
     async fn a_compaction_during_backoff_ends_the_backoff() {
-        // Window 100,000. 25K of pads and three outputs (8K, 8K, 12K) jump
-        // from ~41K straight past the trigger (no prefold). Nothing is old
-        // enough to slim, so a model fold runs, and fails: backoff. Next
-        // turn four parallel calls push the big outputs out of the newest
-        // four, and slimming them reaches `after` while the backoff is still
-        // on. That success ends the backoff, so when the history climbs into
-        // the band again a prefold starts.
-        let parallel = |id: &str| {
-            let ids: Vec<String> = (0..4).map(|n| format!("{id}-{n}")).collect();
-            CompleteResponse {
-                function_calls: ids
-                    .iter()
-                    .map(|c| FunctionCall { call_id: c.clone(), name: "log".into(), arguments: "{\"n\":500}".into() })
-                    .collect(),
-                output_items: ids
-                    .iter()
-                    .map(|c| json!({"type":"function_call","call_id": c,"name":"log","arguments":"{\"n\":500}"}))
-                    .collect(),
-                ..CompleteResponse::new(id)
-            }
-        };
+        // 25K of pads and an 8K output (~33K), then a 20K output jumps past
+        // the trigger with nothing old enough to slim: a blocking fold runs
+        // and fails, which sets the backoff. Four parallel calls then push
+        // the big outputs out of the newest four, slimming them lands far
+        // enough while the backoff is on, and that ends it: back in the band,
+        // a background fold starts.
         let replies = vec![
             log_reply("b1", 8_000, 50),
-            log_reply("b2", 8_000, 0),
-            log_reply("b3", 12_000, 0),
-            // turn 4: over the trigger; the fold fails (backoff), then:
-            parallel("p4"),
-            // turn 5: slimming lands under `after`: compacted, backoff over
-            log_reply("s5", 13_000, 0),
-            // turn 6: back in the band: a prefold starts
-            log_reply("s6", 500, 0),
+            log_reply("b2", 20_000, 0),
+            parallel_logs("p3", 4, 500),
+            log_reply("s4", 13_000, 0),
+            log_reply("s5", 500, 0),
             done_reply(),
         ];
-        let r = log_run(replies, 100_000, true).await;
+        let r = dyn_run(replies, 100_000, true, FoldScript::failing()).await;
         assert_eq!(r.out.text, "done");
-        let methods = fold_methods(&r.events);
-        assert_eq!(methods, ["trim-outputs"], "{methods:?}");
-        assert!(
-            r.events.iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("輪後再試"))),
-            "the first fold failed and set the backoff"
-        );
-        assert!(
-            r.folds as u32 > compact::FOLD_ATTEMPTS,
-            "a prefold started after the backoff ended: {} fold requests",
-            r.folds
-        );
+        assert!(r.noticed("輪後再試"), "the first fold failed and set the backoff");
+        assert_eq!(r.methods(), ["trim-outputs"]);
+        assert!(r.folds as u32 > compact::FOLD_ATTEMPTS, "a background fold started after the backoff ended: {}", r.folds);
     }
 
     #[test]
@@ -3637,9 +3727,6 @@ mod tests {
         assert_eq!(used_tokens(10_000, 1_000, 0, 1.0), 11_000);
         // No server count: the whole history, scaled.
         assert_eq!(used_tokens(0, 0, 5_000, 1.5), 7_500);
-        // What arrives before the trigger, in local units.
-        assert_eq!(growth_until(50_000, 44_000, 2.0), 3_000);
-        assert_eq!(growth_until(50_000, 52_000, 1.0), 0);
     }
 
     #[tokio::test]
@@ -3680,6 +3767,7 @@ mod tests {
         let provider = Looper { calls: Mutex::new(Vec::new()) };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = tokio::time::timeout(Duration::from_secs(10), run(&provider, &tools, &rec, cfg("go", 4)))
             .await
             .expect("the loop must be cut off")
@@ -3725,6 +3813,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("go", 4)).await.unwrap();
         assert_eq!(out.text, "done");
         let calls = provider.calls.lock().unwrap().clone();
@@ -3815,6 +3904,7 @@ mod tests {
         let mut config = cfg("ship the kernel", 4);
         config.context_window = 10_000;
         config.compact_keep_recent = 2;
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, config).await.unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(out.compacted, 1);
@@ -3865,6 +3955,7 @@ mod tests {
         c.reasoning_effort = ReasoningEffort::Xhigh;
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, c).await.unwrap();
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls[0].reasoning_effort, ReasoningEffort::Xhigh);
@@ -3895,6 +3986,7 @@ mod tests {
         c.inbox = Some(rx);
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "second");
         assert_eq!(out.turns, 2);
@@ -3943,6 +4035,7 @@ mod tests {
         c.bg_notify = Some(bg_rx);
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "echo died");
         let calls = provider.calls.lock().unwrap();
@@ -3985,6 +4078,7 @@ mod tests {
         ]));
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "ok, they were killed");
         let calls = provider.calls.lock().unwrap();
@@ -4031,6 +4125,7 @@ mod tests {
         ];
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "continuing");
         let calls = provider.calls.lock().unwrap();
@@ -4084,6 +4179,7 @@ mod tests {
         }));
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         run(&provider, &tools, &rec, c).await.unwrap();
         let saved = snaps.lock().unwrap();
         assert!(!saved.is_empty(), "run end must persist a snapshot");
@@ -4118,6 +4214,7 @@ mod tests {
         c.inbox = Some(rx);
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, c).await.unwrap();
         assert_eq!(out.text, "done");
         assert_eq!(out.turns, 1);
@@ -4178,6 +4275,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let out = run(&provider, &tools, &rec, cfg("what time?", 4))
             .await
             .unwrap();
@@ -4247,6 +4345,7 @@ mod tests {
         };
         let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
         let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Arc::new(provider);
         let run_h = tokio::spawn(async move { run(&provider, &tools, &rec, c).await });
         entered_rx.await.expect("complete started");
         cancel.trip();
@@ -4317,6 +4416,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             drop(tx);
         });
+        let provider = Arc::new(provider);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             run(&provider, &tools, &rec, c),
@@ -4383,6 +4483,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             drop(tx);
         });
+        let provider = Arc::new(provider);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             run(&provider, &tools, &rec, c),

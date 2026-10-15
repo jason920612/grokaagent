@@ -194,6 +194,34 @@ pub trait Provider: Send + Sync {
     ) -> impl std::future::Future<Output = Result<CompactResponse>> + Send;
 }
 
+/// A shared provider is a provider, so one can be handed to a background
+/// task (the dynamic context fold) and still used by the run.
+impl<T: Provider> Provider for std::sync::Arc<T> {
+    fn complete(
+        &self,
+        req: CompleteRequest,
+    ) -> impl std::future::Future<Output = Result<CompleteResponse>> + Send {
+        (**self).complete(req)
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        req: CompleteRequest,
+        on_text: &'a (dyn Fn(&str) + Send + Sync),
+        on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
+        on_reasoning: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> impl std::future::Future<Output = Result<CompleteResponse>> + Send + 'a {
+        (**self).complete_stream(req, on_text, on_server, on_reasoning)
+    }
+
+    fn compact(
+        &self,
+        req: CompactRequest,
+    ) -> impl std::future::Future<Output = Result<CompactResponse>> + Send {
+        (**self).compact(req)
+    }
+}
+
 #[derive(Clone)]
 pub struct XaiOauthProvider {
     auth_path: PathBuf,

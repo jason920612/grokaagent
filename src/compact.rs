@@ -39,14 +39,15 @@ pub const TAIL_RATIO: f32 = 0.2;
 pub const FOLD_INPUT_RATIO: f32 = 0.75;
 pub const HARD_RATIO: f32 = 0.9;
 /// Aim for this much of the window right after a fold (instructions, tools,
-/// memory and tail together), so the next fold is not one turn away.
-pub const AFTER_RATIO: f32 = 0.35;
+/// memory and tail together). Low, so a fold buys a long stretch of work:
+/// every fold costs the prompt cache one miss, wherever it lands.
+pub const AFTER_RATIO: f32 = 0.22;
 /// The user's own earlier messages, kept verbatim through folds.
 pub const USER_RATIO: f32 = 0.08;
 const USER_TOKENS_MAX: u32 = 20_000;
-/// Start folding in the background (alongside the working request) here,
-/// so the fold is ready when the trigger is reached.
-pub const PREFOLD_RATIO: f32 = 0.42;
+/// Start folding in a background task here; the work goes on, and the fold
+/// is spliced in as soon as it is ready (the trigger is the backstop).
+pub const PREFOLD_RATIO: f32 = 0.40;
 /// Old tool outputs are slimmed before any model fold; the newest few stay.
 const KEEP_RECENT_OUTPUTS: usize = 4;
 /// A fold needs at least this many old items besides a previous memory.
@@ -125,6 +126,7 @@ pub struct Budget {
     pub memory: u32,
     /// The user's verbatim messages.
     pub user: u32,
+    /// Where a background fold starts ([`PREFOLD_RATIO`]).
     pub prefold: u32,
 }
 
@@ -1215,8 +1217,8 @@ mod tests {
         assert_eq!(context_window("grok-4.7"), 500_000);
         let b = Budget::new(500_000);
         assert_eq!((b.trigger, b.tail, b.fold_input, b.hard), (250_000, 100_000, 375_000, 450_000));
-        // 32K window with 7K of instructions + tools: the tail shrinks so a
-        // fold lands near 35% instead of just under the 50% trigger.
+        // 32K window with 7K of instructions + tools: the tail shrinks toward
+        // the fold target (never below a twentieth of the window).
         let small = Budget::new(32 * 1024).with_fixed(7_000);
         assert!(small.tail <= 32 * 1024 * 35 / 100 - 7_000 - 2_500, "{}", small.tail);
         assert!(small.tail >= 32 * 1024 / 20);
@@ -1678,10 +1680,11 @@ Work toward it.", crate::notice::TASK_MODE)),
     async fn trimming_old_outputs_can_replace_a_model_fold() {
         let p = Scripted { replies: Mutex::new(vec![]), inputs: Mutex::new(vec![]) };
         let notes = |_: String| {};
+        // Six big outputs, then four small ones (the newest stay whole).
         let mut history = vec![user("ship the kernel")];
-        for i in 0..8 {
+        for i in 0..10 {
             history.push(call(&format!("c{i}"), "{}"));
-            history.push(out(&format!("c{i}"), &"y".repeat(40_000)));
+            history.push(out(&format!("c{i}"), &"y".repeat(if i < 6 { 40_000 } else { 400 })));
         }
         let mut c = ctx(&p, &notes, 128_000);
         c.max_tail_items = None;
