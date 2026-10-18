@@ -4,8 +4,28 @@
 //! format arboard looks for. Decode those bytes ourselves.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use image::DynamicImage;
+
+/// One clipboard handle for the whole session. On X11 a copy lives only as
+/// long as some handle does: one dropped right after `set` takes the data
+/// with it unless a clipboard manager grabbed it first.
+static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+
+pub fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Option<T>) -> Option<T> {
+    let mut slot = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = arboard::Clipboard::new().ok();
+    }
+    f(slot.as_mut()?)
+}
+
+/// Drop the session handle on exit, so X11 hands the last copy to a
+/// clipboard manager if one runs.
+pub fn release_clipboard() {
+    CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
 
 pub fn from_png_bytes(bytes: &[u8]) -> Option<DynamicImage> {
     image::load_from_memory(bytes).ok()
@@ -21,17 +41,18 @@ pub fn from_dib_bytes(dib: &[u8]) -> Option<DynamicImage> {
         return None;
     }
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
     let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
-    let palette = if bit_count <= 8 {
-        if colors_used == 0 {
-            1u32 << bit_count
-        } else {
-            colors_used
-        }
+    let palette = if bit_count <= 8 && colors_used == 0 {
+        1u32 << bit_count
     } else {
-        0
+        colors_used
     };
-    let off_bits = 14u32 + header_size + palette.saturating_mul(4);
+    // BI_BITFIELDS after a plain BITMAPINFOHEADER: three color masks follow it.
+    let masks = if header_size == 40 && compression == 3 { 12 } else { 0 };
+    let off_bits = (14 + header_size)
+        .saturating_add(masks)
+        .saturating_add(palette.saturating_mul(4));
     let mut bmp = Vec::with_capacity(14 + dib.len());
     bmp.extend_from_slice(b"BM");
     bmp.extend_from_slice(&(14u32 + dib.len() as u32).to_le_bytes());
@@ -51,28 +72,96 @@ pub fn read_image() -> Option<DynamicImage> {
     arboard_image()
 }
 
+/// Copied image files, including formats the decoders cannot read (the
+/// caller reports those).
 pub fn read_image_files() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        let files = windows_clipboard_files();
+        let files = image_files(windows_clipboard_files());
         if !files.is_empty() {
-            return files
-                .into_iter()
-                .filter(|p| p.is_file() && crate::vision::is_image_ext(p))
-                .collect();
+            return files;
         }
     }
-    arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.get().file_list().ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.is_file() && crate::vision::is_image_ext(p))
+    image_files(with_clipboard(|c| c.get().file_list().ok()).unwrap_or_default())
+}
+
+/// Existing image files of a copied file list. GTK and Qt write text/uri-list
+/// with CRLF line ends, and arboard splits on LF only, so each path may end
+/// in `\r`.
+fn image_files(list: Vec<PathBuf>) -> Vec<PathBuf> {
+    list.into_iter()
+        .map(|p| match p.to_str() {
+            Some(s) => PathBuf::from(s.trim_end_matches(['\r', '\n', '\0'])),
+            None => p,
+        })
+        .filter(|p| {
+            (crate::vision::is_image_ext(p) || crate::vision::is_unsupported_image_ext(p)) && p.is_file()
+        })
         .collect()
 }
 
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn copied_file_lists_lose_their_crlf_and_keep_every_image_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("shot.png");
+        let photo = dir.path().join("photo.webp");
+        let heic = dir.path().join("phone.heic");
+        let notes = dir.path().join("notes.txt");
+        for p in [&shot, &photo, &heic, &notes] {
+            std::fs::write(p, "x").unwrap();
+        }
+        let crlf = |p: &PathBuf| PathBuf::from(format!("{}\r", p.display()));
+        let got = image_files(vec![crlf(&shot), crlf(&photo), heic.clone(), notes, dir.path().join("gone.png")]);
+        assert_eq!(got, vec![shot, photo, heic]);
+    }
+
+    /// 4x1, 32 bpp, BI_BITFIELDS after a 40-byte header: masks, then pixels.
+    fn bitfields_dib() -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&4i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes());
+        for mask in [0x00FF_0000u32, 0x0000_FF00, 0x0000_00FF] {
+            dib.extend_from_slice(&mask.to_le_bytes());
+        }
+        for bgra in [[0, 0, 255, 0], [0, 255, 0, 0], [255, 0, 0, 0], [255, 255, 255, 0]] {
+            dib.extend_from_slice(&bgra);
+        }
+        dib
+    }
+
+    #[test]
+    fn bitfields_dib_pixels_start_after_the_masks() {
+        let img = from_dib_bytes(&bitfields_dib()).expect("decode DIB").to_rgb8();
+        let px: Vec<[u8; 3]> = img.pixels().map(|p| p.0).collect();
+        assert_eq!(px, [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]]);
+    }
+
+    #[test]
+    fn a_color_table_on_a_true_color_dib_is_skipped() {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+        dib[32..36].copy_from_slice(&2u32.to_le_bytes());
+        dib.extend_from_slice(&[9; 8]);
+        dib.extend_from_slice(&[0, 255, 0, 0]);
+        let img = from_dib_bytes(&dib).expect("decode DIB").to_rgb8();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 255, 0]);
+    }
+}
+
 fn arboard_image() -> Option<DynamicImage> {
-    let data = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    let data = with_clipboard(|c| c.get_image().ok())?;
     crate::vision::from_rgba(
         data.width as u32,
         data.height as u32,

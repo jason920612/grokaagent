@@ -1,7 +1,10 @@
 //! Keyboard input. Keys go to the innermost thing that is open: a modal
 //! overlay, the rename field, the settings tab, an agent tab, or the chat.
 
+mod burst;
 mod mouse;
+
+pub(crate) use burst::PasteBurst;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 

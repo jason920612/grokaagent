@@ -850,6 +850,74 @@ impl Rt {
     }
 }
 
+/// What one paste or drop did to the attachments, for a single status line.
+#[derive(Debug, Default)]
+pub(crate) struct Attached {
+    pub added: usize,
+    /// Left out because the composer already held `MAX_USER_IMAGES`.
+    pub over_cap: usize,
+    /// File names in formats the decoders cannot read.
+    pub unsupported: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+impl Attached {
+    /// `None` when there was nothing to attach.
+    pub fn message(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.added > 0 {
+            parts.push(format!("已附上 {} 張圖片", self.added));
+        }
+        if self.over_cap > 0 {
+            parts.push(format!("最多 {} 張圖片，{} 張未附上", crate::vision::MAX_USER_IMAGES, self.over_cap));
+        }
+        if !self.unsupported.is_empty() {
+            parts.push(format!("不支援的圖片格式：{}（可用 PNG、JPEG、GIF、WebP、BMP）", self.unsupported.join("、")));
+        }
+        if let Some(e) = self.errors.first() {
+            parts.push(format!("無法加入圖片: {e}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// What a paste takes from the clipboard.
+#[derive(Debug, PartialEq, Eq)]
+enum ClipPick {
+    Files,
+    Text,
+    /// The bitmap, if there is one: it is read only when picked.
+    Bitmap,
+}
+
+/// Copied image files come first: a file copied in Finder also puts its icon
+/// on the pasteboard as a picture. Then non-blank `text`, which only Ctrl+V
+/// passes (the 貼上圖片 button is for images): spreadsheets and office apps
+/// copy a picture of the cells next to the text.
+fn clip_pick(has_files: bool, text: Option<&str>) -> ClipPick {
+    if has_files {
+        ClipPick::Files
+    } else if text.is_some_and(|t| !t.trim().is_empty()) {
+        ClipPick::Text
+    } else {
+        ClipPick::Bitmap
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn copied_files_beat_text_and_text_beats_a_bitmap() {
+        assert_eq!(clip_pick(true, Some("/Users/me/design.png")), ClipPick::Files, "not the Finder icon");
+        assert_eq!(clip_pick(true, None), ClipPick::Files);
+        assert_eq!(clip_pick(false, Some("1\t2\n3\t4")), ClipPick::Text, "not a picture of the cells");
+        assert_eq!(clip_pick(false, Some(" \n")), ClipPick::Bitmap, "blank text falls through");
+        assert_eq!(clip_pick(false, None), ClipPick::Bitmap, "the button reads no text");
+    }
+}
+
 pub(crate) struct App {
     pub opts: TuiOptions,
     pub knobs: Arc<Mutex<SessionKnobs>>,
@@ -1051,6 +1119,7 @@ impl App {
         let workspace = folderpick::existing_dir(&workspace);
         self.launch_workspace = workspace.clone();
         if self.cur().is_blank() {
+            let old = self.workspace();
             let Self { store, sessions, current, .. } = self;
             let s = sessions.get_mut(current.as_str()).expect("current session");
             s.meta.workspace = workspace.clone();
@@ -1058,7 +1127,12 @@ impl App {
             if let Some(st) = store.as_ref() {
                 let _ = st.save_meta(&s.meta);
             }
-            self.flash(format!("工作目錄  {}", folderpick::display_path(&workspace)));
+            let lost = self.carry_pending(&old, &workspace);
+            let mut msg = format!("工作目錄  {}", folderpick::display_path(&workspace));
+            if lost > 0 {
+                msg.push_str(&format!(" · {lost} 張附件無法搬移，已移除"));
+            }
+            self.flash(msg);
             return;
         }
         let cur = self.current.clone();
@@ -1075,6 +1149,25 @@ impl App {
         self.current = id;
         self.after_session_change();
         self.flash(format!("工作目錄  {}", folderpick::display_path(&workspace)));
+    }
+
+    /// Pending attachments are inbox files relative to the workspace. When a
+    /// blank chat moves to another folder they move along, or they would
+    /// point into the new folder and miss. Returns how many could not move.
+    fn carry_pending(&mut self, from: &std::path::Path, to: &std::path::Path) -> usize {
+        if from == to || self.cur().pending.is_empty() {
+            return 0;
+        }
+        let _ = crate::vision::groka_dir(to, "inbox");
+        let pending = std::mem::take(&mut self.cur_mut().pending);
+        let total = pending.len();
+        let kept: Vec<String> = pending
+            .into_iter()
+            .filter(|rel| move_file(&from.join(rel), &to.join(rel)).is_ok())
+            .collect();
+        let lost = total - kept.len();
+        self.cur_mut().pending = kept;
+        lost
     }
 
     pub fn delete_session(&mut self, id: &str) {
@@ -1333,98 +1426,112 @@ impl App {
 
     // —— Attachments & clipboard ——
 
-    pub fn attach_pending(&mut self, rel: String) -> bool {
-        let s = self.cur_mut();
-        if s.pending.len() >= crate::vision::MAX_USER_IMAGES {
-            let msg = format!("最多 {} 張圖片", crate::vision::MAX_USER_IMAGES);
-            self.flash(msg);
+    /// Free attachment slots in the composer.
+    fn room(&self) -> usize {
+        crate::vision::MAX_USER_IMAGES.saturating_sub(self.cur().pending.len())
+    }
+
+    fn attach(&mut self, rel: String, got: &mut Attached) {
+        self.cur_mut().pending.push(rel);
+        got.added += 1;
+    }
+
+    /// Copy image files into the inbox. Slots are checked before decoding,
+    /// so nothing past the cap is read or saved.
+    fn ingest_paths(&mut self, paths: &[PathBuf], got: &mut Attached) {
+        let ws = self.workspace();
+        for p in paths {
+            if !crate::vision::is_image_ext(p) {
+                let name = p.file_name().unwrap_or(p.as_os_str());
+                got.unsupported.push(name.to_string_lossy().into_owned());
+            } else if self.room() == 0 {
+                got.over_cap += 1;
+            } else {
+                match crate::vision::ingest_image_file(&ws, p) {
+                    Ok(rel) => self.attach(rel, got),
+                    Err(e) => got.errors.push(e.to_string()),
+                }
+            }
+        }
+    }
+
+    fn ingest_clipboard_bitmap(&mut self, got: &mut Attached) {
+        let Some(img) = crate::clipimg::read_image() else {
+            return;
+        };
+        if self.room() == 0 {
+            got.over_cap += 1;
+            return;
+        }
+        match crate::vision::save_user_image(&self.workspace(), &img) {
+            Ok(rel) => self.attach(rel, got),
+            Err(e) => got.errors.push(e.to_string()),
+        }
+    }
+
+    /// Flash what happened. `false` = nothing did.
+    fn report(&mut self, got: &Attached) -> bool {
+        let Some(msg) = got.message() else {
             return false;
-        }
-        if !s.pending.contains(&rel) {
-            s.pending.push(rel);
-        }
+        };
+        self.flash(msg);
         true
     }
 
-    fn ingest_paths(&mut self, paths: &[PathBuf]) -> usize {
-        let ws = self.workspace();
-        let mut n = 0;
-        for p in paths {
-            match crate::vision::ingest_image_file(&ws, p) {
-                Ok(rel) => {
-                    if self.attach_pending(rel) {
-                        n += 1;
-                    }
-                }
-                Err(e) => self.flash(format!("無法加入圖片: {e}")),
-            }
-        }
-        n
-    }
-
-    fn ingest_clipboard_images(&mut self) -> bool {
-        if let Some(img) = crate::clipimg::read_image() {
-            return match crate::vision::save_user_image(&self.workspace(), &img) {
-                Ok(rel) => {
-                    let ok = self.attach_pending(rel);
-                    if ok {
-                        self.flash("已貼上圖片");
-                    }
-                    ok
-                }
-                Err(e) => {
-                    self.flash(format!("無法貼上圖片: {e}"));
-                    false
-                }
-            };
-        }
+    /// Paste what `clip_pick` chooses; `text` is the clipboard text when the
+    /// paste may take text. `false` = nothing to paste.
+    fn paste_clip(&mut self, text: Option<String>) -> bool {
         let files = crate::clipimg::read_image_files();
-        if files.is_empty() {
-            return false;
+        let mut got = Attached::default();
+        match clip_pick(!files.is_empty(), text.as_deref()) {
+            ClipPick::Files => self.ingest_paths(&files, &mut got),
+            ClipPick::Text => {
+                self.paste_text(text.as_deref().unwrap_or_default());
+                return true;
+            }
+            ClipPick::Bitmap => self.ingest_clipboard_bitmap(&mut got),
         }
-        let n = self.ingest_paths(&files);
-        if n > 0 {
-            self.flash(format!("已附上 {n} 張圖片"));
-        }
-        n > 0
+        self.report(&got)
     }
 
-    /// "貼上圖片" button: clipboard image or copied image files.
+    /// "貼上圖片" button: copied image files, else the clipboard bitmap.
     pub fn paste_image(&mut self) {
-        if !self.ingest_clipboard_images() {
+        if !self.paste_clip(None) {
             self.flash("剪貼簿沒有圖片 — 先複製截圖或圖片檔，再點「貼上圖片」");
         }
     }
 
-    /// Text pasted into the composer; dropped image paths become attachments.
+    /// Text pasted into the composer. Dropped image files become attachments
+    /// and their paths are not inserted, unless every one is in a format the
+    /// decoders cannot read: the notice says so, and a path to a favicon or a
+    /// TIFF may be meant as text.
     pub fn paste_text(&mut self, s: &str) {
         let dropped = crate::vision::parse_image_drop(s);
-        if !dropped.is_empty() {
-            let n = self.ingest_paths(&dropped);
-            if n > 0 {
-                self.flash(format!("已附上 {n} 張圖片"));
-                return;
-            }
-        }
-        self.cur_mut().draft.insert_str(s);
-    }
-
-    /// Bracketed paste. An empty payload (Ctrl+V of a bitmap) reads the clipboard.
-    pub fn paste_from_terminal(&mut self, s: &str) {
-        if s.trim().is_empty() && crate::vision::parse_image_drop(s).is_empty() {
-            self.paste_clipboard();
-        } else {
-            self.paste_text(s);
-        }
-    }
-
-    pub fn paste_clipboard(&mut self) {
-        if self.ingest_clipboard_images() {
+        if dropped.is_empty() {
+            self.cur_mut().draft.insert_str(s);
             return;
         }
-        if let Some(s) = clipboard_get() {
-            self.paste_text(&s);
+        let mut got = Attached::default();
+        self.ingest_paths(&dropped, &mut got);
+        self.report(&got);
+        if got.added + got.over_cap == 0 && got.errors.is_empty() {
+            self.cur_mut().draft.insert_str(s);
         }
+    }
+
+    /// Bracketed paste. A blank payload (Ctrl+V of a bitmap) reads the clipboard.
+    pub fn paste_from_terminal(&mut self, s: &str) {
+        if !s.trim().is_empty() {
+            self.paste_text(s);
+        } else if !self.paste_clipboard() {
+            self.cur_mut().draft.insert_str(s);
+        }
+    }
+
+    /// Ctrl+V: copied image files, else text, else a bitmap. `false` =
+    /// nothing to paste.
+    pub fn paste_clipboard(&mut self) -> bool {
+        self.paste_clip(clipboard_get())
     }
 
     /// Ctrl+C: copy the selection. `false` = nothing selected.
@@ -1774,6 +1881,18 @@ pub(crate) fn boot_session(store: Option<&SessionStore>, workspace: PathBuf) -> 
     };
     let task = TaskHub::new(meta.id.clone());
     (Session::new(meta, intro_rows(), task), true)
+}
+
+/// Rename, or copy and delete across file systems.
+fn move_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::rename(src, dst).is_err() {
+        std::fs::copy(src, dst)?;
+        let _ = std::fs::remove_file(src);
+    }
+    Ok(())
 }
 
 /// Emit a session title event (the runtime also uses this for LLM titles).

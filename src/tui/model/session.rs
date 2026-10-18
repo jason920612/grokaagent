@@ -328,7 +328,8 @@ pub(crate) struct Session {
     pub queue: VecDeque<Queued>,
     /// The composer is editing `queue[i]`; auto-send waits for commit/cancel.
     pub queue_edit: Option<usize>,
-    pub stash: Option<Edit>,
+    /// The composer's own draft and attachments while it edits a queued item.
+    pub stash: Option<(Edit, Vec<String>)>,
     pub inbox: Option<mpsc::UnboundedSender<UserTurn>>,
     pub cancel: Option<CancelFlag>,
     pub ask_hub: Option<AskUserHub>,
@@ -717,43 +718,57 @@ impl Session {
             }
         }
         if self.stash.is_none() {
-            self.stash = Some(std::mem::take(&mut self.draft));
+            self.stash = Some((std::mem::take(&mut self.draft), std::mem::take(&mut self.pending)));
         }
         self.draft = Edit::at_end(self.queue[idx].text.clone());
+        self.pending = self.queue[idx].images.clone();
         self.queue_edit = Some(idx);
     }
 
-    /// Restore the queued text and the previous draft.
+    /// Restore the queued item and the previous draft and attachments.
     pub fn cancel_queue_edit(&mut self) {
         if self.queue_edit.take().is_some() {
-            self.draft = self.stash.take().unwrap_or_default();
+            self.restore_stash();
         }
     }
 
-    /// Save the composer into the queued item; empty text drops it.
-    /// Returns `true` if the item was removed.
+    fn restore_stash(&mut self) {
+        let (draft, pending) = self.stash.take().unwrap_or_default();
+        self.draft = draft;
+        self.pending = pending;
+    }
+
+    /// Save the composer (text and attachments) into the queued item; an
+    /// empty composer drops it. Returns `true` if the item was removed.
     pub fn commit_queue_edit(&mut self) -> bool {
         let Some(i) = self.queue_edit.take() else {
             return false;
         };
         let text = self.draft.text.trim().to_string();
+        let images = std::mem::take(&mut self.pending);
         let mut removed = false;
         if i < self.queue.len() {
-            if text.is_empty() && self.queue[i].images.is_empty() {
+            if text.is_empty() && images.is_empty() {
                 self.queue.remove(i);
                 removed = true;
             } else {
                 self.queue[i].text = text;
+                self.queue[i].images = images;
             }
         }
-        self.draft = self.stash.take().unwrap_or_default();
+        self.restore_stash();
         removed
     }
 
     /// Take the composer contents (text + attachments) as a turn.
     pub fn take_turn(&mut self) -> Option<UserTurn> {
         let text = self.draft.text.trim().to_string();
-        let images: Vec<PathBuf> = self.pending.drain(..).map(PathBuf::from).collect();
+        // While a queued item is edited, the attachments shown are its own.
+        let images: Vec<PathBuf> = if self.queue_edit.is_some() {
+            Vec::new()
+        } else {
+            self.pending.drain(..).map(PathBuf::from).collect()
+        };
         if text.is_empty() && images.is_empty() {
             return None;
         }
@@ -795,6 +810,44 @@ impl Session {
         if s.starts_with("工作") || s.starts_with("第") || s.starts_with("中斷") {
             self.chat.status = format!("結束 ({turns} 輪)");
         }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut meta = SessionMeta::new(PathBuf::from("."));
+        meta.id = "s".into();
+        Session::new(meta, Vec::new(), TaskHub::new("s"))
+    }
+
+    #[test]
+    fn editing_a_queued_item_edits_its_images_too() {
+        let mut s = session();
+        s.queue.push_back(Queued { text: "fix this".into(), images: vec!["a.jpg".into()] });
+        s.draft = Edit::at_end("next");
+        s.pending = vec!["next.jpg".into()];
+        s.begin_queue_edit(0);
+        assert_eq!(s.pending, ["a.jpg"], "the item's own images are shown");
+        s.pending.push("b.jpg".into());
+        assert!(s.take_turn().is_some_and(|t| t.images.is_empty()), "a send meanwhile takes none of them");
+        assert!(!s.commit_queue_edit());
+        assert_eq!(s.queue[0].images, ["a.jpg", "b.jpg"]);
+        assert_eq!(s.pending, ["next.jpg"], "the next message keeps its own");
+
+        s.begin_queue_edit(0);
+        s.pending.clear();
+        s.cancel_queue_edit();
+        assert_eq!(s.queue[0].images, ["a.jpg", "b.jpg"], "cancel restores the item");
+        assert_eq!(s.pending, ["next.jpg"]);
+
+        s.begin_queue_edit(0);
+        s.draft.clear();
+        s.pending.clear();
+        assert!(s.commit_queue_edit(), "no text and no images drops the item");
+        assert!(s.queue.is_empty());
     }
 }
 
