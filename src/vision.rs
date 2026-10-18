@@ -24,7 +24,7 @@ pub fn below_vision_min(width: u32, height: u32) -> bool {
 
 pub fn enlarge_yourself_note(width: u32, height: u32) -> String {
     format!(
-        "This image is {width}x{height} ({} pixels). xAI vision rejects images below {MIN_VISION_PIXELS} pixels, so pixels were not attached. Enlarge or regenerate the file in the workspace (nearest-neighbor scale is fine), then read_image again. Do not ask the user to upscale it.",
+        "This image is {width}x{height} ({} pixels). Images below {MIN_VISION_PIXELS} pixels are not attached (xAI vision rejects them). Enlarge or regenerate the file in the workspace (nearest-neighbor scale is fine), then read_image again. Do not ask the user to upscale it.",
         width.saturating_mul(height)
     )
 }

@@ -2433,7 +2433,7 @@ fn image_region(args: &Value, width: u32, height: u32) -> Result<Option<(u32, u3
     let (w, h) = (w.min(width - x), h.min(height - y));
     if crate::vision::below_vision_min(w, h) {
         return Err(Error::Tool(format!(
-            "region {w}x{h} is under the {} pixels xAI vision accepts; pick a larger region",
+            "region {w}x{h} is under the {} pixel minimum for attached images; pick a larger region",
             crate::vision::MIN_VISION_PIXELS
         )));
     }
@@ -2444,7 +2444,7 @@ impl ClientTool for ReadImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_image".into(),
-            description: "Load an image (PNG, JPEG, GIF, WebP or BMP) from the workspace and attach the pixels so you can see it on the next turn. It is sent with the long edge at most 1280 px; sent_width/sent_height/scale in the result say what you got. Pass region to crop in original pixels before that downscale, e.g. to read part of a tall full-page screenshot. xAI rejects images under 512 total pixels (for example 16x16); those are not attached — enlarge or regenerate the file, then call again.".into(),
+            description: "Load an image (PNG, JPEG, GIF, WebP or BMP) from the workspace and attach the pixels so you can see it on the next turn. It is sent with the long edge at most 1280 px; sent_width/sent_height/scale in the result say what you got. Pass region to crop in original pixels before that downscale, e.g. to read part of a tall full-page screenshot. Images under 512 total pixels (for example 16x16) are not attached (xAI rejects them) — enlarge or regenerate the file, then call again.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
