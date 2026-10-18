@@ -10,7 +10,12 @@ use crate::tools::ToolSpec;
 
 const DEFAULT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const DEFAULT_MODEL: &str = "grok-4.6";
-const GROK_CLIENT_VERSION_DEFAULT: &str = "0.2.103";
+const GROK_CLIENT_VERSION_DEFAULT: &str = "1.0.62";
+/// Where the current Grok CLI version is looked up after an HTTP 426.
+const GROK_CLI_LATEST_URL: &str = "https://registry.npmjs.org/@xai-official%2Fgrok/latest";
+
+/// The Grok CLI version learned after a 426, used over the built-in default.
+static LIVE_CLIENT_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// How hard grok-4.6 thinks. Cannot be turned off; default is high.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +300,14 @@ impl XaiOauthProvider {
     }
 
     async fn grok_catalog_get(&self, url: &str) -> Result<(u16, String)> {
+        let first = self.grok_catalog_get_once(url).await?;
+        if first.0 == 426 && self.refresh_client_version().await {
+            return self.grok_catalog_get_once(url).await;
+        }
+        Ok(first)
+    }
+
+    async fn grok_catalog_get_once(&self, url: &str) -> Result<(u16, String)> {
         let token = auth::valid_access_token(&self.auth_path).await?;
         let resp = self
             .client
@@ -373,14 +386,50 @@ impl XaiOauthProvider {
         model: &str,
     ) -> Result<(u16, String)> {
         let token = auth::valid_access_token(&self.auth_path).await?;
-        let resp = self
-            .grok_request(path, cache_key, model, &token, "application/json")
-            .json(payload)
+        let mut retried = false;
+        loop {
+            let resp = self
+                .grok_request(path, cache_key, model, &token, "application/json")
+                .json(payload)
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            if status == 426 && !retried && self.refresh_client_version().await {
+                retried = true;
+                continue;
+            }
+            return Ok((status, text));
+        }
+    }
+
+    /// After an HTTP 426: look up the current Grok CLI version and use it
+    /// from now on. True when there is a different version to retry with.
+    /// A version set in GROKA_GROK_CLIENT_VERSION is left alone.
+    async fn refresh_client_version(&self) -> bool {
+        if std::env::var("GROKA_GROK_CLIENT_VERSION").is_ok() {
+            return false;
+        }
+        let Ok(resp) = self
+            .client
+            .get(GROK_CLI_LATEST_URL)
+            .timeout(Duration::from_secs(15))
             .send()
-            .await?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await?;
-        Ok((status, text))
+            .await
+        else {
+            return false;
+        };
+        let Ok(body) = resp.json::<Value>().await else {
+            return false;
+        };
+        let Some(latest) = body.get("version").and_then(Value::as_str).filter(|v| valid_version(v)) else {
+            return false;
+        };
+        if latest == grok_client_version() {
+            return false;
+        }
+        *LIVE_CLIENT_VERSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(latest.to_string());
+        true
     }
 
     async fn grok_post_sse(
@@ -393,18 +442,26 @@ impl XaiOauthProvider {
         on_reasoning: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<CompleteResponse> {
         let token = auth::valid_access_token(&self.auth_path).await?;
-        let resp = self
-            .grok_request(
-                "/responses",
-                cache_key,
-                model,
-                &token,
-                "text/event-stream",
-            )
-            .timeout(Duration::from_secs(600))
-            .json(payload)
-            .send()
-            .await?;
+        let mut retried = false;
+        let resp = loop {
+            let resp = self
+                .grok_request(
+                    "/responses",
+                    cache_key,
+                    model,
+                    &token,
+                    "text/event-stream",
+                )
+                .timeout(Duration::from_secs(600))
+                .json(payload)
+                .send()
+                .await?;
+            if resp.status().as_u16() == 426 && !retried && self.refresh_client_version().await {
+                retried = true;
+                continue;
+            }
+            break resp;
+        };
         let status = resp.status().as_u16();
         let ctype = resp
             .headers()
@@ -448,8 +505,23 @@ impl XaiOauthProvider {
     }
 }
 
+/// GROKA_GROK_CLIENT_VERSION, else the version learned after a 426, else
+/// the built-in default.
 fn grok_client_version() -> String {
-    std::env::var("GROKA_GROK_CLIENT_VERSION").unwrap_or_else(|_| GROK_CLIENT_VERSION_DEFAULT.into())
+    if let Ok(v) = std::env::var("GROKA_GROK_CLIENT_VERSION") {
+        return v;
+    }
+    LIVE_CLIENT_VERSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| GROK_CLIENT_VERSION_DEFAULT.into())
+}
+
+/// A plain release version such as `1.0.62`, safe to send as a header.
+fn valid_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Grok Build defaults `store: false` for ZDR. Chat turns also use `store:
@@ -1132,7 +1204,10 @@ fn entitlement_error(status: u16, body: &str) -> Error {
         ))
     } else if status == 426 {
         Error::Provider(
-            "xAI CLI proxy rejected the client version (HTTP 426). Set GROKA_GROK_CLIENT_VERSION to a newer Grok CLI version.".into(),
+            format!(
+                "xAI CLI proxy rejected the client version {} (HTTP 426). Set GROKA_GROK_CLIENT_VERSION to a newer Grok CLI version (`npm view @xai-official/grok version`).",
+                grok_client_version()
+            ),
         )
     } else {
         let snippet: String = body.chars().take(240).collect();
@@ -1233,6 +1308,16 @@ impl Provider for XaiOauthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_release_versions_are_taken() {
+        assert!(valid_version("1.0.62"));
+        assert!(valid_version(GROK_CLIENT_VERSION_DEFAULT));
+        assert!(!valid_version("1.0.63-alpha.1"));
+        assert!(!valid_version("1.0"));
+        assert!(!valid_version("1.0.x"));
+        assert!(!valid_version("1.0.62\r\nx: y"));
+    }
 
     #[test]
     fn parses_message_and_function_call() {
