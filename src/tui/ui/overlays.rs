@@ -10,7 +10,7 @@ use ratatui::Frame;
 use super::chat::{blit, wrap};
 use super::{centered, chip, draw_edit, line, panel};
 use crate::folderpick;
-use crate::tui::app::{App, Hit, ImageKey, TaskUi};
+use crate::tui::app::{App, Hit, TaskUi};
 use crate::tui::edit::{caret_row_col, wrap_lines};
 use crate::tui::theme::*;
 
@@ -259,7 +259,8 @@ fn image(f: &mut Frame, app: &mut App, area: Rect) {
     if inner.area() == 0 {
         return;
     }
-    let key = ImageKey::of(app.workspace().join(&rel));
+    let path = app.workspace().join(&rel);
+    let key = app.images.key(path);
     let (w, h) = app.images.cells(&key, inner.width, inner.height, false);
     if app.images.defer(&key, w, h) {
         line(f, inner, "…", Style::default().fg(DIM));

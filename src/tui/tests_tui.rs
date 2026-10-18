@@ -133,7 +133,7 @@ fn a_kitty_picture_is_placed_again_after_an_overlay_closes() {
 }
 
 #[test]
-fn a_screenshot_fits_a_short_chat() {
+fn a_thumbnail_fits_a_short_chat() {
     let mut fx = fixture(Some(ProtocolType::Sixel));
     let app = &mut fx.app;
     save(app, "shot.png", 1280, 720, [0, 120, 0]);
@@ -144,6 +144,33 @@ fn a_screenshot_fits_a_short_chat() {
     assert!(inner.height < crate::preview::MAX_ROWS, "the test needs a chat shorter than a thumbnail");
     assert_eq!(app.images.blits.len(), 1, "the thumbnail shrinks to fit instead of never being painted");
     assert!(app.images.blits[0].height < inner.height);
+}
+
+#[test]
+fn a_picture_followed_by_a_reply_scrolls_into_view() {
+    let mut fx = fixture(Some(ProtocolType::Sixel));
+    let app = &mut fx.app;
+    save(app, "shot.png", 1280, 720, [0, 120, 0]);
+    app.cur_mut().chat.push(Row::Picture { path: "shot.png".into(), label: "screenshot".into() });
+    for i in 0..6 {
+        app.cur_mut().chat.push(Row::meta(format!("reply {i}")));
+    }
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    draw(&mut term, app);
+    assert!(app.ui.chat_inner.height < crate::preview::MAX_ROWS, "the test needs a chat shorter than a thumbnail");
+    assert!(app.images.blits.is_empty(), "the reply pushed it up");
+    // Scrolled up, "▼ 最新" takes the chat's last row.
+    let mut shown_at = Vec::new();
+    for off in 1..=app.ui.chat_max_off {
+        let view = app.cur_mut().view_mut();
+        view.stick_bottom = false;
+        view.scroll = off;
+        draw(&mut term, app);
+        if !app.images.blits.is_empty() {
+            shown_at.push(off);
+        }
+    }
+    assert!(!shown_at.is_empty(), "some scroll position shows the whole picture clear of the label");
 }
 
 #[test]
@@ -202,7 +229,9 @@ fn ctrl_c_in_the_viewer_copies_the_image_and_never_quits() {
     app.cur_mut().draft = crate::tui::edit::Edit { text: "draft".into(), caret: 5, anchor: Some(0) };
     app.open_image("a.png".into());
     assert!(!ctrl_c(app));
-    assert_ne!(app.cur().chat.status, "已複製", "the draft selection is not what the viewer copies");
+    // Copying the draft would say 已複製 or 無法複製到剪貼簿.
+    let status = app.cur().chat.status.clone();
+    assert!(matches!(status.as_str(), "已複製圖片" | "已複製路徑" | "無法複製圖片"), "the viewer copies its image: {status}");
     // A transcript trim resets the chat selection while the viewer is open.
     app.cur_mut().draft.anchor = None;
     app.cur_mut().view_mut().sel = ChatSel::None;

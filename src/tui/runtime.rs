@@ -322,9 +322,15 @@ impl Painter {
     fn full(&mut self, terminal: &mut Term, app: &mut App, freeze: bool) -> Result<()> {
         let before = terminal.get_frame().area();
         terminal.autoresize().map_err(Error::Io)?;
-        if terminal.get_frame().area() != before {
+        let grid = terminal.get_frame().area() != before;
+        // One ioctl per paint: a font zoom may change only the pixel size.
+        let cell = if grid || app.images.uses_graphics() { crate::preview::winsize_cell() } else { None };
+        if grid || app.images.font_zoomed(cell) {
+            if !grid {
+                terminal.clear().map_err(Error::Io)?;
+            }
             // ratatui cleared the screen, Sixel / iTerm2 pictures included.
-            app.images.resized(crate::preview::winsize_cell());
+            app.images.resized(cell);
         }
         let caret = {
             let mut frame = terminal.get_frame();

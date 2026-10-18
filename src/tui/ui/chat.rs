@@ -525,9 +525,10 @@ fn image_block(
         caption_rows = wrap(line.clone(), cols).len() as u16;
         out.push(Item::new(line, hit));
     }
-    // Graphics are painted only when they fit, so never be taller than the chat.
-    let max_rows = crate::preview::MAX_ROWS.min(view_h.saturating_sub(caption_rows)).max(1);
-    let key = ImageKey::of(workspace.join(rel));
+    // Graphics are painted only when wholly on screen and clear of the
+    // jump-to-latest label on the chat's last row: picture and caption fit above it.
+    let max_rows = crate::preview::MAX_ROWS.min(view_h.saturating_sub(caption_rows + 1)).max(1);
+    let key = images.key(workspace.join(rel));
     let (w, h) = images.cells(&key, cols.saturating_sub(crate::preview::INDENT), max_rows, true);
     out.push(Item {
         graphic: Some((key, w.max(1), h.max(1))),
@@ -670,6 +671,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let rows = &s.view_transcript().rows;
+    images.sync_rows(rows.len());
     let mut paints = Vec::new();
     for item in items(rows, &view, child, &label, images, &workspace, &mut ui.image_hits, inner.width, inner.height) {
         if let Some((key, width, height)) = item.graphic {

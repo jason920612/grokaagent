@@ -480,6 +480,9 @@ const HALFBLOCK_BUDGET: usize = 16 << 20;
 /// No new viewer decode this soon after a resize: dragging a window edge
 /// would otherwise encode the picture once per intermediate size.
 const RESIZE_SETTLE: Duration = Duration::from_millis(200);
+/// How long one stat stands for a file: every image row needs its key on
+/// every frame, and frames come every 80 ms while the agent works.
+const STAT_TTL: Duration = Duration::from_secs(1);
 
 type PreviewKey = (ImageKey, u16, u16);
 
@@ -487,6 +490,9 @@ type PreviewKey = (ImageKey, u16, u16);
 /// file version and size in cells.
 pub(crate) struct Images {
     pub picker: Option<Picker>,
+    /// Recent stats by path, and the transcript length they were taken at.
+    keys: HashMap<PathBuf, (Instant, ImageKey)>,
+    keys_rows: usize,
     /// Header-only sizes; `None` = not a readable image.
     dims: HashMap<ImageKey, Option<(u32, u32)>>,
     halfblocks: Lru<PreviewKey, Vec<ratatui::text::Line<'static>>>,
@@ -506,6 +512,8 @@ impl Images {
     pub fn new(picker: Option<Picker>) -> Self {
         Self {
             picker,
+            keys: HashMap::new(),
+            keys_rows: 0,
             dims: HashMap::new(),
             halfblocks: Lru::new(HALFBLOCK_BUDGET),
             graphics: Lru::new(GRAPHICS_BUDGET),
@@ -521,6 +529,30 @@ impl Images {
 
     pub fn uses_graphics(&self) -> bool {
         self.picker.as_ref().is_some_and(crate::preview::uses_graphics)
+    }
+
+    /// The file at `path` as it is now, stat()ed at most once per `STAT_TTL`.
+    pub fn key(&mut self, path: PathBuf) -> ImageKey {
+        if let Some((at, key)) = self.keys.get(&path) {
+            if at.elapsed() < STAT_TTL {
+                return key.clone();
+            }
+        }
+        if self.keys.len() >= 4096 {
+            self.keys.clear();
+        }
+        let key = ImageKey::of(path.clone());
+        self.keys.insert(path, (Instant::now(), key.clone()));
+        key
+    }
+
+    /// Stat again once the transcript changes length: a new row may show a
+    /// file rewritten under the same name since the last stat.
+    pub fn sync_rows(&mut self, rows: usize) {
+        if rows != self.keys_rows {
+            self.keys_rows = rows;
+            self.keys.clear();
+        }
     }
 
     fn dims(&mut self, key: &ImageKey) -> Option<(u32, u32)> {
@@ -629,9 +661,18 @@ impl Images {
         }
     }
 
+    /// The tty reports a new cell size on the same grid: a font zoom in a
+    /// terminal that resizes its window to keep the columns and rows (WezTerm,
+    /// iTerm2). ratatui erased nothing, so pictures drawn in pixels must be
+    /// cleared and drawn again at the new size.
+    pub fn font_zoomed(&self, cell: Option<FontSize>) -> bool {
+        self.uses_graphics() && cell.is_some_and(|c| Some(c) != self.cell_px)
+    }
+
     /// A session switch repaints everything. Decoded previews stay: they are
     /// keyed by absolute path and file version.
     pub fn clear(&mut self) {
+        self.keys.clear();
         self.blits.clear();
         self.last_blits.clear();
         self.placements.clear();
@@ -739,6 +780,42 @@ mod images_tests {
         assert!(images.redraw_due());
         assert!(!images.redraw_due(), "one repaint");
         assert!(!images.defer(&key, 6, 3));
+    }
+
+    #[test]
+    fn a_stat_serves_frames_until_a_new_row_or_it_ages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plot.png");
+        save(&path, 10, 10, [255, 0, 0]);
+        let mut images = Images::new(None);
+        images.sync_rows(3);
+        let first = images.key(path.clone());
+        save(&path, 20, 10, [0, 0, 255]);
+        images.sync_rows(3);
+        assert_eq!(images.key(path.clone()), first, "the frames that follow reuse the stat");
+        // The chart was regenerated and read again: a new row.
+        images.sync_rows(4);
+        let second = images.key(path.clone());
+        assert_ne!(second, first);
+        assert_eq!(second, ImageKey::of(path.clone()));
+        save(&path, 30, 10, [0, 255, 0]);
+        images.keys.get_mut(&path).unwrap().0 -= STAT_TTL;
+        assert_ne!(images.key(path), second, "an old stat is taken again");
+    }
+
+    #[test]
+    fn a_font_zoom_on_the_same_grid_is_noticed() {
+        let mut images = Images::new(Some(picker(ProtocolType::Iterm2, (10, 20))));
+        images.cell_px = Some((10, 20));
+        assert!(!images.font_zoomed(Some((10, 20))), "a plain resize event");
+        assert!(!images.font_zoomed(None), "no pixel size reported");
+        assert!(images.font_zoomed(Some((8, 16))));
+        images.resized(Some((8, 16)));
+        assert_eq!(images.picker.as_ref().unwrap().font_size(), (8, 16));
+        assert!(!images.font_zoomed(Some((8, 16))), "once");
+        let mut plain = Images::new(Some(picker(ProtocolType::Halfblocks, (10, 20))));
+        plain.cell_px = Some((10, 20));
+        assert!(!plain.font_zoomed(Some((8, 16))), "half-blocks need no repaint");
     }
 }
 
@@ -1411,7 +1488,7 @@ impl App {
         } else if clipboard_set(rel) {
             "已複製路徑"
         } else {
-            "無法複製到剪貼簿"
+            "無法複製圖片"
         };
         self.flash(msg);
     }

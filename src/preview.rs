@@ -149,12 +149,15 @@ fn choose_protocol(
     answer: Option<&Answer>,
     winsize: Option<FontSize>,
 ) -> (ProtocolType, FontSize) {
+    let named = named_protocol(h);
     let proto = decided.unwrap_or_else(|| match answer {
+        // iTerm2's protocol cannot be queried; the terminals that speak it report Sixel.
+        Some(a) if (a.kitty || a.sixel) && named == Some(ProtocolType::Iterm2) => ProtocolType::Iterm2,
         Some(a) if a.kitty => ProtocolType::Kitty,
         Some(a) if a.sixel => ProtocolType::Sixel,
         // It answered without a graphics protocol; inherited variables do not overrule that.
         Some(_) => ProtocolType::Halfblocks,
-        None => inherited_guess(h).unwrap_or(ProtocolType::Halfblocks),
+        None => named.or_else(|| inherited_guess(h)).unwrap_or(ProtocolType::Halfblocks),
     });
     match answer.and_then(|a| a.cell).or(winsize) {
         Some(cell) => (proto, cell),
@@ -538,10 +541,10 @@ pub fn parse_protocol_name(s: &str) -> Option<ProtocolType> {
     }
 }
 
-/// A protocol settled without asking the terminal: the override, VS Code, a
-/// terminal that names itself in TERM / TERM_PROGRAM / LC_TERMINAL (which
-/// other terminals overwrite), or inside tmux, which may not pass the query
-/// through, ratatui-image's guess at the terminal outside.
+/// A protocol settled without asking the terminal: the override, VS Code
+/// (half-blocks are safe even where the name is inherited), a terminal named
+/// in TERM, which every terminal sets for itself, or inside tmux, which may
+/// not pass the query through, ratatui-image's guess at the terminal outside.
 fn decided_protocol(h: &TermHints) -> Option<ProtocolType> {
     if let Some(forced) = h.forced() {
         return Some(forced);
@@ -549,19 +552,30 @@ fn decided_protocol(h: &TermHints) -> Option<ProtocolType> {
     if h.is_vscode() {
         return Some(ProtocolType::Halfblocks);
     }
-    let prog = h.term_program.to_ascii_lowercase();
     let term = h.term.to_ascii_lowercase();
-    if ["kitty", "ghostty"].iter().any(|t| term.contains(t) || prog.contains(t)) {
+    if ["kitty", "ghostty"].iter().any(|t| term.contains(t)) {
         return Some(ProtocolType::Kitty);
-    }
-    const ITERM2: [&str; 8] = ["iterm", "wezterm", "mintty", "rio", "bobcat", "tabby", "hyper", "warpterminal"];
-    if ITERM2.iter().any(|p| prog.contains(p)) || h.lc_terminal.contains("iTerm") {
-        return Some(ProtocolType::Iterm2);
     }
     if h.tmux && h.kitty {
         return Some(ProtocolType::Kitty);
     }
     if h.tmux && (h.iterm_session || h.wezterm) {
+        return Some(ProtocolType::Iterm2);
+    }
+    None
+}
+
+/// A terminal named in TERM_PROGRAM / LC_TERMINAL. Terminals that do not set
+/// those (Alacritty, foot, xterm, GNOME Terminal, Konsole) inherit them from
+/// the shell that started them, so the terminal is still asked, and a name
+/// stands only where its answer does not contradict it.
+fn named_protocol(h: &TermHints) -> Option<ProtocolType> {
+    let prog = h.term_program.to_ascii_lowercase();
+    if ["kitty", "ghostty"].iter().any(|t| prog.contains(t)) {
+        return Some(ProtocolType::Kitty);
+    }
+    const ITERM2: [&str; 8] = ["iterm", "wezterm", "mintty", "rio", "bobcat", "tabby", "hyper", "warpterminal"];
+    if ITERM2.iter().any(|p| prog.contains(p)) || h.lc_terminal.contains("iTerm") {
         return Some(ProtocolType::Iterm2);
     }
     None
@@ -615,7 +629,7 @@ mod tests {
 
     /// The protocol picked when the terminal does not answer.
     fn guess(h: &TermHints) -> Option<ProtocolType> {
-        decided_protocol(h).or_else(|| inherited_guess(h))
+        decided_protocol(h).or_else(|| named_protocol(h)).or_else(|| inherited_guess(h))
     }
 
     #[test]
@@ -882,14 +896,18 @@ mod tui_tests {
     }
 
     #[test]
-    fn terminals_that_name_themselves_skip_the_query() {
+    fn only_term_settles_the_protocol_without_asking() {
         let term = |t: &str| TermHints { term: t.into(), ..TermHints::default() };
         let prog = |p: &str| TermHints { term_program: p.into(), ..TermHints::default() };
         assert_eq!(decided_protocol(&term("xterm-kitty")), Some(ProtocolType::Kitty));
-        assert_eq!(decided_protocol(&prog("ghostty")), Some(ProtocolType::Kitty));
-        assert_eq!(decided_protocol(&prog("iTerm.app")), Some(ProtocolType::Iterm2));
+        assert_eq!(decided_protocol(&term("xterm-ghostty")), Some(ProtocolType::Kitty));
+        assert_eq!(decided_protocol(&prog("ghostty")), None, "TERM_PROGRAM can be inherited");
+        assert_eq!(named_protocol(&prog("ghostty")), Some(ProtocolType::Kitty));
+        assert_eq!(decided_protocol(&prog("iTerm.app")), None);
+        assert_eq!(named_protocol(&prog("iTerm.app")), Some(ProtocolType::Iterm2));
         let lc = TermHints { lc_terminal: "iTerm2".into(), ..TermHints::default() };
-        assert_eq!(decided_protocol(&lc), Some(ProtocolType::Iterm2));
+        assert_eq!(decided_protocol(&lc), None);
+        assert_eq!(named_protocol(&lc), Some(ProtocolType::Iterm2));
         let inherited = TermHints { kitty: true, wt_session: true, ..term("alacritty") };
         assert_eq!(decided_protocol(&inherited), None, "inherited ids leave it to the terminal");
         let tmux = TermHints { kitty: true, tmux: true, ..term("tmux-256color") };
@@ -911,6 +929,24 @@ mod tui_tests {
             (ProtocolType::Kitty, (8, 16)),
             "no answer at all: the guess stands"
         );
+    }
+
+    #[test]
+    fn a_named_terminal_stands_unless_its_answer_says_otherwise() {
+        let cell = Some((8, 16));
+        let sixel = Answer { sixel: true, cell, ..Answer::default() };
+        let kitty = Answer { kitty: true, cell, ..Answer::default() };
+        let plain = Answer { cell, ..Answer::default() };
+        let wez = TermHints { term_program: "WezTerm".into(), ..TermHints::default() };
+        assert_eq!(choose_protocol(&wez, None, Some(&sixel), None).0, ProtocolType::Iterm2, "WezTerm reports Sixel");
+        assert_eq!(choose_protocol(&wez, None, Some(&kitty), None).0, ProtocolType::Iterm2);
+        assert_eq!(choose_protocol(&wez, None, None, cell).0, ProtocolType::Iterm2, "no answer: the name stands");
+        // Alacritty started from a WezTerm shell answers without graphics.
+        assert_eq!(choose_protocol(&wez, None, Some(&plain), None).0, ProtocolType::Halfblocks);
+        let ghostty = TermHints { term_program: "ghostty".into(), ..TermHints::default() };
+        assert_eq!(choose_protocol(&ghostty, None, Some(&kitty), None).0, ProtocolType::Kitty);
+        assert_eq!(choose_protocol(&ghostty, None, Some(&sixel), None).0, ProtocolType::Sixel, "foot from a Ghostty shell");
+        assert_eq!(choose_protocol(&ghostty, None, Some(&plain), None).0, ProtocolType::Halfblocks);
     }
 
     #[test]
