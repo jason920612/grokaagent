@@ -452,12 +452,17 @@ impl Transcript {
     pub fn mark_spawn_done(&mut self, child: &str) {
         for r in self.rows.iter_mut().rev() {
             let Row::Tools(g) = r else { continue };
-            for c in g.calls.iter_mut().rev().filter(|c| c.name == "spawn_agent" && !c.done) {
-                let named = serde_json::from_str::<Value>(&c.output)
-                    .ok()
-                    .and_then(|v| v.get("name").and_then(Value::as_str).map(|n| n == child))
-                    .unwrap_or(false)
-                    || c.args.get("name").and_then(Value::as_str) == Some(child);
+            for c in g.calls.iter_mut().rev().filter(|c| (c.name == "spawn_agent" || c.name == "workflow") && !c.done) {
+                let out = serde_json::from_str::<Value>(&c.output).ok();
+                let named = if c.name == "workflow" {
+                    // A workflow's tree node is its run id.
+                    out.as_ref().and_then(|v| v.get("run_id").and_then(Value::as_str)) == Some(child)
+                } else {
+                    out.as_ref()
+                        .and_then(|v| v.get("name").and_then(Value::as_str).map(|n| n == child))
+                        .unwrap_or(false)
+                        || c.args.get("name").and_then(Value::as_str) == Some(child)
+                };
                 if named {
                     c.done = true;
                     c.phase = "完成".into();

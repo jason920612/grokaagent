@@ -322,6 +322,10 @@ fn click(app: &mut App, hit: Option<Hit>, col: u16, row: u16, shift: bool) {
                     app.settings.field = Field::ImportClaude;
                     app.toggle_import(true);
                 }
+                4 => {
+                    app.settings.field = Field::Ultracode;
+                    app.toggle_ultracode();
+                }
                 _ => {
                     app.settings.field = Field::ImportCodex;
                     app.toggle_import(false);
@@ -427,6 +431,10 @@ fn set_field(app: &mut App, i: usize, col: u16, row: u16, shift: bool) {
         return;
     }
     app.settings.drop = None;
+    if field == Field::WorkflowSize {
+        app.cycle_workflow_size(true);
+        return;
+    }
     let inner = app.ui.field_inner;
     if let Some(edit) = app.settings.edit_mut() {
         if inner.contains(Position::new(col, row)) {

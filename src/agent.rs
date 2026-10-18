@@ -37,6 +37,10 @@ pub struct SessionKnobs {
     /// The user's search toggle. [`Self::server_tools`] is what the live
     /// model gets; this is what new child agents inherit.
     pub search: bool,
+    /// Standing opt-in to workflows for every substantive task.
+    pub ultracode: bool,
+    /// How big workflows should be (told to the model, not enforced).
+    pub workflow_size: crate::workflow::SizeGuide,
 }
 
 pub struct RunConfig {
@@ -273,12 +277,16 @@ fn emit_model_finished(
 
 fn live_instructions(cfg: &RunConfig) -> String {
     let mut out = cfg.instructions.clone();
-    let dispatcher = cfg
-        .knobs
-        .as_ref()
-        .is_some_and(|k| k.lock().unwrap_or_else(|e| e.into_inner()).dispatcher);
-    if dispatcher {
+    let knobs = cfg.knobs.as_ref().map(|k| {
+        let g = k.lock().unwrap_or_else(|e| e.into_inner());
+        (g.dispatcher, g.ultracode, g.workflow_size)
+    });
+    if knobs.is_some_and(|k| k.0) {
         out.push_str(crate::instructions::DISPATCHER_INSTRUCTIONS);
+    }
+    // Only a TUI root has live knobs, and only the root has workflows.
+    if let Some((_, ultracode, size)) = knobs {
+        out.push_str(&crate::workflow::instructions_suffix(ultracode, size));
     }
     let extra = cfg.skills.as_ref().map(|s| {
         s.lock()
@@ -2689,6 +2697,8 @@ mod agent_tests {
                 task_reasoning_effort: crate::provider::ReasoningEffort::High,
                 task_send_reasoning: true,
                 search: false,
+                ultracode: false,
+                workflow_size: Default::default(),
             }));
             let provider = Arc::new(Switching {
                 calls: Mutex::new(Vec::new()),
@@ -2884,6 +2894,8 @@ mod tests {
             task_reasoning_effort: crate::provider::ReasoningEffort::High,
             task_send_reasoning: true,
             search: false,
+            ultracode: false,
+            workflow_size: Default::default(),
         })));
         let text = live_instructions(&c);
         assert!(text.starts_with("use tools"));
@@ -6046,6 +6058,8 @@ mod task_proxy_tests {
                 task_reasoning_effort: crate::provider::ReasoningEffort::Medium,
                 task_send_reasoning: true,
                 search: false,
+                ultracode: false,
+                workflow_size: Default::default(),
             })));
             go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
             let proxy = provider.proxy_calls.lock().unwrap();

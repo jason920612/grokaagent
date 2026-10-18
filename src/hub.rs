@@ -437,6 +437,11 @@ pub struct UiSettings {
     pub web_search: bool,
     #[serde(default)]
     pub dispatcher: bool,
+    #[serde(default)]
+    pub ultracode: bool,
+    /// The workflow size guideline's label.
+    #[serde(default)]
+    pub workflow_size: String,
     /// Default model for child agents; empty follows the main model.
     #[serde(default)]
     pub child_model: String,
@@ -634,6 +639,8 @@ pub enum UiCommand {
     SetEffort { id: String },
     ToggleSearch,
     ToggleDispatcher,
+    ToggleUltracode,
+    CycleWorkflowSize,
     ToggleImportClaude,
     ToggleImportCodex,
     ToggleSkill { index: usize },

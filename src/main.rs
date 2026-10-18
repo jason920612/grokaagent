@@ -94,6 +94,9 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long, default_value = "high", value_parser = parse_reasoning)]
         reasoning: ReasoningEffort,
+        /// Start with ultracode on: workflows for every substantive task.
+        #[arg(long)]
+        ultracode: bool,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -213,6 +216,8 @@ async fn real_main() -> grokaagent::Result<()> {
                 dispatcher: false,
                 child_model: String::new(),
                 reasoning_effort: ReasoningEffort::High,
+                ultracode: false,
+                workflow_size: Default::default(),
             })
             .await?;
         }
@@ -276,6 +281,7 @@ async fn real_main() -> grokaagent::Result<()> {
             no_web_search,
             workspace,
             reasoning,
+            ultracode,
             api,
         }) => {
             let (_, model) = boot_provider(api, model, true)?;
@@ -291,6 +297,8 @@ async fn real_main() -> grokaagent::Result<()> {
                 dispatcher: false,
                 child_model: String::new(),
                 reasoning_effort: reasoning,
+                ultracode,
+                workflow_size: Default::default(),
             })
             .await?;
         }

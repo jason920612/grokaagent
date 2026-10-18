@@ -47,5 +47,8 @@ pub struct TuiOptions {
     pub dispatcher: bool,
     /// Default model for spawned child agents. Empty = follow the main model.
     pub child_model: String,
+    /// Standing opt-in to workflows for every substantive task.
+    pub ultracode: bool,
+    pub workflow_size: crate::workflow::SizeGuide,
     pub reasoning_effort: ReasoningEffort,
 }

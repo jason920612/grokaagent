@@ -28,6 +28,8 @@ pub(crate) enum Field {
     Effort,
     Search,
     Dispatcher,
+    Ultracode,
+    WorkflowSize,
     ImportClaude,
     ImportCodex,
     Skills,
@@ -47,6 +49,8 @@ impl Field {
                 Field::Context,
                 Field::Search,
                 Field::Dispatcher,
+                Field::Ultracode,
+                Field::WorkflowSize,
                 Field::ImportClaude,
                 Field::ImportCodex,
                 Field::Skills,
@@ -61,6 +65,8 @@ impl Field {
                 Field::Effort,
                 Field::Search,
                 Field::Dispatcher,
+                Field::Ultracode,
+                Field::WorkflowSize,
                 Field::ImportClaude,
                 Field::ImportCodex,
                 Field::Skills,
@@ -245,6 +251,8 @@ impl App {
             k.server_tools = crate::kit::search_tools(self.opts.web_search, openai, st.xai_ready);
             k.search = self.opts.web_search;
             k.dispatcher = self.opts.dispatcher;
+            k.ultracode = self.opts.ultracode;
+            k.workflow_size = self.opts.workflow_size;
             k.child_model = self.opts.child_model.trim().to_string();
             k.task_reasoning_effort = task_choice.effort;
             k.task_send_reasoning = task_choice.send_reasoning && !task_openai;
@@ -384,6 +392,16 @@ impl App {
 
     pub fn toggle_dispatcher(&mut self) {
         self.opts.dispatcher = !self.opts.dispatcher;
+        self.sync_knobs();
+    }
+
+    pub fn toggle_ultracode(&mut self) {
+        self.opts.ultracode = !self.opts.ultracode;
+        self.sync_knobs();
+    }
+
+    pub fn cycle_workflow_size(&mut self, forward: bool) {
+        self.opts.workflow_size = self.opts.workflow_size.next(forward);
         self.sync_knobs();
     }
 

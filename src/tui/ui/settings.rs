@@ -15,7 +15,7 @@ const LABEL_W: u16 = 20;
 const FORM_W: u16 = 84;
 
 /// Field ↔ hit id.
-pub(crate) const FIELDS: [Field; 14] = [
+pub(crate) const FIELDS: [Field; 16] = [
     Field::Kind,
     Field::Account,
     Field::Endpoint,
@@ -27,6 +27,8 @@ pub(crate) const FIELDS: [Field; 14] = [
     Field::Effort,
     Field::Search,
     Field::Dispatcher,
+    Field::Ultracode,
+    Field::WorkflowSize,
     Field::ImportClaude,
     Field::ImportCodex,
     Field::Skills,
@@ -293,7 +295,28 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         line(f, Rect::new(x, y, LABEL_W, 1), label, focus_style(foc));
         toggle(f, app, ctl_x, y, on, foc, Hit::SetToggle(id));
         if fld == Field::Dispatcher {
-            line(f, Rect::new(ctl_x + 7, y, ctl_w.saturating_sub(7), 1), "主代理只規劃、指揮子代理", Style::default().fg(DIM));
+            // Workflows share the row: Ultracode (the standing opt-in) and
+            // the size guideline it scales.
+            let mut cx = ctl_x + 7;
+            let room = (ctl_x + ctl_w).saturating_sub(cx);
+            let foc_u = focused && field == Field::Ultracode;
+            let foc_s = focused && field == Field::WorkflowSize;
+            if room >= 32 {
+                line(f, Rect::new(cx, y, 10, 1), "Ultracode", focus_style(foc_u));
+                cx += 10;
+                toggle(f, app, cx, y, app.opts.ultracode, foc_u, Hit::SetToggle(4));
+                cx += 7;
+                line(f, Rect::new(cx, y, 5, 1), "規模", focus_style(foc_s));
+                cx += 5;
+                let size = app.opts.workflow_size;
+                let text = if (ctl_x + ctl_w).saturating_sub(cx) >= 24 { size.label() } else { size.short() };
+                let r = Rect::new(cx, y, (ctl_x + ctl_w).saturating_sub(cx).min(display_cols(text) + 4), 1);
+                let style = if foc_s { Style::default().fg(ACCENT).bg(COMPOSER) } else { Style::default().fg(DIM).bg(COMPOSER) };
+                line(f, r, &format!(" ‹{text}› "), style);
+                app.ui.hits.push((r, field_hit(Field::WorkflowSize)));
+            } else {
+                line(f, Rect::new(cx, y, room, 1), "主代理只規劃、指揮子代理", Style::default().fg(DIM));
+            }
         }
         y += 1;
     }

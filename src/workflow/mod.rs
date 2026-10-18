@@ -52,6 +52,76 @@ const RESULT_CAP: usize = 20_000;
 /// The authoring guide `workflow {"reference": true}` returns.
 pub const REFERENCE: &str = include_str!("reference.md");
 
+/// How big the session's workflows should be: a guideline the model is
+/// told, not a hard limit (the hard caps are [`MAX_AGENTS`] and
+/// [`max_concurrency`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SizeGuide {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    Unlimited,
+}
+
+impl SizeGuide {
+    pub const ALL: [SizeGuide; 4] = [Self::Small, Self::Medium, Self::Large, Self::Unlimited];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+            Self::Unlimited => "unlimited",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "小（5 個代理以下）",
+            Self::Medium => "中（10 個代理以下）",
+            Self::Large => "大（30 個代理以下）",
+            Self::Unlimited => "不限",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Small => "小",
+            Self::Medium => "中",
+            Self::Large => "大",
+            Self::Unlimited => "不限",
+        }
+    }
+
+    pub fn next(self, forward: bool) -> Self {
+        let i = Self::ALL.iter().position(|s| *s == self).unwrap_or(1);
+        let n = Self::ALL.len();
+        Self::ALL[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    }
+
+    /// The sentence the system prompt carries.
+    fn guideline(self) -> String {
+        let scale = match self {
+            Self::Small => "small — keep workflows under 5 agents",
+            Self::Medium => "medium — keep workflows under 10 agents",
+            Self::Large => "large — keep workflows under 30 agents",
+            Self::Unlimited => "unlimited — scale workflows to what the task needs",
+        };
+        format!("This session's workflow size guideline: {scale}. This is a guideline, not a hard limit: follow it unless the user's request calls for a different scale.")
+    }
+}
+
+/// Appended to the root's system prompt in a TUI session (byte-stable while
+/// the settings stay the same, so the prompt cache misses once per change).
+pub fn instructions_suffix(ultracode: bool, size: SizeGuide) -> String {
+    let mut out = format!("\n\nWorkflows:\n- {}", size.guideline());
+    if ultracode {
+        out.push_str("\n- Ultracode is on: the user opted into multi-agent orchestration for every substantive task. Optimize for the most exhaustive, correct answer, not the fastest or cheapest: use the workflow tool for every substantive task, often several workflows in sequence (understand → design → implement → review), with adversarial verification of what they find. Token cost is not a constraint. Work alone only on conversational turns and trivial edits.");
+    }
+    out
+}
+
 /// Agents of one run that work at the same time: two fewer than the CPUs,
 /// between 1 and 16 (each agent is a local process).
 pub fn max_concurrency() -> usize {

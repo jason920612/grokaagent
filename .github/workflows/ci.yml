@@ -1,0 +1,41 @@
+name: ci
+
+# Every pull request and push to main: build and test on the three release
+# targets, integration tests (echo workers, workflows) included, so a C
+# dependency or a platform difference breaks here and not at release time.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux screenshot/clipboard libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libclang-dev clang \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxrandr-dev libdbus-1-dev libxkbcommon-dev \
+            libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev
+      - name: Test
+        run: cargo test --locked -- --skip screenshot

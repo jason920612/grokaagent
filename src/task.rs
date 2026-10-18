@@ -3027,6 +3027,8 @@ mod proxy_tests {
             task_reasoning_effort: ReasoningEffort::Low,
             task_send_reasoning: false,
             search: false,
+            ultracode: false,
+            workflow_size: Default::default(),
         }));
         assert_eq!(proxy_settings(Some(&knobs), "x", ReasoningEffort::Low), ("grok-main".into(), ReasoningEffort::Xhigh, true));
         knobs.lock().unwrap().task_model = " other-proxy ".into();

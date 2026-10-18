@@ -1185,6 +1185,8 @@ mod tests {
             task_reasoning_effort: crate::provider::ReasoningEffort::High,
             task_send_reasoning: true,
             search: false,
+            ultracode: false,
+            workflow_size: Default::default(),
         }));
         let n = nursery(&dir, 0, Some(knobs.clone()));
         assert_eq!(n.default_child_model(), "grok-3-mini");

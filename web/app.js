@@ -1407,6 +1407,16 @@
     disp.title = "開啟後模型只負責規劃並指揮子代理，盡量不直接動手";
     disp.addEventListener("click", () => send({ type: "toggle_dispatcher" }));
     modal.append(disp);
+    const ultra = el("button", "", st.ultracode ? "Ultracode：開" : "Ultracode：關");
+    ultra.type = "button";
+    ultra.title = "開啟後，每個實質任務都用工作流程（多代理編排）處理，追求最完整正確的結果";
+    ultra.addEventListener("click", () => send({ type: "toggle_ultracode" }));
+    modal.append(ultra);
+    const size = el("button", "", "工作流程規模：" + (st.workflow_size || "中（10 個代理以下）"));
+    size.type = "button";
+    size.title = "告訴模型工作流程該用多少代理（建議值，不是硬性上限）；點一下切換";
+    size.addEventListener("click", () => send({ type: "cycle_workflow_size" }));
+    modal.append(size);
     const ic = el("button", "", st.import_claude ? "Claude 技能：開" : "Claude 技能：關");
     ic.type = "button";
     ic.addEventListener("click", () => send({ type: "toggle_import_claude" }));

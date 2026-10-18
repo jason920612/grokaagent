@@ -660,6 +660,13 @@ fn settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Field::Account if activate => app.activate_account(),
         Field::Search if activate => app.toggle_search(),
         Field::Dispatcher if activate => app.toggle_dispatcher(),
+        Field::Ultracode if activate => app.toggle_ultracode(),
+        Field::WorkflowSize => match code {
+            KeyCode::Left => app.cycle_workflow_size(false),
+            KeyCode::Right => app.cycle_workflow_size(true),
+            _ if activate => app.cycle_workflow_size(true),
+            _ => {}
+        },
         Field::ImportClaude if activate => app.toggle_import(true),
         Field::ImportCodex if activate => app.toggle_import(false),
         Field::Skills => match code {

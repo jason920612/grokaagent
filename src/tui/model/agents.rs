@@ -448,6 +448,33 @@ impl AgentTree {
         settle
     }
 
+    /// Drop the oldest finished workflow subtrees (top-level `wf-…` nodes)
+    /// beyond the newest `keep`. Returns the paths removed.
+    pub fn prune_workflows(&mut self, keep: usize) -> Vec<String> {
+        let finished: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|a| a.path.starts_with("wf-") && !a.path.contains('/') && !a.alive())
+            .map(|a| a.path.clone())
+            .collect();
+        let excess = finished.len().saturating_sub(keep);
+        let mut gone = Vec::new();
+        for root in finished.into_iter().take(excess) {
+            let prefix = format!("{root}/");
+            self.nodes.retain(|a| {
+                let hit = a.path == root || a.path.starts_with(&prefix);
+                if hit {
+                    gone.push(a.path.clone());
+                }
+                !hit
+            });
+        }
+        if !gone.is_empty() {
+            self.dirty = true;
+        }
+        gone
+    }
+
     pub fn saved(&self) -> Vec<SavedAgent> {
         self.nodes
             .iter()
@@ -482,6 +509,35 @@ mod tests {
     use super::*;
     use crate::events::EventMeta;
     use serde_json::json;
+
+    #[test]
+    fn workflow_agents_nest_under_their_run_and_old_runs_are_pruned() {
+        let mut t = AgentTree::default();
+        for run in ["wf-1", "wf-2", "wf-3"] {
+            t.spawned("", run, "name — description", "workflow");
+            t.apply_relayed(&AgentEvent::RunStarted { meta: m(run, "root"), model: "workflow".into() });
+            t.apply_relayed(&AgentEvent::ChildSpawned {
+                meta: m(run, "root"),
+                name: "find-1".into(),
+                agent_card_url: String::new(),
+                prompt: "look".into(),
+                model: "grok-4.6".into(),
+            });
+            t.apply_relayed(&AgentEvent::Notice { meta: m(run, "root"), message: "階段：Find".into() });
+        }
+        let paths: Vec<&str> = t.nodes.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["wf-1", "wf-1/find-1", "wf-2", "wf-2/find-1", "wf-3", "wf-3/find-1"]);
+        assert_eq!(t.get("wf-1").unwrap().state, AgentState::Working);
+        // Running workflows are never pruned.
+        assert!(t.prune_workflows(1).is_empty());
+        t.exited("", "wf-1", "完成");
+        t.exited("", "wf-2", "完成");
+        assert_eq!(t.get("wf-1/find-1").unwrap().state, AgentState::Exited);
+        let gone = t.prune_workflows(1);
+        assert_eq!(gone, ["wf-1", "wf-1/find-1"]);
+        let paths: Vec<&str> = t.nodes.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["wf-2", "wf-2/find-1", "wf-3", "wf-3/find-1"]);
+    }
 
     fn m(path: &str, run: &str) -> EventMeta {
         EventMeta {

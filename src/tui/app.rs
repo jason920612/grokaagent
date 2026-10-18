@@ -1120,6 +1120,8 @@ impl App {
             task_reasoning_effort: opts.reasoning_effort,
             task_send_reasoning: true,
             search: opts.web_search,
+            ultracode: opts.ultracode,
+            workflow_size: opts.workflow_size,
         }));
         let current = boot.id().to_string();
         let launch_workspace = opts.workspace.clone();

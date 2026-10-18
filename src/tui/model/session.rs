@@ -312,6 +312,15 @@ pub(crate) struct Routed {
     pub run_finished: bool,
 }
 
+/// Finished workflows whose agents stay in the tree; older ones are
+/// dropped when a new workflow starts (each can have dozens of agents).
+const KEEP_WORKFLOWS: usize = 5;
+
+/// A workflow run's node in the agent tree (`wf-…`, its run id).
+fn is_workflow_node(name: &str) -> bool {
+    name.starts_with("wf-") && !name.contains('/')
+}
+
 pub(crate) struct Session {
     pub meta: SessionMeta,
     pub chat: Transcript,
@@ -623,6 +632,19 @@ impl Session {
             // The task proxy may report itself like a child, but it is not a
             // process: its words arrive as TaskProxy rows instead.
             AgentEvent::ChildSpawned { name, .. } | AgentEvent::ChildExited { name, .. } if name == task::AGENT_NAME => {}
+            AgentEvent::ChildSpawned { name, prompt, model, .. } if is_workflow_node(&name) => {
+                for gone in self.agents.prune_workflows(KEEP_WORKFLOWS) {
+                    self.close_agent(&gone);
+                    self.views.remove(&gone);
+                }
+                self.agents.spawned("", &name, &prompt, &model);
+                self.chat.push(Row::meta(format!("工作流程 {name} 已啟動  {prompt}")));
+            }
+            AgentEvent::ChildExited { name, detail, .. } if is_workflow_node(&name) => {
+                self.agents.exited("", &name, &detail);
+                self.chat.mark_spawn_done(&name);
+                self.chat.push(Row::meta(format!("工作流程 {name} 結束  {detail}")));
+            }
             AgentEvent::ChildSpawned { name, prompt, model, .. } => {
                 self.agents.spawned("", &name, &prompt, &model);
                 self.chat.push(Row::meta(format!("子代理 {name} 已啟動")));

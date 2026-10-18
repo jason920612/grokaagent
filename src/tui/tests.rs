@@ -43,6 +43,8 @@ fn opts(dir: &std::path::Path) -> TuiOptions {
         dispatcher: false,
         child_model: String::new(),
         reasoning_effort: ReasoningEffort::High,
+        ultracode: false,
+        workflow_size: Default::default(),
     }
 }
 
