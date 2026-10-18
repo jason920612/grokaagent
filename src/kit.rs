@@ -773,6 +773,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_turns_still_lets_the_closing_turn_run() {
+        // The cap lands on the stop the proxy accepts (or gives up on):
+        // the worker still writes its closing turn and the task ends.
+        for (verdict, phase) in [
+            (json!({"status": "satisfied", "reason": "the worker showed the file"}), crate::task::TaskPhase::Done),
+            (json!({"status": "impossible", "reason": "the disk is read-only"}), crate::task::TaskPhase::Failed),
+        ] {
+            let hub = crate::task::TaskHub::new("");
+            hub.start_task("write hello.txt", "it says hi");
+            let provider = Headless::new(
+                vec![
+                    says(json!({"status": "continue", "message": "Write hello.txt."})),
+                    says(json!({"status": "continue", "message": "Show me the file."})),
+                    says(verdict),
+                ],
+                None,
+                vec!["wrote it: hi", "here: hi", "Summary: hello.txt says hi."],
+            );
+            let (out, _) = headless_capped(&provider, &hub, 2).await;
+            assert_eq!(out.unwrap().text, "Summary: hello.txt says hi.");
+            assert_eq!(hub.snapshot().phase, phase);
+            assert_eq!(provider.calls(), (3, 3));
+        }
+    }
+
+    #[tokio::test]
     async fn a_headless_task_run_stops_pushing_an_agent_that_keeps_failing() {
         let hub = crate::task::TaskHub::new("");
         hub.start_goal("fix the build");

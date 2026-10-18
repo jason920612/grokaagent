@@ -115,10 +115,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
     };
     // Down to the last toggle with every box on its own row. A shorter
     // screen puts the child and task model boxes side by side, so the
-    // fields and toggles after them stay in view.
+    // fields, toggles and skills list after them stay in view.
     let boxes: u16 = if openai { 6 } else { 4 };
     let need = y + if openai { 0 } else { 2 } + 3 * boxes + 5;
-    let pair = need > bottom && ctl_w >= 40;
+    // The skills block: a blank row, its header and a list with one row
+    // inside its border (plus the spare row it keeps with no link).
+    let skills_need = 5 + u16::from(link_row.is_none());
+    let pair = need + skills_need > bottom && ctl_w >= 40;
     let pair_w = (ctl_w.saturating_sub(1) / 2).min(40);
 
     if !openai {

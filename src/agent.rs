@@ -1956,7 +1956,8 @@ pub async fn run<P: Provider + Clone + 'static>(
 
         checkpoint(&cfg, &history);
         // The proxy's pushes share the turn budget: a cap (headless
-        // --max-turns) bounds a task the proxy never accepts.
+        // --max-turns) bounds a task the proxy never accepts. A verdict
+        // that ends the task still gets its closing turn.
         if let Some(instr) = task_after_stop(&cfg, provider, sink, &run_id, &history, &last_text).await {
             append_user(
                 &mut history,
@@ -1964,6 +1965,13 @@ pub async fn run<P: Provider + Clone + 'static>(
                 &UserTurn::from(instr),
                 &cfg.workspace,
             );
+            if cfg
+                .task
+                .as_ref()
+                .is_some_and(|h| h.ending_pending() || h.snapshot().phase == crate::task::TaskPhase::ExplainingFail)
+            {
+                turn = turn.min(max_turns.saturating_sub(1));
+            }
             continue;
         }
         if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {

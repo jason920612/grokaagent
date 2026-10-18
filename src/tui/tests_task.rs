@@ -910,3 +910,21 @@ fn settings_fit_a_standard_terminal() {
     let screen = render(app, 120, 50);
     assert!(!screen.contains("子代理／任務代理") && screen.contains("任務代理（空=同主）"), "{screen}");
 }
+
+#[test]
+fn settings_keep_the_skills_list_in_view_on_a_default_terminal() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    app.ui.side_open = true; // docked at this width, as at startup
+    app.open_settings();
+    // Windows Terminal's default size with the web link: the model boxes
+    // pair up so the skills list still has rows of its own.
+    app.web.url = Some("http://127.0.0.1:8787/?t=x".into());
+    let screen = render(app, 120, 30);
+    assert!(screen.contains("技能（空白鍵") && screen.contains("子代理／任務代理"), "{screen}");
+    assert!(hit_rect(app, ui::settings::field_hit(Field::Skills)).height >= 3);
+    // With no link the list keeps a spare row under it.
+    app.web.url = None;
+    render(app, 120, 31);
+    assert!(hit_rect(app, ui::settings::field_hit(Field::Skills)).height >= 3);
+}
