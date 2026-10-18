@@ -278,84 +278,216 @@ pub fn groka_dir(workspace: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Image files a terminal pasted for a file drop: one path per line, or
+/// shell-quoted words, `file://` URIs included. Empty unless every entry is
+/// an absolute path to an existing image file, so prose or code that only
+/// mentions a path stays text. Formats the decoders cannot read are kept for
+/// the caller to report (see `is_unsupported_image_ext`).
 pub fn parse_image_drop(text: &str) -> Vec<PathBuf> {
-    let t = text.trim();
-    if t.is_empty() {
-        return Vec::new();
-    }
-    let tokens = split_drop_tokens(t);
-    if tokens.is_empty() {
-        return Vec::new();
-    }
     let mut out = Vec::new();
-    for tok in &tokens {
-        let p = PathBuf::from(tok);
-        if p.is_file() && is_image_ext(&p) {
-            out.push(p);
-        }
-    }
-    if out.len() == tokens.len() {
-        out
-    } else {
-        Vec::new()
-    }
-}
-
-fn split_drop_tokens(t: &str) -> Vec<String> {
-    if t.contains('\n') {
-        return t
-            .lines()
-            .map(unquote_path)
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    if t.contains('"') {
-        let quoted = quoted_paths(t);
-        if !quoted.is_empty() {
-            return quoted;
-        }
-    }
-    let one = unquote_path(t);
-    if one.is_empty() {
-        Vec::new()
-    } else {
-        vec![one]
-    }
-}
-
-fn quoted_paths(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_q = false;
-    for c in s.chars() {
-        if c == '"' {
-            if in_q {
-                let t = unquote_path(&cur);
-                if !t.is_empty() {
-                    out.push(t);
-                }
-                cur.clear();
-                in_q = false;
-            } else {
-                in_q = true;
-            }
-        } else if in_q {
-            cur.push(c);
+    for line in text.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()) {
+        match drop_line(line) {
+            Some(paths) => out.extend(paths),
+            None => return Vec::new(),
         }
     }
     out
 }
 
-fn unquote_path(s: &str) -> String {
-    let s = s.trim().trim_matches('\'').trim_matches('"').trim();
-    if let Some(rest) = s.strip_prefix("file://") {
-        let rest = rest.trim_start_matches('/');
-        if rest.len() >= 2 && rest.as_bytes().get(1) == Some(&b':') {
-            return rest.replace('/', "\\");
-        }
-        return rest.to_string();
+/// Image formats people drop or copy that the enabled decoders cannot read.
+pub(crate) fn is_unsupported_image_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("heic" | "heif" | "avif" | "tif" | "tiff" | "svg" | "ico" | "jxl" | "psd")
+    )
+}
+
+/// One pasted line: a single path as is (unquoted spaces and all), or shell
+/// words that each name a dropped file.
+fn drop_line(line: &str) -> Option<Vec<PathBuf>> {
+    if let Some(p) = dropped_file(line) {
+        return Some(vec![p]);
     }
-    s.to_string()
+    shell_words(line, !cfg!(windows))?
+        .iter()
+        .map(|w| dropped_file(w))
+        .collect()
+}
+
+/// An absolute path or `file://` URI naming an existing image file.
+fn dropped_file(s: &str) -> Option<PathBuf> {
+    let p = match s.strip_prefix("file://") {
+        Some(rest) => PathBuf::from(file_uri_path(rest, cfg!(windows))?),
+        None => PathBuf::from(s),
+    };
+    let image = is_image_ext(&p) || is_unsupported_image_ext(&p);
+    (image && p.is_absolute() && p.is_file()).then_some(p)
+}
+
+/// Split a line the way a POSIX shell would: blanks separate words, quotes
+/// group, and with `escapes` a backslash keeps the next char literal (macOS
+/// terminals drop `Screenshot\ 1.png`). Windows paths use `\` as the
+/// separator, so it stays literal there. `None` on an unclosed quote.
+fn shell_words(line: &str, escapes: bool) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Only the shell's blanks: macOS names hold U+202F, which is whitespace too.
+            ' ' | '\t' => words.extend(word.take()),
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => w.push(c),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' if escapes => match chars.next()? {
+                            c @ ('"' | '\\' | '$' | '`') => w.push(c),
+                            c => {
+                                w.push('\\');
+                                w.push(c);
+                            }
+                        },
+                        c => w.push(c),
+                    }
+                }
+            }
+            '\\' if escapes => word.get_or_insert_with(String::new).push(chars.next()?),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Some(words)
+}
+
+/// The local path of a `file://` URI given without its scheme: no host or
+/// `localhost`, percent-decoded, and on Windows `/C:/x` as `C:\x`.
+fn file_uri_path(rest: &str, windows: bool) -> Option<String> {
+    let path = percent_decode(rest.strip_prefix("localhost").unwrap_or(rest))?;
+    if windows {
+        let drive = path.trim_start_matches('/');
+        let b = drive.as_bytes();
+        return (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then(|| drive.replace('/', "\\"));
+    }
+    path.starts_with('/').then_some(path)
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = char::from(bytes.next()?).to_digit(16)?;
+            let lo = char::from(bytes.next()?).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    fn png(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0])).save(path).unwrap();
+        path.to_path_buf()
+    }
+
+    // On Windows `\` separates path components and is never an escape.
+    #[cfg(not(windows))]
+    #[test]
+    fn backslash_escaped_macos_drops_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = png(&dir.path().join("drop dir/Screenshot 2026-10-17 at 10.00.00.png"));
+        let pasted = shot.to_string_lossy().replace(' ', "\\ ");
+        assert_eq!(parse_image_drop(&pasted), vec![shot.clone()]);
+        let unescaped = shot.to_string_lossy().into_owned();
+        assert_eq!(parse_image_drop(&unescaped), vec![shot], "a lone path with plain spaces");
+    }
+
+    #[test]
+    fn multi_file_drops_in_every_quoting_attach_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = png(&dir.path().join("My Pics/a.png"));
+        let b = png(&dir.path().join("b.png"));
+        let (sa, sb) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let both = vec![a.clone(), b.clone()];
+        assert_eq!(parse_image_drop(&format!("'{sa}' '{sb}'")), both, "GNOME single quotes");
+        assert_eq!(parse_image_drop(&format!("\"{sa}\" {sb}")), both, "mixed quoting");
+        assert_eq!(parse_image_drop(&format!("{sb} {sb}")), vec![b.clone(), b.clone()], "plain words");
+        assert_eq!(parse_image_drop(&format!("{sa}\r\n{sb}\n")), both, "one per line");
+    }
+
+    #[test]
+    fn file_uris_keep_the_root_and_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = png(&dir.path().join("My Shot.png"));
+        let uri = format!("file://{}", shot.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(parse_image_drop(&uri), vec![shot.clone()]);
+        let local = format!("file://localhost{}", shot.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(parse_image_drop(&local), vec![shot]);
+        assert_eq!(file_uri_path("/C:/Users/me/a%20b.png", true).as_deref(), Some("C:\\Users\\me\\a b.png"));
+        assert_eq!(file_uri_path("C:/x.png", true).as_deref(), Some("C:\\x.png"));
+        assert_eq!(file_uri_path("/home/u/x.png", false).as_deref(), Some("/home/u/x.png"));
+        assert_eq!(file_uri_path("server/share/x.png", false), None, "remote hosts are not local files");
+        assert_eq!(file_uri_path("/bad%2", false), None);
+        assert_eq!(file_uri_path("/bad%+1", false), None);
+    }
+
+    #[test]
+    fn text_that_only_mentions_a_path_stays_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let logo = png(&dir.path().join("logo.png"));
+        let s = logo.to_string_lossy();
+        assert!(parse_image_drop(&format!("img = Image.open(\"{s}\")")).is_empty());
+        assert!(parse_image_drop(&format!("fix the layout in \"{s}\" please")).is_empty());
+        assert!(parse_image_drop(&format!("{s}\nsee above")).is_empty());
+        assert!(parse_image_drop("logo.png").is_empty(), "relative paths are typed, not dropped");
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        assert!(parse_image_drop(&format!("{s} {}", notes.display())).is_empty());
+        assert!(parse_image_drop(&format!("'{s}")).is_empty(), "unclosed quote");
+    }
+
+    #[test]
+    fn undecodable_image_formats_are_reported_not_pasted() {
+        let dir = tempfile::tempdir().unwrap();
+        let heic = dir.path().join("IMG_0001.HEIC");
+        std::fs::write(&heic, "x").unwrap();
+        assert_eq!(parse_image_drop(&heic.to_string_lossy()), vec![heic.clone()]);
+        assert!(is_unsupported_image_ext(&heic));
+        assert!(!is_image_ext(&heic));
+    }
+
+    #[test]
+    fn shell_words_follow_the_platform_escape_rule() {
+        assert_eq!(shell_words(r"a\ b 'c d' e", true).unwrap(), ["a b", "c d", "e"]);
+        assert_eq!(shell_words(r#""x\"y" "\q""#, true).unwrap(), ["x\"y", "\\q"]);
+        assert_eq!(
+            shell_words(r#""C:\My Pics\a.png" C:\b.png"#, false).unwrap(),
+            [r"C:\My Pics\a.png", r"C:\b.png"]
+        );
+        assert_eq!(shell_words("at 10.00\u{202f}AM.png", true).unwrap(), ["at", "10.00\u{202f}AM.png"]);
+        assert_eq!(shell_words("'' x", true).unwrap(), ["", "x"]);
+        assert!(shell_words("\"open", true).is_none());
+        assert!(shell_words("trailing\\", true).is_none());
+    }
 }
 
 pub fn rel_inbox_path() -> PathBuf {

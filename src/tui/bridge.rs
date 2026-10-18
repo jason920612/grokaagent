@@ -489,7 +489,8 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
             app.ui.send_mode = if mode == "insert" { SendMode::Insert } else { SendMode::Queue };
         }
         UiCommand::PasteImage => app.paste_image(),
-        UiCommand::PasteText { text } => app.paste_text(&text),
+        // Browser text never names host files: insert it, never ingest paths.
+        UiCommand::PasteText { text } => app.cur_mut().draft.insert_str(&text.chars().take(100_000).collect::<String>()),
         UiCommand::RemovePending { index } => {
             let s = app.cur_mut();
             if index < s.pending.len() {

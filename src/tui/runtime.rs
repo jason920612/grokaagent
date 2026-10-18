@@ -46,6 +46,7 @@ pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).map_err(Error::Io)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out)).map_err(Error::Io)?;
     let result = tui_loop(&mut terminal, opts).await;
+    crate::clipimg::release_clipboard();
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
     result
@@ -122,6 +123,7 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
     let (custom_tx, mut custom_rx) = mpsc::unbounded_channel();
     let (login_tx, mut login_rx) = mpsc::unbounded_channel();
     let mut keys = EventStream::new();
+    let mut burst = input::PasteBurst::default();
     let mut paint = Painter::default();
     let mut last_persist = Instant::now();
     let mut last_size = terminal.size().map_err(Error::Io)?;
@@ -179,6 +181,10 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
                 let mut batch = vec![first];
                 while let Some(Some(Ok(ev))) = keys.next().now_or_never() {
                     batch.push(ev);
+                }
+                // crossterm reports no Event::Paste on Windows: pastes and drops arrive as keys.
+                if cfg!(windows) {
+                    batch = burst.coalesce(batch, Instant::now());
                 }
                 let batch = input::coalesce_ime_enter(batch);
                 if batch.is_empty() {
