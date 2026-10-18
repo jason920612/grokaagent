@@ -6,18 +6,19 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::Protocol;
+use ratatui_image::FontSize;
 use tokio::sync::mpsc;
 
 use crate::agent::{CancelFlag, RunOutcome, SessionKnobs, UserTurn};
 use crate::ask::AskUserHub;
 use crate::events::{AgentEvent, EventMeta, EventSink, FanoutSink};
 use crate::folderpick::{self, FolderView};
+use crate::preview::{Graphic, GraphicBlit, Placement};
 use crate::session::{self, SessionMeta, SessionStore};
 use crate::skills::SkillStore;
 use crate::task::{self, TaskHub, TaskPhase};
@@ -394,34 +395,427 @@ impl Default for Ui {
     }
 }
 
-/// Image previews: terminal graphics protocol and cached renderings.
+/// One version of an image file: its path plus length and mtime, so a file
+/// rewritten in place (a re-read chart, a reused screenshot path) gets fresh
+/// previews instead of its first decode.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ImageKey {
+    pub path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl ImageKey {
+    pub fn of(path: PathBuf) -> Self {
+        let meta = std::fs::metadata(&path).ok();
+        Self {
+            len: meta.as_ref().map_or(0, |m| m.len()),
+            modified: meta.and_then(|m| m.modified().ok()),
+            path,
+        }
+    }
+}
+
+/// Rendered previews; once over budget the least recently drawn go first.
+struct Lru<K, V> {
+    /// Value, its size in bytes, and the frame that last drew it.
+    map: HashMap<K, (V, usize, u64)>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
+    fn new(budget: usize) -> Self {
+        Self { map: HashMap::new(), bytes: 0, budget }
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn get(&mut self, key: &K, frame: u64) -> Option<&V> {
+        let entry = self.map.get_mut(key)?;
+        entry.2 = frame;
+        Some(&entry.0)
+    }
+
+    fn insert(&mut self, key: K, value: V, bytes: usize, frame: u64) {
+        if let Some(old) = self.map.insert(key, (value, bytes, frame)) {
+            self.bytes -= old.1;
+        }
+        self.bytes += bytes;
+    }
+
+    /// Keep what `frame` drew; drop the oldest of the rest down to budget.
+    fn trim(&mut self, frame: u64) {
+        if self.bytes <= self.budget {
+            return;
+        }
+        let mut old: Vec<(u64, K)> = self
+            .map
+            .iter()
+            .filter(|(_, e)| e.2 < frame)
+            .map(|(k, e)| (e.2, k.clone()))
+            .collect();
+        old.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in old {
+            if self.bytes <= self.budget {
+                break;
+            }
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.1;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
+
+/// A Kitty viewer image is ~3.6 MB of base64; thumbnails a fraction of that.
+const GRAPHICS_BUDGET: usize = 64 << 20;
+const HALFBLOCK_BUDGET: usize = 16 << 20;
+/// No new viewer decode this soon after a resize: dragging a window edge
+/// would otherwise encode the picture once per intermediate size.
+const RESIZE_SETTLE: Duration = Duration::from_millis(200);
+/// How long one stat stands for a file: every image row needs its key on
+/// every frame, and frames come every 80 ms while the agent works.
+const STAT_TTL: Duration = Duration::from_secs(1);
+
+type PreviewKey = (ImageKey, u16, u16);
+
+/// Image previews: terminal graphics protocol and cached renderings, keyed by
+/// file version and size in cells.
 pub(crate) struct Images {
     pub picker: Option<Picker>,
-    pub halfblocks: HashMap<(String, u16), Vec<ratatui::text::Line<'static>>>,
-    pub protos: HashMap<(String, u16, u16), Protocol>,
-    pub cells: HashMap<(String, u16, u16), (u16, u16)>,
-    pub blits: Vec<crate::preview::GraphicBlit>,
-    pub last_blits: Vec<crate::preview::GraphicBlit>,
+    /// Recent stats by path, and the transcript length they were taken at.
+    keys: HashMap<PathBuf, (Instant, ImageKey)>,
+    keys_rows: usize,
+    /// Header-only sizes; `None` = not a readable image.
+    dims: HashMap<ImageKey, Option<(u32, u32)>>,
+    halfblocks: Lru<PreviewKey, Vec<ratatui::text::Line<'static>>>,
+    graphics: Lru<PreviewKey, Option<Graphic>>,
+    pub blits: Vec<GraphicBlit>,
+    pub last_blits: Vec<GraphicBlit>,
+    pub placements: Vec<Placement>,
+    /// Cell size the tty last reported, to notice a font zoom on resize.
+    pub cell_px: Option<FontSize>,
+    resized_at: Option<Instant>,
+    /// A preview was put off during a resize; repaint once it settles.
+    redraw_pending: bool,
+    frame: u64,
 }
 
 impl Images {
     pub fn new(picker: Option<Picker>) -> Self {
         Self {
             picker,
-            halfblocks: HashMap::new(),
-            protos: HashMap::new(),
-            cells: HashMap::new(),
+            keys: HashMap::new(),
+            keys_rows: 0,
+            dims: HashMap::new(),
+            halfblocks: Lru::new(HALFBLOCK_BUDGET),
+            graphics: Lru::new(GRAPHICS_BUDGET),
             blits: Vec::new(),
             last_blits: Vec::new(),
+            placements: Vec::new(),
+            cell_px: None,
+            resized_at: None,
+            redraw_pending: false,
+            frame: 0,
         }
     }
 
+    pub fn uses_graphics(&self) -> bool {
+        self.picker.as_ref().is_some_and(crate::preview::uses_graphics)
+    }
+
+    /// The file at `path` as it is now, stat()ed at most once per `STAT_TTL`.
+    pub fn key(&mut self, path: PathBuf) -> ImageKey {
+        if let Some((at, key)) = self.keys.get(&path) {
+            if at.elapsed() < STAT_TTL {
+                return key.clone();
+            }
+        }
+        if self.keys.len() >= 4096 {
+            self.keys.clear();
+        }
+        let key = ImageKey::of(path.clone());
+        self.keys.insert(path, (Instant::now(), key.clone()));
+        key
+    }
+
+    /// Stat again once the transcript changes length: a new row may show a
+    /// file rewritten under the same name since the last stat.
+    pub fn sync_rows(&mut self, rows: usize) {
+        if rows != self.keys_rows {
+            self.keys_rows = rows;
+            self.keys.clear();
+        }
+    }
+
+    fn dims(&mut self, key: &ImageKey) -> Option<(u32, u32)> {
+        if let Some(dims) = self.dims.get(key) {
+            return *dims;
+        }
+        if self.dims.len() >= 4096 {
+            self.dims.clear();
+        }
+        let dims = crate::vision::image_dimensions(&key.path).ok();
+        self.dims.insert(key.clone(), dims);
+        dims
+    }
+
+    /// Cells a picture takes, read from the file header only: a chat
+    /// thumbnail (`thumb`, capped) or the viewer (fit to the bounds).
+    pub fn cells(&mut self, key: &ImageKey, max_cols: u16, max_rows: u16, thumb: bool) -> (u16, u16) {
+        use crate::preview::{cell_size_fit, cell_size_for, halfblock_size, MAX_COLS, MAX_ROWS};
+        let dims = self.dims(key);
+        match self.picker.as_ref().filter(|p| crate::preview::uses_graphics(p)) {
+            Some(p) if thumb => cell_size_for(p, dims, max_cols, max_rows),
+            Some(p) => cell_size_fit(p, dims, max_cols, max_rows),
+            None if thumb => halfblock_size(dims, max_cols.min(MAX_COLS).max(4), max_rows.min(MAX_ROWS)),
+            None => halfblock_size(dims, max_cols, max_rows),
+        }
+    }
+
+    /// The encoded picture for `w`×`h` cells; `None` if it cannot be decoded.
+    pub fn graphic(&mut self, key: &ImageKey, w: u16, h: u16) -> Option<Graphic> {
+        let k = (key.clone(), w, h);
+        if let Some(g) = self.graphics.get(&k, self.frame) {
+            return g.clone();
+        }
+        let picker = self.picker.as_ref()?;
+        let g = crate::preview::graphic_for(picker, &key.path, w, h);
+        let bytes = g.as_ref().map_or(0, |g| g.bytes(picker.font_size()));
+        self.graphics.insert(k, g.clone(), bytes, self.frame);
+        g
+    }
+
+    /// Half-block lines filling at most `w`×`h` cells.
+    pub fn halfblock(&mut self, key: &ImageKey, w: u16, h: u16) -> &[ratatui::text::Line<'static>] {
+        let k = (key.clone(), w, h);
+        if !self.halfblocks.contains(&k) {
+            let lines = crate::preview::from_path(&key.path, w, h);
+            let bytes = lines
+                .iter()
+                .map(|l| std::mem::size_of_val(l) + l.spans.len() * std::mem::size_of::<ratatui::text::Span>())
+                .sum();
+            self.halfblocks.insert(k.clone(), lines, bytes, self.frame);
+        }
+        self.halfblocks.get(&k, self.frame).map_or(&[], Vec::as_slice)
+    }
+
+    /// Right after a resize, put off a preview that is not cached yet;
+    /// `true` = draw a placeholder this frame.
+    pub fn defer(&mut self, key: &ImageKey, w: u16, h: u16) -> bool {
+        let k = (key.clone(), w, h);
+        let cached = if self.uses_graphics() { self.graphics.contains(&k) } else { self.halfblocks.contains(&k) };
+        let wait = self.settling() && !cached;
+        self.redraw_pending |= wait;
+        wait
+    }
+
+    fn settling(&self) -> bool {
+        self.resized_at.is_some_and(|t| t.elapsed() < RESIZE_SETTLE)
+    }
+
+    /// A put-off preview can be drawn now.
+    pub fn redraw_due(&mut self) -> bool {
+        let due = self.redraw_pending && !self.settling();
+        if due {
+            self.redraw_pending = false;
+        }
+        due
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        self.blits.clear();
+        self.placements.clear();
+    }
+
+    /// After the overlays: drop covered graphics, place the Kitty ones, and
+    /// trim the caches to what recent frames drew.
+    pub fn finish_frame(&mut self, buf: &mut Buffer) {
+        crate::preview::reveal_obscured_graphics(buf, &mut self.blits);
+        crate::preview::place_graphics(buf, &self.placements);
+        self.graphics.trim(self.frame);
+        self.halfblocks.trim(self.frame);
+    }
+
+    /// The terminal was resized and ratatui erased the screen, so graphics
+    /// written outside its diff must be sent again. A font zoom resizes too:
+    /// if the tty reports a new cell size, encode at that size from now on.
+    pub fn resized(&mut self, cell: Option<FontSize>) {
+        self.last_blits.clear();
+        self.resized_at = Some(Instant::now());
+        let Some(cell) = cell.filter(|c| Some(*c) != self.cell_px) else {
+            return;
+        };
+        self.cell_px = Some(cell);
+        if let Some(p) = self.picker.as_mut().filter(|p| crate::preview::uses_graphics(p) && p.font_size() != cell) {
+            *p = crate::preview::with_cell(p, cell);
+            self.graphics.clear();
+        }
+    }
+
+    /// The tty reports a new cell size on the same grid: a font zoom in a
+    /// terminal that resizes its window to keep the columns and rows (WezTerm,
+    /// iTerm2). ratatui erased nothing, so pictures drawn in pixels must be
+    /// cleared and drawn again at the new size.
+    pub fn font_zoomed(&self, cell: Option<FontSize>) -> bool {
+        self.uses_graphics() && cell.is_some_and(|c| Some(c) != self.cell_px)
+    }
+
+    /// A session switch repaints everything. Decoded previews stay: they are
+    /// keyed by absolute path and file version.
     pub fn clear(&mut self) {
-        self.halfblocks.clear();
-        self.protos.clear();
-        self.cells.clear();
+        self.keys.clear();
         self.blits.clear();
         self.last_blits.clear();
+        self.placements.clear();
+    }
+}
+
+#[cfg(test)]
+mod images_tests {
+    use super::*;
+    use ratatui_image::picker::ProtocolType;
+
+    fn picker(proto: ProtocolType, cell: FontSize) -> Picker {
+        let mut p = Picker::from_fontsize(cell);
+        p.set_protocol_type(proto);
+        p
+    }
+
+    fn save(path: &std::path::Path, w: u32, h: u32, rgb: [u8; 3]) {
+        image::RgbImage::from_pixel(w, h, image::Rgb(rgb)).save(path).unwrap();
+    }
+
+    #[test]
+    fn lru_drops_the_least_recently_drawn_but_not_this_frame() {
+        let mut lru: Lru<&str, ()> = Lru::new(100);
+        lru.insert("a", (), 60, 1);
+        lru.insert("b", (), 60, 2);
+        lru.insert("c", (), 60, 3);
+        lru.get(&"a", 3);
+        lru.trim(3);
+        assert!(lru.contains(&"a") && lru.contains(&"c") && !lru.contains(&"b"));
+        lru.insert("d", (), 500, 4);
+        lru.get(&"c", 4);
+        lru.trim(4);
+        assert!(lru.contains(&"c") && lru.contains(&"d"), "what is on screen stays, even over budget");
+        assert!(!lru.contains(&"a"));
+        assert_eq!(lru.bytes, 560);
+    }
+
+    #[test]
+    fn a_rewritten_file_is_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plot.png");
+        save(&path, 10, 10, [255, 0, 0]);
+        let before = ImageKey::of(path.clone());
+        save(&path, 20, 10, [0, 0, 255]);
+        assert_ne!(ImageKey::of(path), before);
+    }
+
+    #[test]
+    fn halfblocks_decode_once_and_outlive_a_session_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        save(&path, 16, 16, [255, 0, 0]);
+        let key = ImageKey::of(path.clone());
+        let mut images = Images::new(None);
+        let first = images.halfblock(&key, 8, 4).to_vec();
+        assert!(!first[0].spans[0].content.contains("無法預覽"));
+        // Same length and mtime, unreadable content: only a cache hit still draws it.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        assert_eq!(ImageKey::of(path), key);
+        images.clear();
+        assert_eq!(images.halfblock(&key, 8, 4), first.as_slice());
+    }
+
+    #[test]
+    fn a_resize_resends_blits_and_follows_a_font_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        save(&path, 64, 64, [0, 200, 0]);
+        let key = ImageKey::of(path);
+        let mut images = Images::new(Some(picker(ProtocolType::Sixel, (10, 20))));
+        images.cell_px = Some((10, 20));
+        let blit = GraphicBlit { x: 1, y: 1, width: 4, height: 2, data: "\x1bPq$".into() };
+        images.last_blits = vec![blit];
+        images.resized(Some((10, 20)));
+        assert!(images.last_blits.is_empty(), "ratatui erased the screen; send the pictures again");
+        let before = images.cells(&key, 56, 12, true);
+        assert!(images.graphic(&key, before.0, before.1).is_some());
+        images.resized(Some((8, 16)));
+        assert_eq!(images.picker.as_ref().unwrap().font_size(), (8, 16));
+        assert_eq!(images.picker.as_ref().unwrap().protocol_type(), ProtocolType::Sixel);
+        assert!(!images.graphics.contains(&(key.clone(), before.0, before.1)), "encoded at the old size");
+        assert_ne!(images.cells(&key, 56, 12, true), before);
+
+        let mut plain = Images::new(Some(picker(ProtocolType::Halfblocks, (10, 20))));
+        plain.resized(Some((8, 16)));
+        assert_eq!(plain.picker.as_ref().unwrap().font_size(), (10, 20), "half-blocks do not care");
+    }
+
+    #[test]
+    fn the_viewer_waits_for_a_resize_to_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        save(&path, 64, 64, [0, 200, 0]);
+        let key = ImageKey::of(path);
+        let mut images = Images::new(Some(picker(ProtocolType::Kitty, (10, 20))));
+        assert!(!images.defer(&key, 6, 3), "no resize, no wait");
+        images.resized(None);
+        assert!(images.defer(&key, 6, 3));
+        assert!(!images.redraw_due(), "still dragging");
+        images.resized_at = Some(Instant::now() - RESIZE_SETTLE * 2);
+        assert!(images.redraw_due());
+        assert!(!images.redraw_due(), "one repaint");
+        assert!(!images.defer(&key, 6, 3));
+    }
+
+    #[test]
+    fn a_stat_serves_frames_until_a_new_row_or_it_ages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plot.png");
+        save(&path, 10, 10, [255, 0, 0]);
+        let mut images = Images::new(None);
+        images.sync_rows(3);
+        let first = images.key(path.clone());
+        save(&path, 20, 10, [0, 0, 255]);
+        images.sync_rows(3);
+        assert_eq!(images.key(path.clone()), first, "the frames that follow reuse the stat");
+        // The chart was regenerated and read again: a new row.
+        images.sync_rows(4);
+        let second = images.key(path.clone());
+        assert_ne!(second, first);
+        assert_eq!(second, ImageKey::of(path.clone()));
+        save(&path, 30, 10, [0, 255, 0]);
+        images.keys.get_mut(&path).unwrap().0 -= STAT_TTL;
+        assert_ne!(images.key(path), second, "an old stat is taken again");
+    }
+
+    #[test]
+    fn a_font_zoom_on_the_same_grid_is_noticed() {
+        let mut images = Images::new(Some(picker(ProtocolType::Iterm2, (10, 20))));
+        images.cell_px = Some((10, 20));
+        assert!(!images.font_zoomed(Some((10, 20))), "a plain resize event");
+        assert!(!images.font_zoomed(None), "no pixel size reported");
+        assert!(images.font_zoomed(Some((8, 16))));
+        images.resized(Some((8, 16)));
+        assert_eq!(images.picker.as_ref().unwrap().font_size(), (8, 16));
+        assert!(!images.font_zoomed(Some((8, 16))), "once");
+        let mut plain = Images::new(Some(picker(ProtocolType::Halfblocks, (10, 20))));
+        plain.cell_px = Some((10, 20));
+        assert!(!plain.font_zoomed(Some((8, 16))), "half-blocks need no repaint");
     }
 }
 
@@ -1078,6 +1472,25 @@ impl App {
     pub fn open_image(&mut self, rel: String) {
         self.cur_mut().view_mut().sel = ChatSel::Image(rel.clone());
         self.ui.image_view = Some(rel);
+    }
+
+    /// The image the viewer shows, when no other overlay is drawn over it.
+    pub fn viewed_image(&self) -> Option<String> {
+        let covered = self.ui.workspace_pick.is_some() || self.cur().ask.is_some() || self.ui.task_ui.is_some();
+        self.ui.image_view.clone().filter(|_| !covered)
+    }
+
+    /// Copy an image to the clipboard, or its path where images do not fit.
+    pub fn copy_image(&mut self, rel: &str) {
+        let abs = self.workspace().join(rel);
+        let msg = if clipboard_set_image(&abs) {
+            "已複製圖片"
+        } else if clipboard_set(rel) {
+            "已複製路徑"
+        } else {
+            "無法複製圖片"
+        };
+        self.flash(msg);
     }
 
     // —— Task mode ——

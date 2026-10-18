@@ -81,6 +81,11 @@ fn key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         return true;
     }
     if ctrl && matches!(code, KeyCode::Char('c' | 'C')) {
+        // The viewer advertises Ctrl+C as copy: never another selection, never quit.
+        if let Some(rel) = app.viewed_image() {
+            app.copy_image(&rel);
+            return false;
+        }
         if app.copy_selection() {
             return false;
         }
