@@ -475,7 +475,7 @@ impl ClientTool for RunBackgroundTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_background".into(),
-            description: format!("Start a workspace shell command in the background and return immediately. {} Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command. If the command will open a GUI, set window to a short label; the result includes that window's pid so screenshot can target it.", crate::shellrt::describe()),
+            description: format!("Start a workspace shell command in the background and return immediately. {} Use for servers, watchers, and other long-running programs. Inspect with read_background; stop with kill_background. When the process exits, you receive a system notice and are called again. Do not use this for short commands — use run_command. If the command will open a GUI, set window to a short label and pass the same name to screenshot (for a browser window, name rather than pid: its pid is the whole browser, the user's windows included).", crate::shellrt::describe()),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -483,7 +483,7 @@ impl ClientTool for RunBackgroundTool {
                     "shell": {"type": "string", "enum": ["bash", "cmd", "powershell"], "description": "Shell to run in. Default bash; use cmd/powershell only for Windows-native commands."},
                     "name": {"type": "string", "description": "Optional process name (ascii, dash, underscore)"},
                     "cwd": {"type": "string", "description": "Optional subdirectory inside the workspace"},
-                    "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result includes windows[].pid; pass the same name to screenshot."}
+                    "window": {"type": "string", "description": "If this command opens a GUI, a short name (ascii, dash, underscore). Result lists the windows bound to it; pass the same name to screenshot."}
                 },
                 "required": ["command"],
                 "additionalProperties": false

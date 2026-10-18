@@ -193,7 +193,14 @@ pub(crate) enum Row {
     Think(Think),
     Meta(String),
     Err(String),
-    Picture { path: String, label: String },
+    /// `source`: the file the model was shown a copy of (`path`), when the
+    /// two differ: the viewer opens it at full size.
+    Picture {
+        path: String,
+        label: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        source: String,
+    },
 }
 
 impl Row {
@@ -253,8 +260,9 @@ pub(crate) fn tool_phase(name: &str, output: &str) -> &'static str {
     }
 }
 
-/// An image the model asked to look at: `(path, label)` for a picture row.
-pub(crate) fn picture_from_tool(name: &str, output: &str) -> Option<(String, String)> {
+/// An image the model asked to look at: `(path, label, source)` for a
+/// picture row.
+pub(crate) fn picture_from_tool(name: &str, output: &str) -> Option<(String, String, String)> {
     let v: Value = serde_json::from_str(output).ok()?;
     if v.get("attach_image").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -263,7 +271,33 @@ pub(crate) fn picture_from_tool(name: &str, output: &str) -> Option<(String, Str
     if path.is_empty() {
         return None;
     }
-    Some((path.clone(), format!("模型在看  {name}  {path}")))
+    let mut label = format!("模型在看  {name}  {path}");
+    if let Some(r) = v.get("region") {
+        label.push_str(&format!("  區域 {},{} {}×{}", r["x"], r["y"], r["width"], r["height"]));
+    }
+    // read_image's prepared copy: it keeps showing what the model saw even
+    // after the file at `path` is overwritten.
+    match v.get("view").and_then(Value::as_str).filter(|s| !s.is_empty() && *s != path) {
+        Some(shown) => Some((shown.to_string(), label, path)),
+        None => Some((path, label, String::new())),
+    }
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn picture_rows_show_the_copy_the_model_was_sent() {
+        let out = r#"{"attach_image":true,"path":"page.png","view":".groka/seen/ab.jpg","region":{"x":0,"y":1280,"width":640,"height":1280}}"#;
+        let (path, label, source) = picture_from_tool("read_image", out).unwrap();
+        assert_eq!(path, ".groka/seen/ab.jpg");
+        assert_eq!(label, "模型在看  read_image  page.png  區域 0,1280 640×1280");
+        assert_eq!(source, "page.png", "the viewer can open the original");
+        let (path, label, source) = picture_from_tool("screenshot", r#"{"attach_image":true,"path":"s.jpg"}"#).unwrap();
+        assert_eq!((path.as_str(), label.as_str(), source.as_str()), ("s.jpg", "模型在看  screenshot  s.jpg", ""));
+        assert!(picture_from_tool("read_image", r#"{"attach_image":false,"path":"a.png"}"#).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +322,7 @@ mod tests {
         assert!(matches!(&rows[1], Row::User(u) if u.images == ["a.png"]));
         assert!(matches!(&rows[3], Row::Agent(a) if a.work_ms == 1200));
         assert!(matches!(&rows[4], Row::Tools(g) if g.calls[0].call_id.is_empty()));
+        assert!(matches!(&rows[8], Row::Picture { source, .. } if source.is_empty()));
     }
 
     #[test]

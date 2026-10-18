@@ -7,6 +7,7 @@ use ratatui::Frame;
 
 use super::{boxed_edit, line};
 use crate::tui::app::{App, Focus, Hit};
+use crate::tui::edit::display_cols;
 use crate::tui::settings::{CatalogStatus, DropKind, Field, LoginUi};
 use crate::tui::theme::*;
 
@@ -80,7 +81,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
     let mut y = area.y + 1;
     let mut caret = None;
     let mut drop_anchor = None;
-    let bottom = area.bottom();
+    // The web link keeps the last row however short the terminal: the
+    // status bar points here when it has no room for it.
+    let link_row = app.web.url.as_ref().map(|_| area.bottom().saturating_sub(1)).filter(|r| *r > area.y);
+    let bottom = link_row.unwrap_or(area.bottom());
 
     line(f, Rect::new(x, y, w, 1), "設定  · Tab 下一欄 · Enter/空白 切換或開啟 · Esc 關閉分頁", Style::default().fg(DIM));
     y += 2;
@@ -236,8 +240,11 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         let foc = focused && field == Field::Skills;
         line(f, Rect::new(x, y, w, 1), "技能（空白鍵 開/關 · Enter 查看）", focus_style(foc));
         y += 1;
-        let list = Rect::new(x, y, w, bottom.saturating_sub(y + 1));
+        let list = Rect::new(x, y, w, bottom.saturating_sub(y + u16::from(link_row.is_none())));
         skills(f, app, list, foc);
+    }
+    if let Some(r) = link_row {
+        web_link(f, app, Rect::new(x, r, w, 1));
     }
 
     if let (Some(kind), Some(anchor)) = (app.settings.drop, drop_anchor) {
@@ -247,6 +254,20 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         return None;
     }
     caret
+}
+
+/// The web workbench's current link, for terminals too narrow for the status
+/// bar to show it. Never clipped: a cut one-time code opens nothing.
+fn web_link(f: &mut Frame, app: &App, r: Rect) {
+    let Some(url) = &app.web.url else {
+        return;
+    };
+    let full = format!("網頁界面  {url}  · 每個網址只能用一次");
+    let text = [full.as_str(), url.as_str()]
+        .into_iter()
+        .find(|t| display_cols(t) <= r.width)
+        .unwrap_or("網頁界面  視窗太窄，放寬後顯示網址");
+    line(f, r, text, Style::default().fg(DIM));
 }
 
 /// How search reaches the current model: Grok's own tools, or `grok_search`.

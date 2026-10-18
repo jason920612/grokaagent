@@ -326,33 +326,30 @@ pub(crate) fn is_paste_key(code: KeyCode, mods: KeyModifiers) -> bool {
     }
 }
 
+// Through the session's one clipboard handle: on X11 a copy made with a
+// handle that is dropped right away is gone again.
 pub(crate) fn clipboard_set(s: &str) -> bool {
-    arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.set_text(s.to_string()).ok())
-        .is_some()
+    crate::clipimg::with_clipboard(|c| c.set_text(s.to_string()).ok()).is_some()
 }
 
 pub(crate) fn clipboard_get() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get_text().ok()
+    crate::clipimg::with_clipboard(|c| c.get_text().ok())
 }
 
 pub(crate) fn clipboard_set_image(path: &std::path::Path) -> bool {
-    let Ok(img) = image::open(path) else {
+    let Ok(img) = crate::vision::open_image(path) else {
         return false;
     };
     let rgba = img.to_rgba8();
-    arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| {
-            c.set_image(arboard::ImageData {
-                width: rgba.width() as usize,
-                height: rgba.height() as usize,
-                bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-            })
-            .ok()
+    crate::clipimg::with_clipboard(|c| {
+        c.set_image(arboard::ImageData {
+            width: rgba.width() as usize,
+            height: rgba.height() as usize,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
         })
-        .is_some()
+        .ok()
+    })
+    .is_some()
 }
 
 #[cfg(test)]

@@ -364,12 +364,22 @@ pre, code { font-family: var(--mono); font-size: 12.5px; }
 .diff-hunk { color: var(--hunk); }
 .diff-file { color: var(--muted); font-weight: 600; }
 .pics { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.pic { padding: 0; border: 0; border-radius: 4px; background: none; cursor: zoom-in; }
+.pic:disabled { cursor: default; }
 .pics img {
+  display: block;
   max-width: 220px;
   max-height: 160px;
   border-radius: 4px;
   border: 1px solid var(--line);
-  cursor: zoom-in;
+}
+.pic-missing {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* —— Composer —— */
@@ -387,6 +397,8 @@ pre, code { font-family: var(--mono); font-size: 12.5px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.pending-pic { display: inline-flex; align-items: center; gap: 6px; padding-left: 3px; }
+.pending-pic img { width: 28px; height: 20px; object-fit: cover; border-radius: 3px; }
 #composer-wrap { flex: none; padding: 8px 20px 12px; }
 #composer-shell {
   max-width: var(--chat-max);
@@ -550,7 +562,13 @@ button.sb:hover { background: rgba(255, 255, 255, 0.12); }
 }
 #overlay.centered .modal { max-height: 88vh; border: 1px solid var(--line); border-radius: 6px; }
 .modal.lightbox { width: auto; max-width: 94vw; padding: 8px; background: var(--bg); }
-.modal.lightbox img { display: block; max-width: 90vw; max-height: 80vh; }
+.lightbox-head { display: flex; align-items: baseline; gap: 12px; padding: 0 4px 6px; }
+.modal .lightbox-head h2 { margin: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lightbox-head a { flex: none; margin-left: auto; color: var(--accent); font-size: 12px; }
+.lightbox-frame { max-width: 90vw; max-height: 72vh; overflow: auto; }
+.lightbox-frame img { display: block; max-width: 90vw; max-height: 72vh; cursor: zoom-in; }
+.modal.lightbox.actual .lightbox-frame img { max-width: none; max-height: none; cursor: zoom-out; }
+.modal.lightbox .row-btns { margin-top: 8px; }
 .modal h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .modal textarea, .modal input[type="text"], .modal input[type="password"], .modal select {
   width: 100%;
@@ -570,6 +588,7 @@ button.sb:hover { background: rgba(255, 255, 255, 0.12); }
 }
 .modal .row-btns { display: flex; justify-content: flex-end; gap: 6px; margin-top: 14px; }
 .modal .row-btns button:last-child { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.modal .row-btns button.danger { margin-right: auto; border-color: var(--warn); color: var(--warn); }
 .field { margin: 10px 0; }
 .field label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
 .seg { display: flex; gap: 0; }

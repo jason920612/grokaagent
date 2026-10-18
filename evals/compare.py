@@ -60,6 +60,7 @@ def collect(root: Path) -> dict:
         ev = rf.parent / "events.jsonl"
         if not ev.exists():
             continue
+        finished = set()
         for line in ev.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 e = json.loads(line)
@@ -67,6 +68,11 @@ def collect(root: Path) -> dict:
                 continue
             if e.get("type") != "tool_finished":
                 continue
+            # A result is re-reported when its pixels never reached the model.
+            call = (e.get("agent_path"), e.get("agent_name"), e.get("call_id"))
+            if call in finished:
+                continue
+            finished.add(call)
             name, out = e.get("name"), e.get("output", "")
             err = out.startswith('{"error"')
             m["tools"] += 1

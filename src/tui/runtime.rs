@@ -46,6 +46,7 @@ pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).map_err(Error::Io)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out)).map_err(Error::Io)?;
     let result = tui_loop(&mut terminal, opts).await;
+    crate::clipimg::release_clipboard();
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
     result
@@ -78,6 +79,7 @@ fn boot_app(terminal: &Term, mut opts: TuiOptions, rt: Rt) -> Result<App> {
     })));
     let picker = Some(crate::preview::detect_picker());
     let mut app = App::new(opts, store, boot, settings, skills, rt, picker);
+    app.images.cell_px = crate::preview::winsize_cell();
     app.ui.side_open = terminal.size().map(|s| s.width >= SIDEBAR_MIN_TERM).unwrap_or(true);
     app.settings.catalog.ensure_current(&app.opts.model, app.opts.reasoning_effort);
     app.rebuild_catalog();
@@ -115,18 +117,27 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
     };
     if let Some(h) = &hub {
         app.web.url = Some(h.url.clone());
-        app.cur_mut().chat.push(Row::meta(format!("網頁界面  {}", h.url)));
+        // The transcript is saved: the one-time code stays in the status bar
+        // and the settings tab.
+        app.cur_mut().chat.push(Row::meta(format!(
+            "網頁界面  {} · 用狀態列或設定分頁的網址開啟，每個網址只能用一次",
+            h.origin
+        )));
     }
 
     let (cat_tx, mut cat_rx) = mpsc::unbounded_channel();
     let (custom_tx, mut custom_rx) = mpsc::unbounded_channel();
     let (login_tx, mut login_rx) = mpsc::unbounded_channel();
     let mut keys = EventStream::new();
+    let mut burst = input::PasteBurst::default();
     let mut paint = Painter::default();
     let mut last_persist = Instant::now();
     let mut last_size = terminal.size().map_err(Error::Io)?;
 
     loop {
+        if cfg!(windows) {
+            burst.woke(Instant::now());
+        }
         while let Ok(ev) = ev_rx.try_recv() {
             app.route_event(ev);
             paint.content = true;
@@ -171,7 +182,24 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
             last_size = size;
             paint.all();
         }
+        if app.images.redraw_due() {
+            paint.content = true;
+        }
+        if cfg!(windows) {
+            // A typed line's Enter, held for a paste that did not go on.
+            let late = burst.expired(Instant::now());
+            if !late.is_empty() {
+                paint.all();
+                app.web.composer_seq = app.web.composer_seq.saturating_add(1);
+                if late.into_iter().any(|ev| input::handle(&mut app, ev)) {
+                    break;
+                }
+            }
+        }
         paint.frame(terminal, &mut app)?;
+        if cfg!(windows) {
+            burst.waiting(Instant::now());
+        }
 
         tokio::select! {
             maybe = keys.next() => {
@@ -180,7 +208,12 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
                 while let Some(Some(Ok(ev))) = keys.next().now_or_never() {
                     batch.push(ev);
                 }
-                let batch = input::coalesce_ime_enter(batch);
+                // crossterm reports no Event::Paste on Windows: pastes and drops arrive as keys.
+                let batch = if cfg!(windows) {
+                    burst.read(batch, Instant::now())
+                } else {
+                    input::coalesce_ime_enter(batch)
+                };
                 if batch.is_empty() {
                     continue;
                 }
@@ -316,7 +349,18 @@ impl Painter {
     }
 
     fn full(&mut self, terminal: &mut Term, app: &mut App, freeze: bool) -> Result<()> {
+        let before = terminal.get_frame().area();
         terminal.autoresize().map_err(Error::Io)?;
+        let grid = terminal.get_frame().area() != before;
+        // One ioctl per paint: a font zoom may change only the pixel size.
+        let cell = if grid || app.images.uses_graphics() { crate::preview::winsize_cell() } else { None };
+        if grid || app.images.font_zoomed(cell) {
+            if !grid {
+                terminal.clear().map_err(Error::Io)?;
+            }
+            // ratatui cleared the screen, Sixel / iTerm2 pictures included.
+            app.images.resized(cell);
+        }
         let caret = {
             let mut frame = terminal.get_frame();
             ui::draw(&mut frame, app, freeze)

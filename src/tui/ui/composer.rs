@@ -36,7 +36,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Position {
     let right = inner.right();
     let (queue_len, running, editing, pending) = {
         let s = app.cur();
-        (s.queue.len(), s.chat.running, s.queue_edit, s.pending.clone())
+        (s.queue.len(), s.chat.running, s.queue_edit, s.pending.len())
     };
     let mut y = inner.y;
 
@@ -93,14 +93,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Position {
         y += 1;
     }
 
-    // Attachments.
-    if !pending.is_empty() {
+    // Attachments: numbered chips (inbox file names are long and say
+    // nothing); chips that do not fit are counted, never silently hidden.
+    if pending > 0 {
         let mut x = inner.x;
-        for (i, rel) in pending.iter().enumerate() {
-            let name = std::path::Path::new(rel).file_name().and_then(|s| s.to_str()).unwrap_or(rel);
-            let label = format!(" {name} × ");
+        for i in 0..pending {
+            let label = format!(" 圖{} × ", i + 1);
             let w = display_cols(&label);
-            if x + w > right {
+            // Keep room for the "+N" of the chips after this one.
+            let reserve = if i + 1 < pending { 3 } else { 0 };
+            if x + w + reserve > right {
+                let more = format!("+{}", pending - i);
+                line(f, Rect::new(x, y, right.saturating_sub(x), 1), more, Style::default().fg(ACCENT));
                 break;
             }
             let r = Rect::new(x, y, w, 1);

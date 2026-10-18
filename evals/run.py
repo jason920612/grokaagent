@@ -125,6 +125,7 @@ def event_metrics(events: Path) -> dict:
     }
     if not events.exists():
         return m
+    finished = set()
     for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             e = json.loads(line)
@@ -136,6 +137,11 @@ def event_metrics(events: Path) -> dict:
             m["turns"] += 1
             m["root_turns"] += int(root)
         elif typ == "tool_finished":
+            # A result is re-reported when its pixels never reached the model.
+            call = (e.get("agent_path"), e.get("agent_name"), e.get("call_id"))
+            if call in finished:
+                continue
+            finished.add(call)
             name = e.get("name", "?")
             m["tool_calls"] += 1
             m["tools"][name] = m["tools"].get(name, 0) + 1

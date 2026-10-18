@@ -29,7 +29,7 @@ futures = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ratatui = "0.29"
 arboard = "3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp"] }
 xcap = "0.7"
 ratatui-image = { version = "8.0.2", default-features = false, features = ["crossterm"] }
 
