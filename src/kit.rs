@@ -174,27 +174,16 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     if let Ok(auth_path) = crate::auth::default_auth_path() {
         tools.push(Box::new(crate::grok_search::GrokSearchTool::new(auth_path)));
     }
-    if let Some(ask_hub) = spec.ask {
-        // Only an agent the user can answer may ask for more folders;
-        // children ask their parent instead.
-        tools.push(Box::new(crate::grants::RequestAccessTool::new(
-            ask_hub.clone(),
-            tee.clone(),
-            spec.workspace.clone(),
-            spec.agent_name.clone(),
-            run_id.clone(),
-            spec.parent_run_id.clone(),
-        )));
-        tools.push(Box::new(AskUserTool::new(
-            ask_hub,
-            tee.clone(),
-            spec.agent_name.clone(),
-            run_id.clone(),
-            spec.parent_run_id.clone(),
-        )));
+    if let Some(ask_hub) = spec.ask.clone() {
+        tools.extend(ask_tools(provider, &spec, ask_hub, tee.clone(), &run_id));
     }
     if let Some(task) = spec.task.clone() {
-        tools.push(Box::new(crate::task::TaskReportTool::new(task)));
+        // The proxy's intake questions use the same questionnaire; without
+        // one (headless) there is no intake.
+        task.set_ask_hub(spec.ask.clone());
+        tools.push(Box::new(
+            crate::task::TaskReportTool::new(task).with_events(tee.clone(), run_id.clone()),
+        ));
     }
     let nursery = if spec.depth < DEFAULT_MAX_DEPTH {
         let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grokaagent"));
@@ -290,6 +279,128 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     out
 }
 
+/// The tools that ask the human. Only an agent the user can answer may ask
+/// for more folders; children ask their parent instead. In task mode
+/// ask_user first lets the user's proxy answer what the user's own words
+/// settle; request_workspace_access always goes to the human.
+fn ask_tools<P: Provider + Clone + 'static>(
+    provider: &P,
+    spec: &KernelSpec,
+    ask_hub: AskUserHub,
+    sink: Arc<dyn EventSink>,
+    run_id: &str,
+) -> Vec<Box<dyn crate::tools::ClientTool>> {
+    let access = crate::grants::RequestAccessTool::new(
+        ask_hub.clone(),
+        sink.clone(),
+        spec.workspace.clone(),
+        spec.agent_name.clone(),
+        run_id.to_string(),
+        spec.parent_run_id.clone(),
+    );
+    let mut ask = AskUserTool::new(
+        ask_hub,
+        sink.clone(),
+        spec.agent_name.clone(),
+        run_id.to_string(),
+        spec.parent_run_id.clone(),
+    );
+    if let Some(task) = &spec.task {
+        ask = ask.with_delegate(Arc::new(crate::task::ProxyAsk::new(
+            task.clone(),
+            provider.clone(),
+            spec.knobs.clone(),
+            spec.model.clone(),
+            spec.reasoning_effort,
+            spec.workspace.clone(),
+            sink,
+            run_id.to_string(),
+        )));
+    }
+    vec![Box::new(access), Box::new(ask)]
+}
+
+/// Drives a headless task-mode run: prints what the user's proxy says to
+/// stderr, sends `--then` messages each time the agent waits, and closes
+/// the inbox once nothing is left to push (the task ended, paused or is
+/// winding down, the turn cap was hit, or the pokes ran out), which ends
+/// the run.
+pub struct TaskDriver {
+    inner: Arc<dyn EventSink>,
+    hub: Arc<crate::task::TaskHub>,
+    queue: Mutex<std::collections::VecDeque<String>>,
+    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::agent::UserTurn>>>,
+    capped: std::sync::atomic::AtomicBool,
+    /// Review requests sent while the proxy could speak but the agent
+    /// waited (its requests kept failing), since the agent last answered.
+    pokes: std::sync::atomic::AtomicU32,
+}
+
+impl TaskDriver {
+    /// Review requests per stretch in which the agent never answered.
+    pub const MAX_POKES: u32 = 2;
+
+    pub fn new(
+        inner: Arc<dyn EventSink>,
+        hub: Arc<crate::task::TaskHub>,
+        messages: Vec<String>,
+    ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<crate::agent::UserTurn>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let me = Arc::new(Self {
+            inner,
+            hub,
+            queue: Mutex::new(messages.into()),
+            tx: Mutex::new(Some(tx)),
+            capped: Default::default(),
+            pokes: Default::default(),
+        });
+        (me, rx)
+    }
+}
+
+impl EventSink for TaskDriver {
+    fn emit(&self, event: &crate::events::AgentEvent) {
+        use crate::events::AgentEvent;
+        use std::sync::atomic::Ordering;
+        self.inner.emit(event);
+        let meta = event.meta();
+        if meta.parent_run_id.is_some() || !meta.path.is_empty() {
+            return;
+        }
+        match event {
+            AgentEvent::TaskProxy { intent, text, .. } => {
+                eprintln!("[user-proxy {intent}] {text}");
+            }
+            // The agent answered: a later stall gets its pokes again. A
+            // proxy message alone does not count, or an agent whose
+            // requests keep failing would be pushed forever.
+            AgentEvent::ModelFinished { .. } => {
+                self.pokes.store(0, Ordering::SeqCst);
+            }
+            AgentEvent::Error { message, .. } if message.starts_with("max turns (") => {
+                self.capped.store(true, Ordering::SeqCst);
+            }
+            AgentEvent::AwaitingInput { .. } => {
+                let next = self.queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                let mut tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+                if let (Some(text), Some(sender)) = (next, tx.as_ref()) {
+                    let _ = sender.send(crate::agent::UserTurn::from(text));
+                    return;
+                }
+                if self.hub.steering_open()
+                    && !self.capped.load(Ordering::SeqCst)
+                    && self.pokes.fetch_add(1, Ordering::SeqCst) < Self::MAX_POKES
+                {
+                    self.hub.request_review();
+                    return;
+                }
+                *tx = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Feeds scripted follow-up messages to a headless run: each time the root
 /// agent waits for input, the next message is sent; after the last one the
 /// inbox closes and the run ends.
@@ -335,4 +446,325 @@ pub fn events_dir(events_file: &Path) -> PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::AgentEvent;
+    use crate::provider::{CompactRequest, CompactResponse, CompleteRequest, CompleteResponse};
+    use serde_json::json;
+
+    struct Rec(Mutex<Vec<AgentEvent>>);
+    impl EventSink for Rec {
+        fn emit(&self, e: &AgentEvent) {
+            self.0.lock().unwrap().push(e.clone());
+        }
+    }
+
+    /// A proxy that always leaves the question to the human.
+    struct Forwarding(Mutex<Vec<CompleteRequest>>);
+    impl Provider for Forwarding {
+        async fn complete(&self, req: CompleteRequest) -> crate::error::Result<CompleteResponse> {
+            self.0.lock().unwrap().push(req);
+            Ok(CompleteResponse { text: json!({"forward": true, "why": "not settled"}).to_string(), ..CompleteResponse::new("p") })
+        }
+        async fn compact(&self, _req: CompactRequest) -> crate::error::Result<CompactResponse> {
+            Err(crate::error::Error::Provider("no compact".into()))
+        }
+    }
+
+    fn spec(ws: &Path, task: Option<Arc<crate::task::TaskHub>>, ask: AskUserHub) -> KernelSpec {
+        KernelSpec {
+            agent_name: "root".into(),
+            prompt: "go".into(),
+            model: "grok-4.6".into(),
+            max_turns: 0,
+            workspace: ws.to_path_buf(),
+            events_file: ws.join("events.jsonl"),
+            events_dir: ws.to_path_buf(),
+            server_tools: vec![],
+            search: false,
+            depth: 0,
+            parent_run_id: None,
+            run_id: "r".into(),
+            child_mode: "grok".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            knobs: None,
+            inbox: None,
+            images: vec![],
+            ask: Some(ask),
+            context_window: 0,
+            cancel: None,
+            skills: None,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_access_always_asks_the_human_while_ask_user_consults_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let other = dir.path().join("shared-data");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("parse the shared fixtures");
+        let provider = Arc::new(Forwarding(Mutex::new(Vec::new())));
+        let ask_hub = AskUserHub::new();
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let spec = spec(&ws, Some(hub.clone()), ask_hub.clone());
+        let tools = ask_tools(&provider, &spec, ask_hub.clone(), rec.clone(), "r");
+        let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+        assert_eq!(names, ["request_workspace_access", "ask_user"]);
+
+        ask_hub.answer(json!({"cancelled": false, "selected": [{"id": "deny", "label": "拒絕", "value": null}]}).to_string());
+        let out = tools[0]
+            .call(&json!({"path": other.to_string_lossy(), "reason": "read the shared fixtures for the parser tests"}))
+            .await
+            .unwrap();
+        assert!(out.contains("\"granted\":false"), "{out}");
+        assert!(provider.0.lock().unwrap().is_empty(), "request_workspace_access is never delegated");
+        assert_eq!(rec.0.lock().unwrap().iter().filter(|e| matches!(e, AgentEvent::AskUser { .. })).count(), 1);
+
+        ask_hub.answer(crate::ask::encode_answer(&[crate::ask::Picked { id: "opt0".into(), label: "a".into(), value: None }]));
+        let out = tools[1].call(&json!({"question": "Which one?", "options": ["a", "b"]})).await.unwrap();
+        assert!(!out.contains("answered_by"), "{out}");
+        assert_eq!(provider.0.lock().unwrap().len(), 1, "ask_user asked the proxy first");
+        assert_eq!(rec.0.lock().unwrap().iter().filter(|e| matches!(e, AgentEvent::AskUser { .. })).count(), 2);
+
+        // Without a task, nothing is consulted.
+        let plain = ask_tools(&provider, &self::spec(&ws, None, ask_hub.clone()), ask_hub.clone(), rec.clone(), "r");
+        ask_hub.answer(crate::ask::encode_answer(&[crate::ask::Picked { id: "opt1".into(), label: "b".into(), value: None }]));
+        plain[1].call(&json!({"question": "Which one?", "options": ["a", "b"]})).await.unwrap();
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+    }
+
+    fn wait_event() -> AgentEvent {
+        AgentEvent::AwaitingInput {
+            meta: crate::events::EventMeta {
+                ts: chrono::Utc::now(),
+                agent_name: "root".into(),
+                run_id: "r".into(),
+                parent_run_id: None,
+                path: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_headless_driver_closes_once_the_task_is_over() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("x");
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, mut rx) = TaskDriver::new(rec, hub.clone(), vec!["then this".into()]);
+        // Follow-ups go first.
+        driver.emit(&wait_event());
+        assert_eq!(rx.try_recv().unwrap().text, "then this");
+        // Live but waiting: ask the proxy to look, a couple of times at most.
+        hub.take_review_request();
+        driver.emit(&wait_event());
+        assert!(hub.take_review_request());
+        assert!(rx.try_recv().is_err());
+        driver.emit(&wait_event());
+        driver.emit(&wait_event());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)));
+
+        // A task that ended closes the inbox on the next wait.
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("x");
+        hub.accept_done();
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, mut rx) = TaskDriver::new(rec, hub, vec![]);
+        driver.emit(&wait_event());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn the_headless_driver_stops_poking_what_cannot_move() {
+        use crate::events::EventMeta;
+        let m = || EventMeta { ts: chrono::Utc::now(), agent_name: "root".into(), run_id: "r".into(), parent_run_id: None, path: String::new() };
+        let closed = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::agent::UserTurn>| {
+            matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected))
+        };
+        // Paused, stopped by Esc, winding down after an acceptance: closed
+        // on the first wait, no review requested.
+        for setup in [
+            (|h: &crate::task::TaskHub| h.set_paused(true)) as fn(&crate::task::TaskHub),
+            |h| h.set_skip_steer(true),
+            |h| {
+                h.replace(crate::task::TaskState {
+                    goal: "x".into(),
+                    phase: crate::task::TaskPhase::Active,
+                    ending: Some(crate::task::Ending { phase: crate::task::TaskPhase::Done, reason: "seen".into() }),
+                    ..crate::task::TaskState::default()
+                })
+            },
+        ] {
+            let hub = crate::task::TaskHub::new("");
+            hub.start_goal("x");
+            setup(&hub);
+            hub.take_review_request();
+            let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+            let (driver, mut rx) = TaskDriver::new(rec, hub.clone(), vec![]);
+            driver.emit(&wait_event());
+            assert!(closed(&mut rx));
+            assert!(!hub.take_review_request());
+        }
+        // Pokes come back only once the agent answered again.
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("x");
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, mut rx) = TaskDriver::new(rec, hub.clone(), vec![]);
+        let proxy = AgentEvent::TaskProxy { meta: m(), intent: "push".into(), text: "again".into() };
+        for _ in 0..TaskDriver::MAX_POKES {
+            driver.emit(&wait_event());
+            assert!(hub.take_review_request());
+            driver.emit(&proxy);
+        }
+        driver.emit(&AgentEvent::ModelFinished { meta: m(), text: "ok".into(), finish: "stop".into(), input_tokens: 0, cached_tokens: 0 });
+        driver.emit(&wait_event());
+        assert!(hub.take_review_request());
+        assert!(!closed(&mut rx));
+    }
+
+    /// The user proxy answers from a script (then `proxy_then`, forever);
+    /// the worker from its own, and once that runs out every request
+    /// fails.
+    struct Headless {
+        proxy: Mutex<std::collections::VecDeque<crate::error::Result<CompleteResponse>>>,
+        proxy_then: Option<serde_json::Value>,
+        worker: Mutex<std::collections::VecDeque<&'static str>>,
+        proxy_calls: std::sync::atomic::AtomicUsize,
+        worker_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Headless {
+        fn new(proxy: Vec<crate::error::Result<CompleteResponse>>, proxy_then: Option<serde_json::Value>, worker: Vec<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                proxy: Mutex::new(proxy.into()),
+                proxy_then,
+                worker: Mutex::new(worker.into()),
+                proxy_calls: Default::default(),
+                worker_calls: Default::default(),
+            })
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.proxy_calls.load(SeqCst), self.worker_calls.load(SeqCst))
+        }
+    }
+
+    fn says(v: serde_json::Value) -> crate::error::Result<CompleteResponse> {
+        Ok(CompleteResponse { text: v.to_string(), ..CompleteResponse::new("p") })
+    }
+
+    impl Provider for Headless {
+        async fn complete(&self, req: CompleteRequest) -> crate::error::Result<CompleteResponse> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if req.instructions.starts_with("You are the user's proxy") {
+                self.proxy_calls.fetch_add(1, SeqCst);
+                if let Some(r) = self.proxy.lock().unwrap().pop_front() {
+                    return r;
+                }
+                return match &self.proxy_then {
+                    Some(v) => says(v.clone()),
+                    None => Err(crate::error::Error::Provider("HTTP 500: proxy down".into())),
+                };
+            }
+            self.worker_calls.fetch_add(1, SeqCst);
+            match self.worker.lock().unwrap().pop_front() {
+                Some(t) => Ok(CompleteResponse { text: t.into(), ..CompleteResponse::new("w") }),
+                None => Err(crate::error::Error::Provider("HTTP 400: bad request".into())),
+            }
+        }
+        async fn compact(&self, _req: CompactRequest) -> crate::error::Result<CompactResponse> {
+            Err(crate::error::Error::Provider("no compact".into()))
+        }
+    }
+
+    /// `grokaagent run --task` minus the CLI: a kick-started task run whose
+    /// inbox the driver owns. It must end on its own.
+    async fn headless(provider: &Arc<Headless>, hub: &Arc<crate::task::TaskHub>) -> (Result<RunOutcome>, Vec<AgentEvent>) {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, rx) = TaskDriver::new(rec.clone(), hub.clone(), vec![]);
+        let cfg = RunConfig {
+            agent_name: "root".into(),
+            instructions: "use tools".into(),
+            prompt: crate::task::KICK.into(),
+            model: "grok-4.6".into(),
+            max_turns: 0,
+            server_tools: vec![],
+            context_window: 0,
+            compact_keep_recent: 0,
+            parent_run_id: None,
+            run_id: "run-1".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            knobs: None,
+            inbox: Some(rx),
+            bg_notify: None,
+            workspace: dir.path().to_path_buf(),
+            images: Vec::new(),
+            closed_backgrounds: None,
+            prior_history: Vec::new(),
+            persist_history: None,
+            cancel: None,
+            skills: None,
+            task: Some(hub.clone()),
+        };
+        let tools = ToolRegistry::new(vec![]);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), agent::run(provider, &tools, driver.as_ref(), cfg))
+            .await
+            .expect("the headless task run must end on its own");
+        let events = rec.0.lock().unwrap().clone();
+        (out, events)
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_ends_when_the_task_is_done() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_task("write hello.txt", "it says hi");
+        let provider = Headless::new(
+            vec![
+                says(json!({"status": "continue", "message": "Write hello.txt."})),
+                says(json!({"status": "satisfied", "reason": "the worker showed the file"})),
+            ],
+            None,
+            vec!["wrote it: hi", "Summary: hello.txt says hi."],
+        );
+        let (out, events) = headless(&provider, &hub).await;
+        assert_eq!(out.unwrap().text, "Summary: hello.txt says hi.");
+        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Done);
+        assert_eq!(provider.calls(), (2, 2));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { reason, .. } if reason == "stop")));
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_ends_when_the_proxy_fails_after_a_poke() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("fix the build");
+        // The plan, then the poked review fails twice and pauses the task.
+        let provider = Headless::new(vec![says(json!({"status": "continue", "message": "Fix it."}))], None, vec![]);
+        let (out, events) = headless(&provider, &hub).await;
+        assert!(out.is_err());
+        assert!(hub.snapshot().paused);
+        assert_eq!(provider.calls().0, 3, "the plan, then one review tried twice");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_stops_pushing_an_agent_that_keeps_failing() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("fix the build");
+        // The proxy always answers; the worker never does.
+        let provider = Headless::new(vec![], Some(json!({"status": "continue", "message": "Try again."})), vec![]);
+        let (out, events) = headless(&provider, &hub).await;
+        assert!(out.is_err());
+        let (proxy, worker) = provider.calls();
+        assert_eq!(proxy, 1 + TaskDriver::MAX_POKES as usize, "the plan and one push per poke");
+        assert_eq!(worker, 3 * (1 + TaskDriver::MAX_POKES as usize));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { .. })));
+    }
 }

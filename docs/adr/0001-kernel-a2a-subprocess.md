@@ -1,7 +1,7 @@
 # ADR 0001 — Kernel, A2A, 子行程
 
 - 日期：2026-08-13
-- 更新日期：2026-09-24
+- 更新日期：2026-10-18
 - 狀態：已確認
 
 ## 已鎖定
@@ -14,7 +14,7 @@
 | 對話形態 | 樹狀委派 + 多方 session，**同一套 A2A `Message`** | `spawn_agent` 與 `send_message` 不分裂型別 |
 | 監控 | 事件管道，模型自己寫腳本掛上 | 框架不提供監控產品 UI；腳本失敗不得殺死 run。可選的 Hub web 鏡像是 TUI 操作面，不是監控產品 |
 | 子工具集 | 與父相同（同一 `kit` 工具表） | 僅以 `max_depth`／`max_children` 限制委派規模；不再維持「比父窄的允許清單」 |
-| Task mode | **正式例外**：可選監督者 checklist | 不是通用編排器／內建議長；只在使用者開啟 task mode 時，對 stop／wait 再打一輪無工具監督 JSON |
+| Task mode | **正式例外**：可選的用戶代理（user proxy） | 不是通用編排器／內建議長；只在使用者開啟 task mode 時，由另一次模型呼叫代替使用者對主代理說話（見下方「Task mode 用戶代理」） |
 
 ## 核心與邊界
 
@@ -29,7 +29,21 @@ A2A 是適配層，不是核心。每個 agent 行程都是一個 A2A server（l
 - 管理工具：`spawn_agent`、`send_message`（立即回傳）、`wait_agents`、`list_agents`、`stop_agent`（中斷目前回合，或 `kill=true` 結束行程並釋放名額）。父按 Esc 時，正在工作的子也會被中斷（保留 session，不喚醒父）。
 - Session：共用 `contextId`，父把 `Message` 轉給指定子行程。子進入 `INPUT_REQUIRED` 時暫停、由父模型決定回覆或轉給另一個 agent——**尚未實作**（見缺口）。
 - 沒有內建議長。要議長就再 spawn 一個名叫 moderator 的 agent。
-- Task mode 監督者不是議長：它只產出 checklist／continue／complete／impossible，不轉送多方 Message。
+- Task mode 用戶代理不是議長：它只代替使用者對主代理說話，不轉送多方 Message、不 spawn、不改檔。
+
+## Task mode 用戶代理
+
+2026-10-18 修訂：task mode 原本是一個無工具的 JSON 裁判（checklist／continue／complete／impossible）；現在改為**用戶代理**：一次有界、唯讀、會用工具的審查呼叫，扮演使用者對主代理說話。
+
+- 模型：`SessionKnobs.task_model`，空白＝跟主模型相同；同一個 provider（依模型 id 分流）、主代理的推理強度、自己的 cache key。
+- 開場前確認（intake）：任務開始、寫開場要求之前，代理可以先用一般問卷問使用者 1–3 題「最後想看到什麼」（交付物、怎麼驗收、外觀或行為、範圍），只在目標與驗收條件說不清楚時才問；每題是代理的建議答案、「其他（自己填寫）」、「略過，直接開始」。回答以「用戶補充：問題 → 答案」附加到驗收條件並記進代理記憶；略過或取消就照已知的開始。每個任務只問一次（修改、繼續、立即審查都不再問）；沒有問卷可用的 run（子代理、headless）不問。
+- 何時說話：開場（`plan`）、主代理自然停下時（`push`）、閒置時被喚醒（新目標、立即審查、繼續）、以及主代理看起來卡住時的中途提醒（`checkpoint`：30 輪工具沒有改檔也沒有代理訊息、同一個失敗呼叫連續 3 次、同一個呼叫連續 4 次；每 10 輪最多一次）。暫停時完全不呼叫。
+- 工具：只有唯讀的 `read_file`、`list_dir`、`workspace_changes`（git status／diff --stat），每次審查最多 8 次，之後強制作答；工具結果只留在代理自己的請求裡，不進主代理歷史。
+- 輸出：一個 JSON（`continue`／`satisfied`／`hand_back`／`impossible`、message、checklist、note、reason）。程式只守兩條線：checklist 省略的項目保留（要刪須 `dropped` 加理由）；有未完成項目或沒有 reason 的 `satisfied`、沒有 reason 的 `hand_back`／`impossible` 降為 `continue`，這時不轉述代理原本的話（主代理會以為已驗收），改說還缺什麼，並在代理記憶裡記下被駁回的原因。沒有回合上限，何時交還由代理自己判斷。
+- 對主代理：訊息以 `[user-proxy]` 開頭並明說「不是使用者」，使用者自己的訊息永遠優先；context 摺疊把它當系統文字，不當使用者原話。`satisfied`／`hand_back` 先讓主代理寫總結，下一次停下才進入已完成／已交還；這個待結束狀態存在 task 狀態裡，程式重開後仍會先要總結再結束。
+- 代答：`ask_user` 先問代理，只有目標、驗收條件或使用者說過的話已經決定的才代答（回覆帶 `answered_by: user_proxy`），其餘照常問人；`request_workspace_access` 一律問人。
+- 記憶：代理的記憶（proxy_log）、回合數與最新訊息存在 task 狀態裡；呼叫失敗重試一次，仍失敗就暫停任務等使用者按繼續。Esc 會讓代理停手，直到使用者說話、按繼續或立即審查。
+- Headless：`grokaagent run --task <目標> [--criteria <條件>]` 用記憶體中的 task 狀態跑同一套流程；主代理請求一直失敗時最多再請代理看兩次，任務結束、暫停或收尾中就關閉 inbox 結束 run。
 
 框架不自動拆工。要不要開子 agent 由父模型決定。
 
@@ -68,7 +82,7 @@ A2A 是適配層，不是核心。每個 agent 行程都是一個 A2A server（l
 ## 不做
 
 CrewAI 式通用編排器、監控產品、Rust plugin、歷史 ACP REST、深層 agent 管 agent。  
-（Task mode 監督 checklist 是上表正式例外，不是這條的編排器。）
+（Task mode 用戶代理是上表正式例外，不是這條的編排器。）
 
 ## 缺口（仍為目標，尚未落地）
 

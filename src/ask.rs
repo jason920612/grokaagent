@@ -1,6 +1,8 @@
 //! Interactive questionnaire: the model poses choices, the TUI user picks.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -231,12 +233,29 @@ impl AskUserHub {
     }
 }
 
+/// What a delegate made of a question before the human sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delegated {
+    /// Resolve the call with this body (the shape [`answer_from_picks`]
+    /// produces for a human pick).
+    Answer(String),
+    /// Ask the human as usual.
+    Forward,
+}
+
+/// Consulted before a question goes to the human: in task mode, the
+/// user's proxy answers what the user's own words already settle.
+pub trait AskDelegate: Send + Sync {
+    fn consult<'a>(&'a self, question: &'a Question) -> Pin<Box<dyn Future<Output = Delegated> + Send + 'a>>;
+}
+
 pub struct AskUserTool {
     hub: AskUserHub,
     sink: Arc<dyn EventSink>,
     agent_name: String,
     run_id: String,
     parent_run_id: Option<String>,
+    delegate: Option<Arc<dyn AskDelegate>>,
 }
 
 impl AskUserTool {
@@ -253,7 +272,13 @@ impl AskUserTool {
             agent_name,
             run_id,
             parent_run_id,
+            delegate: None,
         }
+    }
+
+    pub fn with_delegate(mut self, delegate: Arc<dyn AskDelegate>) -> Self {
+        self.delegate = Some(delegate);
+        self
     }
 
     fn meta(&self) -> EventMeta {
@@ -313,8 +338,14 @@ impl ClientTool for AskUserTool {
         let hub = self.hub.clone();
         let sink = self.sink.clone();
         let meta = self.meta();
+        let delegate = self.delegate.clone();
         Box::pin(async move {
             let q = parse_question(&args)?;
+            if let Some(d) = delegate {
+                if let Delegated::Answer(body) = d.consult(&q).await {
+                    return Ok(body);
+                }
+            }
             let rx = hub.register();
             sink.emit(&AgentEvent::AskUser {
                 meta,
@@ -483,5 +514,45 @@ mod tests {
         let mut rx = rx;
         let body = rx.try_recv().expect("queued answer should be ready");
         assert!(body.contains("cancelled"));
+    }
+}
+
+#[cfg(test)]
+mod delegate_tests {
+    use super::*;
+
+    struct Fixed(Delegated, Mutex<Vec<String>>);
+    impl AskDelegate for Fixed {
+        fn consult<'a>(&'a self, question: &'a Question) -> Pin<Box<dyn Future<Output = Delegated> + Send + 'a>> {
+            self.1.lock().unwrap().push(question.prompt.clone());
+            let out = self.0.clone();
+            Box::pin(async move { out })
+        }
+    }
+
+    struct Rec(Mutex<Vec<AgentEvent>>);
+    impl EventSink for Rec {
+        fn emit(&self, event: &AgentEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegate_answers_before_the_human_or_forwards() {
+        let args = json!({"question": "Q", "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]});
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let answer = Arc::new(Fixed(Delegated::Answer("{\"cancelled\":false,\"selected\":[]}".into()), Mutex::new(Vec::new())));
+        let tool = AskUserTool::new(AskUserHub::new(), rec.clone(), "root".into(), "r".into(), None).with_delegate(answer.clone());
+        assert_eq!(tool.call(&args).await.unwrap(), "{\"cancelled\":false,\"selected\":[]}");
+        assert_eq!(*answer.1.lock().unwrap(), ["Q"]);
+        assert!(rec.0.lock().unwrap().is_empty(), "the human is not asked");
+
+        let hub = AskUserHub::new();
+        hub.answer(encode_answer(&[Picked { id: "b".into(), label: "B".into(), value: None }]));
+        let forward = Arc::new(Fixed(Delegated::Forward, Mutex::new(Vec::new())));
+        let tool = AskUserTool::new(hub, rec.clone(), "root".into(), "r".into(), None).with_delegate(forward);
+        let v: Value = serde_json::from_str(&tool.call(&args).await.unwrap()).unwrap();
+        assert_eq!(v["selected"][0]["id"], "b");
+        assert!(rec.0.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::AskUser { question, .. } if question == "Q")));
     }
 }
