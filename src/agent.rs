@@ -594,13 +594,13 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
     }
 }
 
-/// Pause after Esc. `None` = session ended.
-async fn after_interrupt(
+/// Pause after Esc. `false` = the session ended (no inbox).
+fn after_interrupt(
     cfg: &mut RunConfig,
     sink: &dyn EventSink,
     run_id: &str,
     last_text: &str,
-) -> Option<Vec<UserTurn>> {
+) -> bool {
     if let Some(c) = &cfg.cancel {
         c.take();
     }
@@ -620,34 +620,18 @@ async fn after_interrupt(
             reason: "interrupt".into(),
             text: last_text.to_string(),
         });
-        return None;
+        return false;
     }
     sink.emit(&AgentEvent::AwaitingInput {
         meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
     });
-    wait_session(cfg).await
-}
-
-fn resume_after_interrupt(
-    cfg: &RunConfig,
-    history: &mut Vec<Value>,
-    pending: &mut Vec<Value>,
-    msgs: Vec<UserTurn>,
-) {
-    append_user(
-        history,
-        pending,
-        &UserTurn::from(format!("{} {INTERRUPT_NOTE}", crate::notice::INTERRUPT)),
-        &cfg.workspace,
-    );
-    for msg in msgs {
-        append_user(history, pending, &msg, &cfg.workspace);
-    }
+    true
 }
 
 /// `true` = keep the session. `false` = run ended.
-async fn take_interrupt(
+async fn take_interrupt<P: Provider>(
     cfg: &mut RunConfig,
+    provider: &P,
     sink: &dyn EventSink,
     run_id: &str,
     last_text: &str,
@@ -655,11 +639,77 @@ async fn take_interrupt(
     pending: &mut Vec<Value>,
 ) -> bool {
     checkpoint(cfg, history);
-    match after_interrupt(cfg, sink, run_id, last_text).await {
-        None => false,
-        Some(msgs) => {
-            resume_after_interrupt(cfg, history, pending, msgs);
-            true
+    if !after_interrupt(cfg, sink, run_id, last_text) {
+        return false;
+    }
+    wait_for_work(cfg, provider, sink, run_id, history, pending, last_text, true).await
+}
+
+/// Whether a queued turn is the user's own words, not the kick marker or a
+/// harness notice (a background exit, a child's reply).
+fn is_user_turn(m: &UserTurn) -> bool {
+    !m.is_empty() && !crate::task::is_kick(&m.text) && !crate::notice::is_harness(&m.text)
+}
+
+fn user_texts(msgs: &[UserTurn]) -> Vec<String> {
+    msgs.iter()
+        .filter(|m| is_user_turn(m))
+        .map(|m| if m.text.trim().is_empty() { "[image]".to_string() } else { m.text.clone() })
+        .collect()
+}
+
+/// Real user messages that reach a working run go into the user proxy's
+/// memory (task mode); the worker handles them first.
+fn note_user_turns(cfg: &RunConfig, msgs: &[UserTurn]) {
+    if let Some(hub) = &cfg.task {
+        for t in user_texts(msgs) {
+            hub.note_user(&t);
+        }
+    }
+}
+
+/// Idle until there is work: a message (user, background, child), or the
+/// user proxy speaking up (a new goal, a review request, a resume).
+/// `false` = the session ended. After Esc (`interrupted`) the messages
+/// follow the interrupt note; a proxy message comes on its own.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_work<P: Provider>(
+    cfg: &mut RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    last_text: &str,
+    interrupted: bool,
+) -> bool {
+    loop {
+        let Some(msgs) = wait_session(cfg).await else {
+            return false;
+        };
+        let msgs: Vec<UserTurn> = msgs
+            .into_iter()
+            .filter(|m| !m.is_empty() && !crate::task::is_kick(&m.text))
+            .collect();
+        let woke = !msgs.is_empty();
+        if interrupted && woke {
+            append_user(
+                history,
+                pending,
+                &UserTurn::from(format!("{} {INTERRUPT_NOTE}", crate::notice::INTERRUPT)),
+                &cfg.workspace,
+            );
+        }
+        for msg in &msgs {
+            append_user(history, pending, msg, &cfg.workspace);
+        }
+        let users = user_texts(&msgs);
+        if let Some(instr) = task_idle(cfg, provider, sink, run_id, history, last_text, &users).await {
+            append_user(history, pending, &UserTurn::from(instr), &cfg.workspace);
+            return true;
+        }
+        if woke || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
+            return true;
         }
     }
 }
@@ -735,8 +785,9 @@ struct Failed<'a> {
 /// Tell the model why the request failed (and whether its images were
 /// removed) and keep the loop going. Do not pause for the user.
 #[allow(clippy::too_many_arguments)]
-async fn recover_from_provider_error(
+async fn recover_from_provider_error<P: Provider>(
     cfg: &mut RunConfig,
+    provider: &P,
     sink: &dyn EventSink,
     run_id: &str,
     history: &mut Vec<Value>,
@@ -809,22 +860,16 @@ async fn recover_from_provider_error(
     sink.emit(&AgentEvent::AwaitingInput {
         meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
     });
-    match wait_session(cfg).await {
-        Some(msgs) => {
-            for msg in msgs {
-                append_user(history, pending, &msg, &cfg.workspace);
-            }
-            Ok(images)
-        }
-        None => {
-            sink.emit(&AgentEvent::RunFinished {
-                meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
-                reason: "error".into(),
-                text: last_text.to_string(),
-            });
-            Err(err)
-        }
+    // A task kick (review now, resume, a new goal) counts here as well.
+    if wait_for_work(cfg, provider, sink, run_id, history, pending, last_text, false).await {
+        return Ok(images);
     }
+    sink.emit(&AgentEvent::RunFinished {
+        meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+        reason: "error".into(),
+        text: last_text.to_string(),
+    });
+    Err(err)
 }
 
 /// A provider error that may be about the attached images themselves, or
@@ -842,8 +887,9 @@ fn image_error(err: &Error, model: &str) -> bool {
 /// turn with a note. Repeated trips fall back to the provider-error path,
 /// which tells the model and eventually stops.
 #[allow(clippy::too_many_arguments)]
-async fn handle_loop(
+async fn handle_loop<P: Provider>(
     cfg: &mut RunConfig,
+    provider: &P,
     sink: &dyn EventSink,
     run_id: &str,
     history: &mut Vec<Value>,
@@ -859,7 +905,7 @@ async fn handle_loop(
         // A repetition loop never touches the images.
         let model = live_knobs(cfg).0;
         let failed = Failed { model: &model, seen: &HashSet::new() };
-        return recover_from_provider_error(cfg, sink, run_id, history, pending, consecutive, last_text, failed, trip.to_error())
+        return recover_from_provider_error(cfg, provider, sink, run_id, history, pending, consecutive, last_text, failed, trip.to_error())
             .await
             .map(|_| ());
     }
@@ -883,16 +929,18 @@ async fn handle_loop(
 /// Retries of a turn whose response kept falling into a repetition loop.
 const MAX_LOOP_RETRIES: u32 = 2;
 
+/// Returns how many file changes it reported.
 fn emit_file_changes(
     sink: &dyn EventSink,
     agent_name: &str,
     run_id: &str,
     parent_run_id: Option<&str>,
     output: &str,
-) {
+) -> usize {
     let Ok(v) = serde_json::from_str::<Value>(output) else {
-        return;
+        return 0;
     };
+    let mut reported = 0;
     let mut items: Vec<Value> = Vec::new();
     if v.get("path").and_then(Value::as_str).is_some() && v.get("diff").is_some() {
         items.push(v);
@@ -926,7 +974,9 @@ fn emit_file_changes(
             kind,
             diff,
         });
+        reported += 1;
     }
+    reported
 }
 
 /// Replay every `function_call` into history when `output_items` omitted it.
@@ -1008,21 +1058,10 @@ pub async fn run<P: Provider + Clone + 'static>(
             &cfg.images,
             &cfg.workspace,
         ));
+        note_user_turns(&cfg, &[UserTurn { text: cfg.prompt.clone(), images: cfg.images.clone() }]);
     }
     if let Some(hub) = cfg.task.clone() {
-        let (model, effort, send_reasoning, _) = live_knobs(&cfg);
-        if let Some(instr) = race_cancel(&cfg.cancel, crate::task::prepare_first_turn(
-            hub.as_ref(),
-            provider,
-            &model,
-            effort,
-            send_reasoning,
-            &run_id,
-            &history,
-            sink,
-        ))
-        .await.ok().flatten()
-        {
+        if let Some(instr) = task_first_turn(&cfg, provider, sink, &run_id, &history).await {
             history.push(crate::vision::user_message(
                 &instr,
                 &[],
@@ -1085,9 +1124,17 @@ pub async fn run<P: Provider + Clone + 'static>(
     // that sees images: a later blind model does not take them back.
     let mut seen_by_vision: HashSet<String> = HashSet::new();
 
+    // Signs the worker is stuck mid-run, for the user proxy (task mode).
+    let mut watch = crate::task::Watch::default();
+
     'run: loop {
         if seen_model {
-            for msg in drain_session(&mut cfg) {
+            let msgs = drain_session(&mut cfg);
+            note_user_turns(&cfg, &msgs);
+            for msg in msgs {
+                if crate::task::is_kick(&msg.text) {
+                    continue;
+                }
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
                 turn = 0;
             }
@@ -1102,6 +1149,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
             if !take_interrupt(
                 &mut cfg,
+                provider,
                 sink,
                 &run_id,
                 &last_text,
@@ -1138,23 +1186,16 @@ pub async fn run<P: Provider + Clone + 'static>(
                 sink.emit(&AgentEvent::AwaitingInput {
                     meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
                 });
-                match wait_session(&mut cfg).await {
-                    Some(msgs) if !msgs.is_empty() => {
-                        for msg in msgs {
-                            append_user(&mut history, &mut pending, &msg, &cfg.workspace);
-                        }
-                        continue;
-                    }
-                    Some(_) => continue,
-                    None => {
-                        sink.emit(&AgentEvent::RunFinished {
-                            meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                            reason: "max_turns".into(),
-                            text: last_text,
-                        });
-                        return Err(err);
-                    }
+                // A task kick (review now, resume, a new goal) counts here as well.
+                if wait_for_work(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &last_text, false).await {
+                    continue;
                 }
+                sink.emit(&AgentEvent::RunFinished {
+                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                    reason: "max_turns".into(),
+                    text: last_text,
+                });
+                return Err(err);
             }
             sink.emit(&AgentEvent::RunFinished {
                 meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
@@ -1270,10 +1311,11 @@ pub async fn run<P: Provider + Clone + 'static>(
             let agent_name = cfg.agent_name.clone();
             let parent = cfg.parent_run_id.clone();
             let say = |m: String| notice(sink, &agent_name, &run_id, parent.as_deref(), m);
+            let goal = fold_goal(&cfg);
             let ctx = compact::FoldCtx {
                 provider,
                 instructions: &instructions,
-                goal: &cfg.prompt,
+                goal: &goal,
                 model: &model,
                 effort,
                 send_reasoning,
@@ -1289,7 +1331,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             let result = race_cancel(&cfg.cancel, compact::fold(&ctx, &history)).await;
             chosen = match result {
                 Err(()) => {
-                    if !take_interrupt(&mut cfg, sink, &run_id, &last_text, &mut history, &mut pending).await {
+                    if !take_interrupt(&mut cfg, provider, sink, &run_id, &last_text, &mut history, &mut pending).await {
                         return Ok(outcome(&cfg, &history, run_id, last_text, total_turns, cache_turns, compacted));
                     }
                     turn = 0;
@@ -1317,7 +1359,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                         Some(c)
                     } else if used >= budget.hard {
                         say(format!("壓縮失敗（{e}），上下文將滿：改用不經模型的緊急壓縮"));
-                        Some(compact::emergency_fold(&cfg.prompt, &history, &fold_budget, max_tail_items))
+                        Some(compact::emergency_fold(&goal, &history, &fold_budget, max_tail_items))
                     } else {
                         say(format!(
                             "壓縮失敗（{e}），先不壓縮送出；{COMPACT_BACKOFF_TURNS} 輪後再試"
@@ -1388,7 +1430,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                 let (seen, boundary) = (snapshot.len(), snapshot.last().cloned());
                 let p = provider.clone();
                 let (instructions, goal, model, cache_key) =
-                    (live_instructions(&cfg), cfg.prompt.clone(), model.clone(), cache_key.clone());
+                    (live_instructions(&cfg), fold_goal(&cfg), model.clone(), cache_key.clone());
                 let (client_tools, server_tools, workspace) =
                     (tools.specs_for(&server_tools), server_tools.clone(), cfg.workspace.clone());
                 let task = tokio::spawn(async move {
@@ -1521,6 +1563,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             Err(()) => {
                 if !take_interrupt(
                     &mut cfg,
+                    provider,
                     sink,
                     &run_id,
                     &last_text,
@@ -1545,7 +1588,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls, &repeat_ctx) {
                 None => r,
                 Some(trip) => {
-                    handle_loop(&mut cfg, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
+                    handle_loop(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
                     continue;
                 }
             },
@@ -1555,12 +1598,13 @@ pub async fn run<P: Provider + Clone + 'static>(
                     unit: String::new(),
                     repeats: 0,
                 });
-                handle_loop(&mut cfg, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
+                handle_loop(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
                 continue;
             }
             Ok(Err(e)) => {
                 let images = recover_from_provider_error(
                     &mut cfg,
+                    provider,
                     sink,
                     &run_id,
                     &mut history,
@@ -1668,6 +1712,13 @@ pub async fn run<P: Provider + Clone + 'static>(
             // Images attached by this batch; past the cap the rest are not.
             let mut attached = 0usize;
             let sees = provider.sees_images(&model) && !blind.contains(&model);
+            let batch_text = response.text.clone();
+            // The user proxy may answer an ask_user from the user's words.
+            if let Some(hub) = cfg.task.as_ref().filter(|h| h.steering_open()) {
+                if response.function_calls.iter().any(|c| c.name == "ask_user") {
+                    hub.set_ask_context(crate::task::ask_context(&history, &batch_text));
+                }
+            }
             for call in response.function_calls {
                 let args: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
                 if interrupted || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
@@ -1752,13 +1803,17 @@ pub async fn run<P: Provider + Clone + 'static>(
                     pending.push(item);
                     continue;
                 }
-                emit_file_changes(
+                watch.call(&call.name, &args, &output);
+                if emit_file_changes(
                     sink,
                     &cfg.agent_name,
                     &run_id,
                     cfg.parent_run_id.as_deref(),
                     &output,
-                );
+                ) > 0
+                {
+                    watch.progress();
+                }
                 let shown = crate::tools::model_view(&output);
                 let item = crate::vision::function_call_output(&call.call_id, &shown, image_uri.as_deref());
                 if image_uri.is_some() {
@@ -1772,9 +1827,17 @@ pub async fn run<P: Provider + Clone + 'static>(
                 crate::vision::retain_seen_images(&mut history, crate::vision::KEEP_RECENT_IMAGES, seen_upto);
                 images_known = crate::vision::image_item_count(&history);
             }
+            watch.tool_round();
+            if !interrupted {
+                if let Some(instr) = task_checkpoint(&cfg, provider, sink, &run_id, &history, &batch_text, &mut watch).await {
+                    append_user(&mut history, &mut pending, &UserTurn::from(instr), &cfg.workspace);
+                    watch.progress();
+                }
+            }
             if interrupted {
                 if !take_interrupt(
                     &mut cfg,
+                    provider,
                     sink,
                     &run_id,
                     &last_text,
@@ -1809,8 +1872,13 @@ pub async fn run<P: Provider + Clone + 'static>(
             &last_usage,
         );
 
-        let extra = drain_session(&mut cfg);
+        watch.progress();
+        let extra: Vec<UserTurn> = drain_session(&mut cfg)
+            .into_iter()
+            .filter(|m| !crate::task::is_kick(&m.text))
+            .collect();
         if !extra.is_empty() {
+            note_user_turns(&cfg, &extra);
             for msg in extra {
                 append_user(&mut history, &mut pending, &msg, &cfg.workspace);
             }
@@ -1836,18 +1904,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         }
 
         checkpoint(&cfg, &history);
-        if let Some(instr) = task_inject(
-            &cfg,
-            provider,
-            sink,
-            &run_id,
-            &history,
-            &last_text,
-            true,
-            false,
-        )
-        .await
-        {
+        if let Some(instr) = task_after_stop(&cfg, provider, sink, &run_id, &history, &last_text).await {
             append_user(
                 &mut history,
                 &mut pending,
@@ -1863,62 +1920,125 @@ pub async fn run<P: Provider + Clone + 'static>(
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
-        loop {
-            match wait_session(&mut cfg).await {
-                Some(msgs) => {
-                    let had_user = msgs
-                        .iter()
-                        .any(|m| !m.is_empty() && !crate::task::is_kick(&m.text));
-                    for msg in msgs {
-                        if crate::task::is_kick(&msg.text) {
-                            continue;
-                        }
-                        append_user(&mut history, &mut pending, &msg, &cfg.workspace);
-                    }
-                    if let Some(instr) = task_inject(
-                        &cfg,
-                        provider,
-                        sink,
-                        &run_id,
-                        &history,
-                        &last_text,
-                        false,
-                        had_user,
-                    )
-                    .await
-                    {
-                        append_user(
-                            &mut history,
-                            &mut pending,
-                            &UserTurn::from(instr),
-                            &cfg.workspace,
-                        );
-                        break;
-                    }
-                    if had_user || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
-                        break;
-                    }
-                }
-                None => {
-                    sink.emit(&AgentEvent::RunFinished {
-                        meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                        reason: "stop".into(),
-                        text: last_text.clone(),
-                    });
-                    return Ok(outcome(
-                        &cfg,
-                        &history,
-                        run_id,
-                        last_text,
-                        total_turns,
-                        cache_turns,
-                        compacted,
-                    ));
-                }
-            }
+        if !wait_for_work(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &last_text, false).await {
+            sink.emit(&AgentEvent::RunFinished {
+                meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                reason: "stop".into(),
+                text: last_text.clone(),
+            });
+            return Ok(outcome(
+                &cfg,
+                &history,
+                run_id,
+                last_text,
+                total_turns,
+                cache_turns,
+                compacted,
+            ));
         }
         turn = 0;
     }
+}
+
+/// The goal a context fold keeps as the original request: in a task run
+/// started without a prompt of its own, the task's goal, not the kick
+/// marker.
+fn fold_goal(cfg: &RunConfig) -> String {
+    if crate::task::is_kick(&cfg.prompt) {
+        if let Some(goal) = cfg.task.as_ref().map(|h| h.snapshot().goal).filter(|g| !g.trim().is_empty()) {
+            return goal;
+        }
+    }
+    cfg.prompt.clone()
+}
+
+fn proxy_call<'a, P: Provider>(
+    cfg: &'a RunConfig,
+    hub: &'a crate::task::TaskHub,
+    provider: &'a P,
+    sink: &'a dyn EventSink,
+    run_id: &'a str,
+) -> crate::task::ProxyCall<'a, P> {
+    let (model, effort, send_reasoning) = crate::task::proxy_settings(cfg.knobs.as_ref(), &cfg.model, cfg.reasoning_effort);
+    crate::task::ProxyCall {
+        hub,
+        provider,
+        model,
+        effort,
+        send_reasoning,
+        run_id,
+        workspace: &cfg.workspace,
+        sink,
+    }
+}
+
+/// Task mode at run start: the proxy's opening brief. Esc aborts it.
+async fn task_first_turn<P: Provider>(
+    cfg: &RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &[Value],
+) -> Option<String> {
+    let hub = cfg.task.as_ref()?;
+    let call = proxy_call(cfg, hub, provider, sink, run_id);
+    race_cancel(&cfg.cancel, crate::task::prepare_first_turn(&call, history)).await.ok().flatten()
+}
+
+/// Task mode after the worker stopped on its own.
+async fn task_after_stop<P: Provider>(
+    cfg: &RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &[Value],
+    last_text: &str,
+) -> Option<String> {
+    let hub = cfg.task.as_ref()?;
+    let call = proxy_call(cfg, hub, provider, sink, run_id);
+    race_cancel(&cfg.cancel, crate::task::after_natural_stop(&call, history, last_text)).await.ok().flatten()
+}
+
+/// Task mode when an idle wait woke; `users` are the real user messages.
+async fn task_idle<P: Provider>(
+    cfg: &RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &[Value],
+    last_text: &str,
+    users: &[String],
+) -> Option<String> {
+    let hub = cfg.task.as_ref()?;
+    let call = proxy_call(cfg, hub, provider, sink, run_id);
+    race_cancel(&cfg.cancel, crate::task::after_wait(&call, history, last_text, users)).await.ok().flatten()
+}
+
+/// Task mode after a tool batch: the proxy looks in when a new goal or a
+/// review request is waiting, or when the worker seems stuck.
+async fn task_checkpoint<P: Provider>(
+    cfg: &RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &[Value],
+    last_text: &str,
+    watch: &mut crate::task::Watch,
+) -> Option<String> {
+    let hub = cfg.task.as_ref()?;
+    if !hub.steering_open() {
+        return None;
+    }
+    let why = if hub.snapshot().phase == crate::task::TaskPhase::NeedPlan {
+        "the user just started this task while the worker was busy".to_string()
+    } else if hub.take_review_request() {
+        "the user asked you to look now".to_string()
+    } else {
+        watch.due()?
+    };
+    watch.looked();
+    let call = proxy_call(cfg, hub, provider, sink, run_id);
+    race_cancel(&cfg.cancel, crate::task::checkpoint(&call, history, last_text, &why)).await.ok().flatten()
 }
 
 #[cfg(test)]
@@ -2268,7 +2388,7 @@ mod agent_tests {
         let mut pending = history.clone();
         let mut n = consecutive;
         let failed = Failed { model, seen: &HashSet::new() };
-        recover_from_provider_error(cfg, &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
+        recover_from_provider_error(cfg, &Script::new(vec![]), &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
         let note = history.last().unwrap()["content"].as_str().unwrap().to_string();
         (history, note)
     }
@@ -2484,7 +2604,7 @@ mod agent_tests {
         let mut n = 0;
         let err = Error::Provider("xAI HTTP 400: Image inputs are not supported by this model.".into());
         let failed = Failed { model: "text-model", seen: &HashSet::new() };
-        let images = recover_from_provider_error(cfg, &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
+        let images = recover_from_provider_error(cfg, &Script::new(vec![]), &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
         assert_eq!(images, ImagesAfterError::Refused);
         let out: Value = serde_json::from_str(history[0]["output"].as_str().unwrap()).unwrap();
         assert!(out["attach_error"].as_str().unwrap().starts_with("text-model cannot view images"), "{out}");
@@ -2535,47 +2655,6 @@ mod agent_tests {
         let sent: Value = serde_json::from_str(output_of(&reqs[1], "c1")["output"].as_str().unwrap()).unwrap();
         assert_eq!(sent, shown);
         assert!(!crate::vision::input_has_image(&reqs[1].input));
-    }
-}
-
-async fn task_inject<P: Provider>(
-    cfg: &RunConfig,
-    provider: &P,
-    sink: &dyn EventSink,
-    run_id: &str,
-    history: &[Value],
-    last_text: &str,
-    after_stop: bool,
-    had_user: bool,
-) -> Option<String> {
-    let hub = cfg.task.as_ref()?;
-    let (model, effort, send_reasoning, _) = live_knobs(cfg);
-    if after_stop {
-        race_cancel(&cfg.cancel, crate::task::after_natural_stop(
-            hub,
-            provider,
-            &model,
-            effort,
-            send_reasoning,
-            run_id,
-            history,
-            last_text,
-            sink,
-        ))
-        .await.ok().flatten()
-    } else {
-        race_cancel(&cfg.cancel, crate::task::after_wait(
-            hub,
-            provider,
-            &model,
-            effort,
-            send_reasoning,
-            run_id,
-            history,
-            had_user,
-            sink,
-        ))
-        .await.ok().flatten()
     }
 }
 
@@ -5193,18 +5272,8 @@ mod tests {
         assert_eq!(out.text, "after interrupt");
     }
 
-    fn supervisor_reply(status: &str, item: &str, done: bool, next: &str, reason: &str) -> CompleteResponse {
-        let done = if done { "true" } else { "false" };
-        CompleteResponse {
-            text: format!(
-                r#"{{"status":"{status}","checklist":[{{"text":"{item}","done":{done}}}],"next":"{next}","reason":"{reason}"}}"#
-            ),
-            ..CompleteResponse::new("sup")
-        }
-    }
-
     #[tokio::test]
-    async fn task_supervisor_review_is_cancellable() {
+    async fn task_proxy_review_is_cancellable() {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let cancel = CancelFlag::new();
         let mut c = cfg("goal", 0);
@@ -5215,124 +5284,551 @@ mod tests {
         let provider = HangThenOk { entered: Mutex::new(Some(entered_tx)), calls: Mutex::new(0) };
         let job = tokio::spawn(async move {
             let rec = Rec(Mutex::new(Vec::new()));
-            task_inject(&c, &provider, &rec, "r", &[], "", true, false).await
+            task_after_stop(&c, &provider, &rec, "r", &[], "").await
         });
         entered_rx.await.unwrap();
         cancel.trip();
         assert!(tokio::time::timeout(Duration::from_secs(2), job).await.unwrap().unwrap().is_none());
         assert_ne!(hub.snapshot().phase, crate::task::TaskPhase::Done);
     }
+}
 
-    #[tokio::test]
-    async fn task_mode_keeps_the_worker_going_until_the_supervisor_completes() {
-        let hub = crate::task::TaskHub::new("");
-        hub.start_goal("ship login");
+#[cfg(test)]
+mod task_proxy_tests {
+    use super::*;
+    use crate::provider::{CompactRequest, CompactResponse, CompleteResponse, FunctionCall};
+    use crate::task::{TaskHub, TaskPhase};
+    use crate::tools::{ClientTool, ToolCallFut, ToolSpec};
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+
+    enum Step {
+        Reply(Result<CompleteResponse>),
+        /// Never answers; says so first.
+        Hang(tokio::sync::oneshot::Sender<()>),
+    }
+
+    /// The worker's replies and the user proxy's replies, each in order.
+    /// Proxy requests are told apart by their instructions.
+    struct Duo {
+        proxy: Mutex<VecDeque<Result<CompleteResponse>>>,
+        worker: Mutex<VecDeque<Step>>,
+        proxy_calls: Mutex<Vec<CompleteRequest>>,
+        worker_calls: Mutex<Vec<CompleteRequest>>,
+    }
+
+    impl Duo {
+        fn new(proxy: Vec<Result<CompleteResponse>>, worker: Vec<Step>) -> Arc<Self> {
+            Arc::new(Self {
+                proxy: Mutex::new(proxy.into()),
+                worker: Mutex::new(worker.into()),
+                proxy_calls: Mutex::new(Vec::new()),
+                worker_calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn proxy_prompt(&self, i: usize) -> String {
+            self.proxy_calls.lock().unwrap()[i].input[0]["content"].as_str().unwrap_or("").to_string()
+        }
+    }
+
+    impl Provider for Duo {
+        async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+            if req.instructions.starts_with("You are the user's proxy") {
+                self.proxy_calls.lock().unwrap().push(req);
+                let next = self.proxy.lock().unwrap().pop_front();
+                return next.unwrap_or_else(|| Err(Error::Provider("no proxy reply".into())));
+            }
+            self.worker_calls.lock().unwrap().push(req);
+            let step = self.worker.lock().unwrap().pop_front();
+            match step {
+                Some(Step::Reply(r)) => r,
+                Some(Step::Hang(tx)) => {
+                    let _ = tx.send(());
+                    std::future::pending::<Result<CompleteResponse>>().await
+                }
+                None => Err(Error::Provider("no worker reply".into())),
+            }
+        }
+
+        async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+            Err(Error::Provider("no compact".into()))
+        }
+    }
+
+    /// Records events; on the root's n-th wait for input, `on_wait(n)`
+    /// says whether to close the inbox (which ends the run).
+    struct Closer {
+        events: Mutex<Vec<AgentEvent>>,
+        tx: Mutex<Option<mpsc::UnboundedSender<UserTurn>>>,
+        waits: AtomicUsize,
+        on_wait: Box<dyn Fn(usize) -> bool + Send + Sync>,
+    }
+
+    impl EventSink for Closer {
+        fn emit(&self, event: &AgentEvent) {
+            self.events.lock().unwrap().push(event.clone());
+            if let AgentEvent::AwaitingInput { meta } = event {
+                if meta.parent_run_id.is_none() {
+                    let n = self.waits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if (self.on_wait)(n) {
+                        self.tx.lock().unwrap().take();
+                    }
+                }
+            }
+        }
+    }
+
+    impl Closer {
+        fn intents(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::TaskProxy { intent, .. } => Some(intent.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// A kick-started task run with an inbox. The returned sender is the
+    /// test's own: drop it, or the run waits for more.
+    fn task_run(
+        hub: &Arc<TaskHub>,
+        on_wait: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> (RunConfig, Arc<Closer>, mpsc::UnboundedSender<UserTurn>) {
         let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
-        let mut c = cfg(crate::task::KICK, 0);
-        c.inbox = Some(rx);
-        c.task = Some(hub.clone());
-        let provider = Scripted {
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(pop_front(vec![
-                supervisor_reply("continue", "write test", false, "write the test", ""),
-                CompleteResponse {
-                    text: "wrote test".into(),
-                    ..CompleteResponse::new("w1")
-                },
-                supervisor_reply("complete", "write test", true, "", "done"),
-            ])),
-            compact_calls: Mutex::new(Vec::new()),
-            compact_ok: false,
-        };
-        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
-        let rec = Rec(Mutex::new(Vec::new()));
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            drop(tx);
+        let closer = Arc::new(Closer {
+            events: Mutex::new(Vec::new()),
+            tx: Mutex::new(Some(tx.clone())),
+            waits: AtomicUsize::new(0),
+            on_wait: Box::new(on_wait),
         });
-        let provider = Arc::new(provider);
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            run(&provider, &tools, &rec, c),
-        )
-        .await
-        .expect("task loop must finish")
-        .unwrap();
-        assert_eq!(out.text, "wrote test");
-        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Done);
-        let events = rec.0.lock().unwrap().clone();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ChildSpawned { name, .. } if name == crate::task::AGENT_NAME)),
-            "{events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("已完成"))),
-            "{events:?}"
-        );
-        let calls = provider.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3, "plan + worker + check");
-        assert!(
-            calls[0].cache_key.starts_with("grokaagent-task:"),
-            "{}",
-            calls[0].cache_key
-        );
-        assert!(
-            !calls[1].cache_key.starts_with("grokaagent-task:"),
-            "worker must not use the supervisor cache key"
-        );
+        let c = RunConfig {
+            agent_name: "root".into(),
+            instructions: "use tools".into(),
+            prompt: crate::task::KICK.into(),
+            model: "grok-4.6".into(),
+            max_turns: 0,
+            server_tools: vec![],
+            context_window: 0,
+            compact_keep_recent: 0,
+            parent_run_id: None,
+            run_id: "run-1".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            knobs: None,
+            inbox: Some(rx),
+            bg_notify: None,
+            workspace: PathBuf::from("."),
+            images: Vec::new(),
+            closed_backgrounds: None,
+            prior_history: Vec::new(),
+            persist_history: None,
+            cancel: None,
+            skills: None,
+            task: Some(hub.clone()),
+        };
+        (c, closer, tx)
+    }
+
+    async fn go(provider: &Arc<Duo>, tools: ToolRegistry, closer: &Arc<Closer>, c: RunConfig) -> RunOutcome {
+        tokio::time::timeout(Duration::from_secs(5), run(provider, &tools, closer.as_ref(), c))
+            .await
+            .expect("the task run must finish")
+            .expect("run ok")
+    }
+
+    fn says(v: Value) -> Result<CompleteResponse> {
+        Ok(CompleteResponse { text: v.to_string(), ..CompleteResponse::new("proxy") })
+    }
+
+    fn text(t: &str) -> Step {
+        Step::Reply(Ok(CompleteResponse { text: t.into(), ..CompleteResponse::new("w") }))
+    }
+
+    fn tool(id: &str, name: &str, args: Value) -> Step {
+        Step::Reply(Ok(CompleteResponse {
+            function_calls: vec![FunctionCall { call_id: id.into(), name: name.into(), arguments: args.to_string() }],
+            ..CompleteResponse::new("w")
+        }))
+    }
+
+    /// A run_command stand-in that answers from a script.
+    struct Cmd(Mutex<VecDeque<Value>>);
+
+    impl Cmd {
+        fn new(outs: Vec<Value>) -> Box<Self> {
+            Box::new(Self(Mutex::new(outs.into())))
+        }
+    }
+
+    impl ClientTool for Cmd {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec { name: "run_command".into(), description: "run".into(), parameters: json!({"type": "object"}) }
+        }
+
+        fn call(&self, _args: &Value) -> ToolCallFut<'_> {
+            let out = self.0.lock().unwrap().pop_front().unwrap_or(json!({"exit_code": 0, "stdout": ""}));
+            Box::pin(async move { Ok(out.to_string()) })
+        }
+    }
+
+    fn last_user_text(req: &CompleteRequest) -> String {
+        req.input
+            .iter()
+            .rev()
+            .find(|i| i["role"] == "user")
+            .and_then(|i| i["content"].as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     #[tokio::test]
-    async fn task_mode_impossible_lets_the_worker_explain_then_stops() {
-        let hub = crate::task::TaskHub::new("");
-        hub.start_goal("hack production");
-        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
-        let mut c = cfg(crate::task::KICK, 0);
-        c.inbox = Some(rx);
-        c.task = Some(hub.clone());
-        let provider = Scripted {
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(pop_front(vec![
-                supervisor_reply("continue", "get creds", false, "try", ""),
-                CompleteResponse {
-                    text: "cannot without creds".into(),
-                    ..CompleteResponse::new("w1")
-                },
-                supervisor_reply("impossible", "get creds", false, "", "no credentials exist"),
-                CompleteResponse {
-                    text: "沒做完，因為沒有憑證。".into(),
-                    ..CompleteResponse::new("w2")
-                },
-            ])),
-            compact_calls: Mutex::new(Vec::new()),
-            compact_ok: false,
-        };
-        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
-        let rec = Rec(Mutex::new(Vec::new()));
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            drop(tx);
-        });
-        let provider = Arc::new(provider);
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            run(&provider, &tools, &rec, c),
-        )
-        .await
-        .expect("impossible path must finish")
-        .unwrap();
-        assert_eq!(out.text, "沒做完，因為沒有憑證。");
-        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Failed);
-        let events = rec.0.lock().unwrap().clone();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("未完成"))),
-            "{events:?}"
+    async fn plan_push_then_satisfied_gets_a_summary_turn_then_done() {
+        let hub = TaskHub::new("");
+        hub.start_task("ship login", "with a test");
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "Write the login test first.", "checklist": [{"text": "login test", "done": false}, {"text": "login works", "done": false}], "note": "開場"})),
+                says(json!({"status": "continue", "message": "Run the tests and show me the output."})),
+                says(json!({"status": "satisfied", "checklist": [{"text": "login test", "done": true}, {"text": "login works", "done": true}], "note": "驗收", "reason": "the test output shows 2 passed"})),
+            ],
+            vec![
+                text("wrote the test"),
+                tool("c1", "run_command", json!({"command": "cargo test"})),
+                text("tests pass: 2 passed"),
+                text("Summary: login done, verified by cargo test (2 passed)."),
+            ],
         );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        let tools = ToolRegistry::new(vec![Cmd::new(vec![json!({"exit_code": 0, "stdout": "running 2 tests\ntest result: ok. 2 passed; 0 failed"})])]);
+        let out = go(&provider, tools, &closer, c).await;
+        assert_eq!(out.text, "Summary: login done, verified by cargo test (2 passed).");
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::Done);
+        assert_eq!(s.rounds, 3);
+        assert_eq!(closer.intents(), ["plan", "push", "accept"]);
+        assert_eq!(provider.proxy_calls.lock().unwrap().len(), 3, "no proxy call after the summary");
+        let worker = provider.worker_calls.lock().unwrap();
+        assert_eq!(worker.len(), 4);
+        let first = last_user_text(&worker[0]);
+        assert!(first.starts_with("[user-proxy] Message from the user's proxy") && first.contains("Write the login test first."), "{first}");
+        assert!(first.contains("Criteria: with a test") && first.contains("- [ ] login test"), "{first}");
+        assert!(last_user_text(&worker[1]).contains("Run the tests and show me the output."));
+        assert!(last_user_text(&worker[3]).starts_with("[user-proxy] The user's proxy is satisfied: the test output shows 2 passed. Write the final summary"));
+        // The proxy saw the call and the end of its output.
+        let prompt = provider.proxy_prompt(2);
+        assert!(prompt.contains(r#"tool call: run_command {"command":"cargo test"}"#), "{prompt}");
+        assert!(prompt.contains("2 passed; 0 failed"), "{prompt}");
+        assert!(prompt.contains("The worker's latest reply:\ntests pass: 2 passed"), "{prompt}");
+        let proxy = provider.proxy_calls.lock().unwrap();
+        assert!(proxy.iter().all(|r| r.cache_key.starts_with("grokaagent-task:")));
+        assert!(worker.iter().all(|r| !r.cache_key.starts_with("grokaagent-task:")));
+        assert!(proxy.iter().all(|r| r.model == "grok-4.6"), "defaults to the main model");
+    }
+
+    #[tokio::test]
+    async fn hand_back_returns_the_task_to_the_user() {
+        let hub = TaskHub::new("");
+        hub.start_goal("pick a database and migrate");
+        let provider = Duo::new(
+            vec![says(json!({"status": "hand_back", "reason": "only you can pick between Postgres and SQLite"}))],
+            vec![text("You need to choose the database; here is where things stand.")],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        assert_eq!(hub.snapshot().phase, TaskPhase::HandedBack);
+        assert_eq!(closer.intents(), ["hand_back"]);
+        let worker = provider.worker_calls.lock().unwrap();
+        assert!(last_user_text(&worker[0]).contains("handing this back to the user: only you can pick between Postgres and SQLite"));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_failing_command_brings_a_checkpoint() {
+        let hub = TaskHub::new("");
+        hub.start_goal("fix the build");
+        let fail = json!({"exit_code": 101, "stdout": "", "stderr": "error[E0425]: cannot find value `x`"});
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "Fix the build, then show me cargo build passing."})),
+                says(json!({"status": "continue", "message": "You ran the same failing command three times. Read the first error and fix it before running it again."})),
+                says(json!({"status": "hand_back", "reason": "stuck"})),
+            ],
+            vec![
+                tool("c1", "run_command", json!({"command": "cargo build"})),
+                tool("c2", "run_command", json!({"command": "cargo build"})),
+                tool("c3", "run_command", json!({"command": "cargo build"})),
+                text("I'll read the error."),
+                text("summary"),
+            ],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        let tools = ToolRegistry::new(vec![Cmd::new(vec![fail.clone(), fail.clone(), fail])]);
+        go(&provider, tools, &closer, c).await;
+        assert_eq!(closer.intents(), ["plan", "checkpoint", "hand_back"]);
+        let prompt = provider.proxy_prompt(1);
+        assert!(prompt.contains("Review kind: checkpoint"), "{prompt}");
+        assert!(prompt.contains("the same failing tool call, 3 times in a row"), "{prompt}");
+        assert!(prompt.contains("cannot find value"), "{prompt}");
+        let worker = provider.worker_calls.lock().unwrap();
+        // Injected right after the third failure, before the next request.
+        let fourth = &worker[3];
+        let last = fourth.input.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"].as_str().unwrap().contains("three times"), "{last}");
+        assert_eq!(fourth.input[fourth.input.len() - 2]["type"], "function_call_output");
+        assert!(!last_user_text(&worker[2]).contains("three times"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_is_answered_by_the_proxy_or_forwarded_to_the_human() {
+        let hub = TaskHub::new("");
+        hub.start_goal("build the notes app on SQLite");
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "Build it."})),
+                says(json!({"forward": false, "selected": [{"id": "sqlite"}], "why": "the goal says SQLite"})),
+                says(json!({"forward": true, "why": "the user never said"})),
+                says(json!({"status": "hand_back", "reason": "done for now"})),
+            ],
+            vec![
+                tool("q1", "ask_user", json!({"question": "Which database?", "options": [{"id": "sqlite", "label": "SQLite"}, {"id": "pg", "label": "Postgres"}]})),
+                tool("q2", "ask_user", json!({"question": "Dark mode?", "options": ["yes", "no"]})),
+                text("built it"),
+                text("summary"),
+            ],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        let ask_hub = crate::ask::AskUserHub::new();
+        // The human's pick, for the question the proxy leaves to them.
+        let human = crate::ask::encode_answer(&[crate::ask::Picked { id: "opt1".into(), label: "no".into(), value: None }]);
+        ask_hub.answer(human.clone());
+        let sink: Arc<dyn EventSink> = closer.clone();
+        let delegate = crate::task::ProxyAsk::new(
+            hub.clone(),
+            provider.clone(),
+            None,
+            "grok-4.6".into(),
+            crate::provider::ReasoningEffort::High,
+            PathBuf::from("."),
+            sink.clone(),
+            "run-1".into(),
+        );
+        let ask = crate::ask::AskUserTool::new(ask_hub, sink, "root".into(), "run-1".into(), None).with_delegate(Arc::new(delegate));
+        go(&provider, ToolRegistry::new(vec![Box::new(ask)]), &closer, c).await;
+        let worker = provider.worker_calls.lock().unwrap();
+        let out = |req: &CompleteRequest, id: &str| -> Value {
+            let item = req.input.iter().find(|i| i["type"] == "function_call_output" && i["call_id"] == id).unwrap();
+            serde_json::from_str(item["output"].as_str().unwrap()).unwrap()
+        };
+        let a1 = out(&worker[1], "q1");
+        assert_eq!(a1["selected"][0]["id"], "sqlite");
+        assert_eq!(a1["answered_by"], "user_proxy");
+        let a2 = out(&worker[2], "q2");
+        assert_eq!(a2, serde_json::from_str::<Value>(&human).unwrap(), "the human's own answer");
+        let events = closer.events.lock().unwrap();
+        let asked: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::AskUser { question, .. } => Some(question.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, ["Dark mode?"], "only the forwarded question reaches the human");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TaskProxy { intent, text, .. } if intent == "answer" && text == "問：Which database?\n答：SQLite")));
+        // The proxy saw the user's words when deciding.
+        let proxy = provider.proxy_calls.lock().unwrap();
+        assert!(proxy[1].instructions.contains("multiple-choice question"));
+        assert!(proxy[1].input[0]["content"].as_str().unwrap().contains("id=sqlite: SQLite"));
+    }
+
+    #[tokio::test]
+    async fn paused_means_no_proxy_calls() {
+        let hub = TaskHub::new("");
+        hub.start_goal("x");
+        hub.set_paused(true);
+        let fail = json!({"exit_code": 1, "stderr": "boom"});
+        let provider = Duo::new(
+            vec![],
+            vec![
+                tool("c1", "run_command", json!({"command": "make"})),
+                tool("c2", "run_command", json!({"command": "make"})),
+                tool("c3", "run_command", json!({"command": "make"})),
+                text("did it"),
+            ],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        let tools = ToolRegistry::new(vec![Cmd::new(vec![fail.clone(), fail.clone(), fail])]);
+        go(&provider, tools, &closer, c).await;
+        assert!(provider.proxy_calls.lock().unwrap().is_empty());
+        assert!(closer.intents().is_empty());
+        let worker = provider.worker_calls.lock().unwrap();
+        assert!(last_user_text(&worker[0]).starts_with("Task mode is on. Goal:\nx"));
+        assert_eq!(hub.snapshot().phase, TaskPhase::NeedPlan);
+    }
+
+    #[tokio::test]
+    async fn review_now_and_resume_wake_an_idle_run() {
+        let hub = TaskHub::new("");
+        hub.start_goal("ship it");
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "step 1"})),
+                Err(Error::Provider("HTTP 500".into())),
+                Err(Error::Provider("HTTP 500".into())),
+                says(json!({"status": "hand_back", "reason": "need a decision"})),
+            ],
+            vec![text("did step 1"), text("summary")],
+        );
+        let h = hub.clone();
+        let (c, closer, tx) = task_run(&hub, move |n| {
+            if n == 1 {
+                // The proxy failed and paused; the user resumes and asks for a look.
+                assert!(h.snapshot().paused);
+                h.set_paused(false);
+                h.request_review();
+                return false;
+            }
+            true
+        });
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        assert_eq!(provider.proxy_calls.lock().unwrap().len(), 4);
+        assert!(provider.proxy_prompt(3).contains("the user asked you to look now"));
+        assert_eq!(hub.snapshot().phase, TaskPhase::HandedBack);
+        assert!(closer.events.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("任務已暫停"))));
+    }
+
+    #[tokio::test]
+    async fn the_task_model_is_used_for_proxy_requests() {
+        for task_model in ["", "proxy-model"] {
+            let hub = TaskHub::new("");
+            hub.start_goal("x");
+            let provider = Duo::new(vec![says(json!({"status": "hand_back", "reason": "r"}))], vec![text("summary")]);
+            let (mut c, closer, tx) = task_run(&hub, |_| true);
+            drop(tx);
+            c.knobs = Some(Arc::new(Mutex::new(SessionKnobs {
+                model: "main-model".into(),
+                reasoning_effort: crate::provider::ReasoningEffort::Medium,
+                send_reasoning: true,
+                server_tools: vec![],
+                dispatcher: false,
+                child_model: "child-model".into(),
+                task_model: task_model.into(),
+                search: false,
+            })));
+            go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+            let proxy = provider.proxy_calls.lock().unwrap();
+            let want = if task_model.is_empty() { "main-model" } else { task_model };
+            assert_eq!(proxy[0].model, want);
+            assert_eq!(proxy[0].reasoning_effort, crate::provider::ReasoningEffort::Medium);
+            assert_eq!(provider.worker_calls.lock().unwrap()[0].model, "main-model");
+        }
+    }
+
+    #[tokio::test]
+    async fn user_messages_mid_task_reach_the_proxy_memory() {
+        let hub = TaskHub::new("");
+        hub.start_goal("build notes");
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "go"})),
+                says(json!({"status": "hand_back", "reason": "r"})),
+            ],
+            vec![text("starting"), text("ok, using SQLite"), text("summary")],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        tx.send(UserTurn::from("use SQLite please")).unwrap();
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        let prompt = provider.proxy_prompt(1);
+        assert!(prompt.contains("[user] use SQLite please"), "{prompt}");
+        assert!(prompt.contains("The worker's latest reply:\nok, using SQLite"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn esc_pauses_the_proxy_until_the_user_speaks() {
+        let hub = TaskHub::new("");
+        hub.start_goal("ship it");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "go"})),
+                says(json!({"status": "hand_back", "reason": "r"})),
+            ],
+            vec![Step::Hang(entered_tx), text("did the step"), text("summary")],
+        );
+        let (mut c, closer, tx) = task_run(&hub, |n| n >= 2);
+        let cancel = CancelFlag::new();
+        c.cancel = Some(cancel.clone());
+        let (p, cl) = (provider.clone(), closer.clone());
+        let job = tokio::spawn(async move { go(&p, ToolRegistry::new(vec![]), &cl, c).await });
+        entered_rx.await.unwrap();
+        cancel.trip();
+        tx.send(UserTurn::from("keep going")).unwrap();
+        drop(tx);
+        job.await.unwrap();
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::HandedBack);
+        assert!(!s.skip_steer, "the user's message clears the Esc pause");
+        assert!(s.proxy_log.iter().any(|t| t.who == "user" && t.text == "keep going"));
+        assert_eq!(provider.proxy_calls.lock().unwrap().len(), 2);
+        let worker = provider.worker_calls.lock().unwrap();
+        let resumed: Vec<&str> = worker[1].input.iter().filter_map(|i| i["content"].as_str()).collect();
+        assert!(resumed.iter().any(|t| t.starts_with(crate::notice::INTERRUPT)));
+        assert_eq!(resumed.last().copied(), Some("keep going"));
+    }
+
+    #[tokio::test]
+    async fn a_task_started_mid_turn_gets_a_plan_not_a_check() {
+        let hub = TaskHub::new("");
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "Here is what I want: tests first."})),
+                says(json!({"status": "hand_back", "reason": "r"})),
+            ],
+            vec![
+                tool("c1", "run_command", json!({"command": "ls"})),
+                text("listed"),
+                text("summary"),
+            ],
+        );
+        let (mut c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        c.prompt = "look around".into();
+        // The user starts the task while the first command runs.
+        struct Start(Arc<TaskHub>);
+        impl ClientTool for Start {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec { name: "run_command".into(), description: "run".into(), parameters: json!({"type": "object"}) }
+            }
+            fn call(&self, _args: &Value) -> ToolCallFut<'_> {
+                self.0.start_goal("add tests");
+                Box::pin(async { Ok(json!({"exit_code": 0, "stdout": "a b"}).to_string()) })
+            }
+        }
+        go(&provider, ToolRegistry::new(vec![Box::new(Start(hub.clone()))]), &closer, c).await;
+        assert!(provider.proxy_prompt(0).contains("Review kind: plan"));
+        assert_eq!(closer.intents(), ["plan", "hand_back"]);
+        let worker = provider.worker_calls.lock().unwrap();
+        assert!(last_user_text(&worker[1]).contains("tests first"));
+    }
+
+    #[test]
+    fn a_kick_started_fold_keeps_the_task_goal() {
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        let (c, _closer, _tx) = task_run(&hub, |_| true);
+        assert_eq!(fold_goal(&c), "做登入");
+        let (mut c, _closer, _tx) = task_run(&hub, |_| true);
+        c.prompt = "real prompt".into();
+        assert_eq!(fold_goal(&c), "real prompt");
     }
 }

@@ -8,6 +8,7 @@ use grokaagent::config::ProviderConfig;
 use grokaagent::events::JsonlSink;
 use grokaagent::kit::{self, KernelSpec};
 use grokaagent::provider::{AnyProvider, ReasoningEffort};
+use grokaagent::task::TaskHub;
 use grokaagent::tui::{self, TuiOptions};
 use grokaagent::worker::{self, WorkerConfig, WorkerMode};
 
@@ -66,6 +67,14 @@ enum Command {
         /// (repeatable; in order). For scripted multi-turn runs.
         #[arg(long = "then")]
         then: Vec<String>,
+        /// Run in task mode with this goal: the user's proxy (a separate
+        /// model call) pushes the agent until it is satisfied or hands the
+        /// task back. The prompt becomes optional.
+        #[arg(long)]
+        task: Option<String>,
+        /// Acceptance criteria and preferences for --task.
+        #[arg(long, requires = "task")]
+        criteria: Option<String>,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -286,11 +295,19 @@ async fn real_main() -> grokaagent::Result<()> {
             workspace,
             reasoning,
             then,
+            task,
+            criteria,
             api,
         }) => {
-            let prompt = match prompt {
-                Some(p) => p,
-                None => {
+            let task = task.map(|t| t.trim().to_string());
+            if task.as_deref() == Some("") {
+                return Err(grokaagent::Error::EmptyPrompt);
+            }
+            let prompt = match (prompt, &task) {
+                (Some(p), _) => p,
+                // Task mode needs no prompt of its own: the proxy opens.
+                (None, Some(_)) => grokaagent::task::KICK.to_string(),
+                (None, None) => {
                     let mut buf = String::new();
                     io::stdin().read_to_string(&mut buf)?;
                     buf
@@ -307,7 +324,18 @@ async fn real_main() -> grokaagent::Result<()> {
             let (cfg, model) = boot_provider(api, model, false)?;
             let mut sink: Arc<dyn grokaagent::events::EventSink> = Arc::new(JsonlSink::create(&events)?);
             let mut inbox = None;
-            if !then.is_empty() {
+            // In memory only (no session id): nothing is persisted.
+            let hub = task.as_ref().map(|goal| {
+                let hub = TaskHub::new("");
+                hub.start_task(goal.as_str(), criteria.unwrap_or_default());
+                hub
+            });
+            if let Some(hub) = &hub {
+                // The session stays open while the proxy keeps pushing.
+                let (driver, rx) = kit::TaskDriver::new(sink, hub.clone(), then);
+                sink = driver;
+                inbox = Some(rx);
+            } else if !then.is_empty() {
                 let (feeder, rx) = kit::Followups::new(sink, then);
                 sink = feeder;
                 inbox = Some(rx);
@@ -345,10 +373,15 @@ async fn real_main() -> grokaagent::Result<()> {
                     context_window,
                     cancel: None,
                     skills: None,
-                    task: None,
+                    task: hub.clone(),
                 },
             )
-            .await?;
+            .await;
+            if let Some(hub) = &hub {
+                let s = hub.snapshot();
+                eprintln!("task: {} ({} proxy message(s)) {}", s.phase.label(), s.rounds, s.review_note);
+            }
+            let outcome = outcome?;
             println!("{}", outcome.text);
             for (i, u) in outcome.cache_turns.iter().enumerate() {
                 eprintln!(

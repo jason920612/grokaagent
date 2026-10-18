@@ -7,6 +7,7 @@ the user's real data. Only the xAI login is shared (Grok models need it).
 
     python evals/run.py --models grok-4.7,deepseek-v4.1-flash
     python evals/run.py --models deepseek-v4.1-flash --tasks S1,D2 --trials 2
+    python evals/run.py --models grok-4.7 --task-mode   # the user proxy drives each task
 
 Keys are read from the environment named in evals/models.json (never from
 argv, never printed). Results land in evals/results/<stamp>/; see report.py.
@@ -121,7 +122,7 @@ def event_metrics(events: Path) -> dict:
         "turns": 0, "tool_calls": 0, "tool_errors": 0, "tools": {}, "tool_error_samples": [],
         "edit_file_errors": 0, "children": 0, "child_names": [], "input_tokens": 0,
         "cached_tokens": 0, "compactions": 0, "errors": [], "finish": "", "final_text": "",
-        "root_turns": 0, "server_tools": 0,
+        "root_turns": 0, "server_tools": 0, "proxy_messages": 0,
     }
     if not events.exists():
         return m
@@ -162,6 +163,8 @@ def event_metrics(events: Path) -> dict:
             m["child_names"].append(e.get("name", ""))
         elif typ == "context_compacted":
             m["compactions"] += 1
+        elif typ == "task_proxy" and e.get("intent") != "report":
+            m["proxy_messages"] += 1
         elif typ == "error":
             m["errors"].append(e.get("message", "")[:300])
         elif typ == "run_finished" and root:
@@ -172,7 +175,8 @@ def event_metrics(events: Path) -> dict:
     return m
 
 
-def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_root: Path) -> dict:
+def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_root: Path,
+            task_mode: bool = False) -> dict:
     run_dir = out_root / alias / task["id"] / f"t{trial}"
     if run_dir.exists():
         shutil.rmtree(run_dir)
@@ -203,7 +207,14 @@ def run_one(bin_path: Path, alias: str, m: dict, task: dict, trial: int, out_roo
     # Later user messages, each sent when the agent waits for input.
     for msg in task.get("followups", []):
         cmd += ["--then", msg]
-    cmd.append(task["prompt"])
+    if task_mode:
+        # The prompt becomes the goal; the user proxy pushes until it is
+        # satisfied or hands back.
+        cmd += ["--task", task["prompt"]]
+        if task.get("criteria"):
+            cmd += ["--criteria", task["criteria"]]
+    else:
+        cmd.append(task["prompt"])
     timeout = task.get("timeout_s", 600)
     log(f"start  {alias:22s} {task['id']} t{trial}")
     t0 = time.time()
@@ -243,6 +254,9 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--rerun-invalid", action="store_true",
                     help="with --out: rerun only runs that died on provider errors, in place")
+    ap.add_argument("--task-mode", action="store_true",
+                    help="run each task in task mode: its prompt is the goal (with its criteria, if any) "
+                         "and the user proxy drives the agent")
     args = ap.parse_args()
 
     models = load_models()
@@ -261,7 +275,7 @@ def main() -> None:
     (out_root / "run.json").write_text(json.dumps({
         "models": {a: models[a] for a in aliases}, "tasks": [t["id"] for t in tasks],
         "trials": args.trials, "started": dt.datetime.now().isoformat(),
-        "bin": str(args.bin),
+        "bin": str(args.bin), "task_mode": args.task_mode,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"{len(aliases)} model(s) x {len(tasks)} task(s) x {args.trials} trial(s) -> {out_root}")
 
@@ -285,7 +299,7 @@ def main() -> None:
             for a in aliases:
                 if only is not None and (a, t["id"], trial) not in only:
                     continue
-                futures.append(pools[a].submit(run_one, args.bin, a, models[a], t, trial, out_root))
+                futures.append(pools[a].submit(run_one, args.bin, a, models[a], t, trial, out_root, args.task_mode))
     for f in cf.as_completed(futures):
         try:
             results.append(f.result())

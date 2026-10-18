@@ -6,8 +6,10 @@
 
 /// A child agent's news: `[child agent `name` replied …]`, `paused`, `exited`.
 pub const CHILD: &str = "[child agent `";
-/// The task supervisor's steering messages.
+/// The old task supervisor's steering messages (still in saved histories).
 pub const TASK_SYSTEM: &str = "[task-system]";
+/// The task-mode user proxy's messages: written for the user, not by them.
+pub const USER_PROXY: &str = "[user-proxy]";
 /// Task mode resumed without a new prompt.
 pub const TASK_MODE: &str = "Task mode is on. Goal:";
 /// The repetition-loop guard's retry note.
@@ -20,6 +22,7 @@ pub const INTERRUPT: &str = "The user pressed Esc and interrupted the previous m
 const PREFIXES: &[&str] = &[
     CHILD,
     TASK_SYSTEM,
+    USER_PROXY,
     TASK_MODE,
     LOOP_GUARD,
     REQUEST_FAILED,
