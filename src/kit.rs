@@ -687,6 +687,10 @@ mod tests {
     /// `grokaagent run --task` minus the CLI: a kick-started task run whose
     /// inbox the driver owns. It must end on its own.
     async fn headless(provider: &Arc<Headless>, hub: &Arc<crate::task::TaskHub>) -> (Result<RunOutcome>, Vec<AgentEvent>) {
+        headless_capped(provider, hub, 0).await
+    }
+
+    async fn headless_capped(provider: &Arc<Headless>, hub: &Arc<crate::task::TaskHub>, max_turns: u32) -> (Result<RunOutcome>, Vec<AgentEvent>) {
         let dir = tempfile::tempdir().unwrap();
         let rec = Arc::new(Rec(Mutex::new(Vec::new())));
         let (driver, rx) = TaskDriver::new(rec.clone(), hub.clone(), vec![]);
@@ -695,7 +699,7 @@ mod tests {
             instructions: "use tools".into(),
             prompt: crate::task::KICK.into(),
             model: "grok-4.6".into(),
-            max_turns: 0,
+            max_turns,
             server_tools: vec![],
             context_window: 0,
             compact_keep_recent: 0,
@@ -752,6 +756,20 @@ mod tests {
         assert!(hub.snapshot().paused);
         assert_eq!(provider.calls().0, 3, "the plan, then one review tried twice");
         assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { .. })));
+    }
+
+    #[tokio::test]
+    async fn max_turns_bounds_a_headless_task_the_proxy_never_accepts() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("make every test pass");
+        // The proxy always wants more; the worker always answers.
+        let provider = Headless::new(vec![], Some(json!({"status": "continue", "message": "Not yet. Keep going."})), vec!["working"; 50]);
+        let (out, events) = headless_capped(&provider, &hub, 3).await;
+        assert!(matches!(out, Err(crate::error::Error::MaxTurns(3))), "{out:?}");
+        let (proxy, worker) = provider.calls();
+        assert_eq!(worker, 3, "the proxy's pushes count against the cap");
+        assert_eq!(proxy, 1 + 3, "the plan and a push at each stop");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { reason, .. } if reason == "max_turns")));
     }
 
     #[tokio::test]

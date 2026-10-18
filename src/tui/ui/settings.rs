@@ -11,7 +11,7 @@ use crate::tui::edit::display_cols;
 use crate::tui::settings::{CatalogStatus, DropKind, Field, LoginUi};
 use crate::tui::theme::*;
 
-const LABEL_W: u16 = 18;
+const LABEL_W: u16 = 20;
 const FORM_W: u16 = 84;
 
 /// Field ↔ hit id.
@@ -51,6 +51,16 @@ fn toggle(f: &mut Frame, app: &mut App, x: u16, y: u16, on: bool, focused: bool,
     };
     line(f, r, if on { " 開 " } else { " 關 " }, style);
     app.ui.hits.push((r, hit));
+}
+
+/// The child and task model boxes when they share a row.
+const PAIR_LABEL: &str = "子代理／任務代理";
+
+/// Names a box on its top border, for boxes that share a row.
+fn box_title(f: &mut Frame, area: Rect, title: &str, focused: bool) {
+    let text = format!(" {title} ");
+    let w = display_cols(&text).min(area.width.saturating_sub(4));
+    line(f, Rect::new(area.x + 2, area.y, w, 1), text, Style::default().fg(if focused { ACCENT } else { DIM }));
 }
 
 fn combo(f: &mut Frame, app: &mut App, area: Rect, label: &str, focused: bool, open: bool, hit: Hit) {
@@ -103,6 +113,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
     let row_label = |f: &mut Frame, y: u16, text: &str, on: bool| {
         line(f, Rect::new(x, y + 1, LABEL_W, 1), text, focus_style(on));
     };
+    // Down to the last toggle with every box on its own row. A shorter
+    // screen puts the child and task model boxes side by side, so the
+    // fields and toggles after them stay in view.
+    let boxes: u16 = if openai { 6 } else { 4 };
+    let need = y + if openai { 0 } else { 2 } + 3 * boxes + 5;
+    let pair = need > bottom && ctl_w >= 40;
+    let pair_w = (ctl_w.saturating_sub(1) / 2).min(40);
 
     if !openai {
         // Account.
@@ -134,22 +151,35 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
             CatalogStatus::Failed(e) => format!("  （目錄失敗：{e}）"),
             _ => String::new(),
         };
-        // Model, child model, effort.
-        for (fld, label, value, kind) in [
-            (Field::Model, format!("模型{status}"), app.model_label(), DropKind::Model),
-            (Field::ChildModel, "子代理模型".to_string(), app.child_model_label(), DropKind::ChildModel),
-            (Field::TaskModel, "任務代理模型".to_string(), app.task_model_label(), DropKind::TaskModel),
-            (Field::Effort, "思考強度".to_string(), app.effort_label(), DropKind::Effort),
-        ] {
+        // Model, child model, task model, effort.
+        let model = (Field::Model, format!("模型{status}"), app.model_label(), DropKind::Model, "");
+        let child = (Field::ChildModel, "子代理模型".to_string(), app.child_model_label(), DropKind::ChildModel, "子代理");
+        let task = (Field::TaskModel, "任務代理模型".to_string(), app.task_model_label(), DropKind::TaskModel, "任務代理");
+        let effort = (Field::Effort, "思考強度".to_string(), app.effort_label(), DropKind::Effort, "");
+        let rows = if pair {
+            vec![vec![model], vec![child, task], vec![effort]]
+        } else {
+            vec![vec![model], vec![child], vec![task], vec![effort]]
+        };
+        for row in rows {
             if y + 3 > bottom {
                 break;
             }
-            row_label(f, y, &label, focused && field == fld);
-            let r = Rect::new(ctl_x, y, ctl_w.min(40), 3);
-            let open = app.settings.drop == Some(kind);
-            combo(f, app, r, &value, focused && field == fld, open, field_hit(fld));
-            if open {
-                drop_anchor = Some(r);
+            let shared = row.len() > 1;
+            let on_row = row.iter().any(|c| focused && field == c.0);
+            row_label(f, y, if shared { PAIR_LABEL } else { &row[0].1 }, on_row);
+            let w = if shared { pair_w } else { ctl_w.min(40) };
+            for (i, (fld, _, value, kind, title)) in row.into_iter().enumerate() {
+                let on = focused && field == fld;
+                let r = Rect::new(ctl_x + i as u16 * (w + 1), y, w, 3);
+                let open = app.settings.drop == Some(kind);
+                combo(f, app, r, &value, on, open, field_hit(fld));
+                if shared {
+                    box_title(f, r, title, on);
+                }
+                if open {
+                    drop_anchor = Some(r);
+                }
             }
             y += 3;
         }
@@ -169,47 +199,70 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         } else {
             "模型名".to_string()
         };
-        let rows: Vec<(Field, String)> = vec![
-            (Field::Endpoint, "端點".into()),
-            (Field::ApiKey, "API 金鑰（選填）".into()),
-            (Field::Model, model_title),
-            (Field::ChildModel, if has_list { "子代理模型".into() } else { "子代理（空=同主）".into() }),
-            (Field::TaskModel, if has_list { "任務代理模型".into() } else { "任務代理（空=同主）".into() }),
-            (Field::Context, "上下文（如 262K）".into()),
-        ];
-        for (fld, label) in rows {
+        let label_of = |fld: Field| -> String {
+            match fld {
+                Field::Endpoint => "端點".into(),
+                Field::ApiKey => "API 金鑰（選填）".into(),
+                Field::Model => model_title.clone(),
+                Field::ChildModel if has_list => "子代理模型".into(),
+                Field::ChildModel => "子代理（空=同主）".into(),
+                Field::TaskModel if has_list => "任務代理模型".into(),
+                Field::TaskModel => "任務代理（空=同主）".into(),
+                _ => "上下文（如 262K）".into(),
+            }
+        };
+        let rows: Vec<Vec<Field>> = if pair {
+            vec![vec![Field::Endpoint], vec![Field::ApiKey], vec![Field::Model], vec![Field::ChildModel, Field::TaskModel], vec![Field::Context]]
+        } else {
+            [Field::Endpoint, Field::ApiKey, Field::Model, Field::ChildModel, Field::TaskModel, Field::Context].into_iter().map(|f| vec![f]).collect()
+        };
+        for row in rows {
             if y + 3 > bottom {
                 break;
             }
-            let on = focused && field == fld;
-            row_label(f, y, &label, on);
-            let r = Rect::new(ctl_x, y, ctl_w, 3);
-            match fld {
-                Field::Model | Field::ChildModel | Field::TaskModel if has_list => {
-                    let (kind, value) = match fld {
-                        Field::Model => (DropKind::Model, app.model_label()),
-                        Field::ChildModel => (DropKind::ChildModel, app.child_model_label()),
-                        _ => (DropKind::TaskModel, app.task_model_label()),
-                    };
-                    let open = app.settings.drop == Some(kind);
-                    combo(f, app, Rect::new(r.x, r.y, r.width.min(48), 3), &value, on, open, field_hit(fld));
-                    if open {
-                        drop_anchor = Some(r);
+            let shared = row.len() > 1;
+            let on_row = row.iter().any(|c| focused && field == *c);
+            row_label(f, y, &if shared { PAIR_LABEL.to_string() } else { label_of(row[0]) }, on_row);
+            let w = if shared { pair_w } else { ctl_w };
+            for (i, fld) in row.into_iter().enumerate() {
+                let on = focused && field == fld;
+                let r = Rect::new(ctl_x + i as u16 * (w + 1), y, w, 3);
+                match fld {
+                    Field::Model | Field::ChildModel | Field::TaskModel if has_list => {
+                        let (kind, value) = match fld {
+                            Field::Model => (DropKind::Model, app.model_label()),
+                            Field::ChildModel => (DropKind::ChildModel, app.child_model_label()),
+                            _ => (DropKind::TaskModel, app.task_model_label()),
+                        };
+                        let open = app.settings.drop == Some(kind);
+                        combo(f, app, Rect::new(r.x, r.y, r.width.min(48), 3), &value, on, open, field_hit(fld));
+                        if open {
+                            drop_anchor = Some(r);
+                        }
+                    }
+                    _ => {
+                        let edit = match fld {
+                            Field::Endpoint => &endpoint,
+                            Field::ApiKey => &api_key,
+                            Field::Model => &model_edit,
+                            Field::ChildModel => &child_edit,
+                            Field::TaskModel => &task_edit,
+                            _ => &context,
+                        };
+                        let pos = boxed_edit(f, app, r, edit, on, field_hit(fld), fld == Field::ApiKey);
+                        if on {
+                            caret = Some(pos);
+                        }
                     }
                 }
-                _ => {
-                    let edit = match fld {
-                        Field::Endpoint => &endpoint,
-                        Field::ApiKey => &api_key,
-                        Field::Model => &model_edit,
-                        Field::ChildModel => &child_edit,
-                        Field::TaskModel => &task_edit,
-                        _ => &context,
+                if shared {
+                    let title = match (fld, has_list) {
+                        (Field::ChildModel, true) => "子代理",
+                        (Field::ChildModel, false) => "子代理（空=同主）",
+                        (_, true) => "任務代理",
+                        (_, false) => "任務代理（空=同主）",
                     };
-                    let pos = boxed_edit(f, app, r, edit, on, field_hit(fld), fld == Field::ApiKey);
-                    if on {
-                        caret = Some(pos);
-                    }
+                    box_title(f, r, title, on);
                 }
             }
             y += 3;

@@ -1179,6 +1179,8 @@ mod tests {
             dispatcher: false,
             child_model: "grok-3-mini".into(),
             task_model: String::new(),
+            task_reasoning_effort: crate::provider::ReasoningEffort::High,
+            task_send_reasoning: true,
             search: false,
         }));
         let n = nursery(&dir, 0, Some(knobs.clone()));

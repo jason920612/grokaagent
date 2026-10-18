@@ -788,3 +788,125 @@ fn a_row_from_a_newer_version_costs_only_itself() {
     assert_eq!(&text[3..], ["kept proxy", "kept after"]);
     assert!(super::model::rows::decode_rows(&json!({"not": "a list"})).is_empty());
 }
+
+#[test]
+fn an_edit_while_the_worker_explains_a_failure_reopens_the_task() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let _rx = live_run(app);
+    app.cur().task.replace(TaskState {
+        goal: "deploy".into(),
+        phase: TaskPhase::ExplainingFail,
+        fail_reason: "no credentials exist".into(),
+        review_note: "no credentials exist".into(),
+        rounds: 2,
+        ..TaskState::default()
+    });
+    app.edit_task("deploy", "creds are now in .env");
+    let t = task(app);
+    assert_eq!((t.phase, t.fail_reason.as_str(), t.rounds), (TaskPhase::Active, "", 2));
+    assert!(t.review_note.is_empty());
+    assert!(app.cur().task.take_review_request(), "the proxy reviews the change at the stop");
+}
+
+#[test]
+fn ending_or_replacing_the_task_closes_its_intake_question() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let _live = live_run(app);
+    let hub = AskUserHub::new();
+    app.cur_mut().ask_hub = Some(hub.clone());
+    let options = vec![
+        Choice { id: "opt0".into(), label: "一份 PDF".into(), input: false },
+        Choice { id: "skip".into(), label: "略過，直接開始".into(), input: false },
+    ];
+    let ask = |app: &mut App, agent: &str| {
+        let m = meta(app, agent);
+        app.route_event(AgentEvent::AskUser { meta: m, question: "最後要交出什麼？".into(), allow_multiple: false, options: options.clone() });
+    };
+    app.start_task("goal", "");
+    ask(app, task::AGENT_NAME);
+    let mut rx = hub.register();
+    app.end_task();
+    assert!(app.cur().ask.is_none(), "no question left about an ended task");
+    assert!(rx.try_recv().unwrap().contains("\"cancelled\":true"));
+    // Replacing the task (here from the web, once it ended) does the same.
+    ask(app, task::AGENT_NAME);
+    let _rx = hub.register();
+    app.start_task("other goal", "");
+    assert!(app.cur().ask.is_none());
+    // The agent's own question is not the task's.
+    ask(app, "root");
+    app.end_task();
+    assert!(app.cur().ask.is_some());
+}
+
+#[test]
+fn a_stale_web_form_does_not_replace_a_live_task() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let _rx = live_run(app);
+    let sid = app.current.clone();
+    app.start_task("TUI 的任務", "");
+    let mut s = task(app);
+    s.rounds = 1;
+    s.last_proxy = "先寫測試".into();
+    app.cur().task.replace(s);
+    bridge::apply_command(app, UiCommand::StartTask { session_id: sid.clone(), goal: "網頁草稿的目標".into(), criteria: String::new() });
+    let t = task(app);
+    assert_eq!((t.goal.as_str(), t.rounds, t.last_proxy.as_str()), ("TUI 的任務", 1, "先寫測試"));
+    // With no task set, the web starts one as before.
+    app.end_task();
+    bridge::apply_command(app, UiCommand::StartTask { session_id: sid, goal: "網頁草稿的目標".into(), criteria: String::new() });
+    assert_eq!(task(app).goal, "網頁草稿的目標");
+}
+
+#[test]
+fn a_task_model_of_its_own_gets_its_own_effort() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    app.settings.grok_catalog = crate::catalog::parse_catalog_value(&json!({
+        "data": [
+            {"id": "grok-4.6", "name": "Grok", "reasoning_efforts": ["low", "high"]},
+            {"id": "plain", "name": "Plain"}
+        ]
+    }))
+    .unwrap();
+    app.rebuild_catalog();
+    app.select_task_model("plain".into());
+    let k = app.knobs.lock().unwrap().clone();
+    assert_eq!(k.task_model, "plain");
+    assert!(!k.task_send_reasoning, "a model with no efforts is sent none");
+    let (model, _, send) = task::proxy_settings(Some(&app.knobs), "x", ReasoningEffort::High);
+    assert_eq!((model.as_str(), send), ("plain", false));
+}
+
+#[test]
+fn settings_fit_a_standard_terminal() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    app.ui.side_open = false; // it floats over the tab this narrow
+    app.open_settings();
+    // Grok: the child and task model boxes share a row, so the toggles
+    // after them stay in view.
+    let screen = render(app, 80, 24);
+    assert!(screen.contains("子代理／任務代理") && screen.contains("任務代理"), "{screen}");
+    assert!(screen.contains("調度員模式") && screen.contains("引入Codex技能"), "{screen}");
+    app.settings.field = Field::TaskModel;
+    press(app, KeyCode::Enter);
+    assert_eq!(app.settings.drop, Some(DropKind::TaskModel));
+    press(app, KeyCode::Esc);
+    // A custom endpoint keeps its context field.
+    app.set_provider_kind(ProviderKind::Openai);
+    app.settings.custom_catalog = Default::default();
+    let screen = render(app, 80, 24);
+    assert!(screen.contains("上下文") && screen.contains("任務代理（空=同主）"), "{screen}");
+    click(app, hit_rect(app, ui::settings::field_hit(Field::TaskModel)));
+    assert_eq!(app.settings.field, Field::TaskModel);
+    type_text(app, "local-proxy");
+    app.flush_conn();
+    assert_eq!(app.knobs.lock().unwrap().task_model, "local-proxy");
+    // A tall screen keeps a row each, with the label in full.
+    let screen = render(app, 120, 50);
+    assert!(!screen.contains("子代理／任務代理") && screen.contains("任務代理（空=同主）"), "{screen}");
+}

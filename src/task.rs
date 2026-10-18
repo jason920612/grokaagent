@@ -407,8 +407,12 @@ impl TaskHub {
         g.goal = goal;
         g.criteria = criteria;
         g.ending = None;
-        if g.phase == TaskPhase::Done {
+        // A failure the worker is still explaining reopens too: the proxy
+        // reviews the change instead of the task ending as failed.
+        if matches!(g.phase, TaskPhase::Done | TaskPhase::ExplainingFail) {
             g.phase = TaskPhase::Active;
+            g.fail_reason.clear();
+            g.claim = None;
         }
         drop(g);
         self.persist();
@@ -1176,7 +1180,8 @@ pub struct ProxyCall<'a, P> {
 }
 
 /// The proxy's model, effort and whether to send the effort: the task
-/// model when the user picked one, else the main model; the main effort.
+/// model when the user picked one, with the effort worked out for it;
+/// else the main model and its effort.
 pub fn proxy_settings(
     knobs: Option<&Arc<Mutex<SessionKnobs>>>,
     model: &str,
@@ -1186,8 +1191,11 @@ pub fn proxy_settings(
         Some(k) => {
             let g = k.lock().unwrap_or_else(|e| e.into_inner());
             let task = g.task_model.trim();
-            let model = if task.is_empty() { g.model.clone() } else { task.to_string() };
-            (model, g.reasoning_effort, g.send_reasoning)
+            if task.is_empty() {
+                (g.model.clone(), g.reasoning_effort, g.send_reasoning)
+            } else {
+                (task.to_string(), g.task_reasoning_effort, g.task_send_reasoning)
+            }
         }
         None => (model.to_string(), effort, true),
     }
@@ -1461,18 +1469,53 @@ fn closing_message(e: &Ending) -> String {
     }
 }
 
-/// First turn after task mode starts: the opening brief.
-pub async fn prepare_first_turn<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value]) -> Option<String> {
-    let s = call.hub.snapshot();
-    if let Some(e) = s.ending.as_ref().filter(|_| s.phase.is_live()) {
-        // The run stopped (the app closed) while the worker owed its
-        // closing summary: ask for it again; the next stop ends the task.
-        return Some(closing_message(e));
-    }
-    if s.phase != TaskPhase::NeedPlan || s.paused {
+/// The worker's last reply in `history`.
+fn last_reply(history: &[Value]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|i| i.get("role").and_then(Value::as_str) == Some("assistant"))
+        .map(item_plain)
+        .unwrap_or_default()
+}
+
+/// First turn of a run: a new task's opening brief. A run the UI started
+/// for a live task (`kick`, no prompt of its own) also asks again for a
+/// closing turn the worker still owes, or takes the look the user asked
+/// for; a run started by the user's own message leaves the floor to it.
+pub async fn prepare_first_turn<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], kick: bool) -> Option<String> {
+    let hub = call.hub;
+    let s = hub.snapshot();
+    if !s.phase.is_live() {
         return None;
     }
-    review(call, history, "", Kind::Plan, "").await
+    if kick {
+        // The run stopped (the app closed, Esc) while the worker owed its
+        // closing turn: ask for it again; the next stop ends the task.
+        if let Some(e) = &s.ending {
+            return Some(closing_message(e));
+        }
+        if s.phase == TaskPhase::ExplainingFail {
+            hub.take_review_request();
+            hub.take_resumed();
+            return Some(impossible_message(&s.fail_reason));
+        }
+    }
+    if s.paused {
+        return None;
+    }
+    if s.phase == TaskPhase::NeedPlan {
+        return review(call, history, "", Kind::Plan, "").await;
+    }
+    if kick && s.phase == TaskPhase::Active && !s.skip_steer && s.ending.is_none() {
+        let asked = hub.take_review_request();
+        let resumed = hub.take_resumed();
+        if asked || resumed {
+            let why = if asked { "the user asked you to look now" } else { "the user resumed you" };
+            return review(call, history, &last_reply(history), Kind::Push, why).await;
+        }
+    }
+    None
 }
 
 /// After the worker stopped on its own. `None` = wait for the user.
@@ -1487,11 +1530,16 @@ pub async fn after_natural_stop<P: Provider>(
         return None;
     }
     let s = hub.snapshot();
-    if !s.phase.is_live() || s.paused || s.skip_steer {
+    if !s.phase.is_live() {
         return None;
     }
     if s.phase == TaskPhase::ExplainingFail {
+        // The worker explained. Finishing is no proxy call, so a pause or
+        // an Esc stop does not hold it.
         finish_failed(call);
+        return None;
+    }
+    if s.paused || s.skip_steer {
         return None;
     }
     // This look answers any pending request or resume.
@@ -1520,8 +1568,20 @@ pub async fn after_wait<P: Provider>(
         return None;
     }
     let s = hub.snapshot();
-    if !s.phase.is_live() || s.paused || s.phase == TaskPhase::ExplainingFail || s.ending.is_some() {
+    if !s.phase.is_live() || s.paused {
         return None;
+    }
+    if s.ending.is_some() || s.phase == TaskPhase::ExplainingFail {
+        // The worker still owes its closing turn (an Esc stopped it): a
+        // review request or a resume asks for it again, nothing else does.
+        if !(hub.take_review_request() | hub.take_resumed()) {
+            return None;
+        }
+        hub.set_skip_steer(false);
+        return Some(match &s.ending {
+            Some(e) => closing_message(e),
+            None => impossible_message(&s.fail_reason),
+        });
     }
     let asked = hub.take_review_request();
     let resumed = hub.take_resumed();
@@ -1686,6 +1746,11 @@ async fn intake<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], epoch: 
     };
     let mut lines = Vec::new();
     for q in &questions {
+        // Ended or replaced while the proxy thought it over: no questions
+        // about a task that is gone.
+        if hub.epoch() != epoch {
+            return;
+        }
         let rx = ask.register();
         call.sink.emit(&AgentEvent::AskUser {
             meta: EventMeta { agent_name: AGENT_NAME.into(), ..meta(call.run_id) },
@@ -1693,10 +1758,9 @@ async fn intake<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], epoch: 
             allow_multiple: false,
             options: intake_choices(q),
         });
-        let body = rx.await.unwrap_or_else(|_| cancelled_json());
-        if hub.epoch() != epoch {
+        let Some(body) = intake_wait(hub, epoch, rx).await else {
             return;
-        }
+        };
         match intake_answer(&body) {
             Some(a) => lines.push(format!("用戶補充：{} → {a}", q.question)),
             None => break,
@@ -1713,11 +1777,36 @@ async fn intake<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], epoch: 
             push_log(s, "user", line.clone());
         }
         let add = lines.join("\n");
-        s.criteria = if s.criteria.trim().is_empty() { add } else { format!("{}\n{add}", s.criteria.trim_end()) };
+        let all = if s.criteria.trim().is_empty() { add } else { format!("{}\n{add}", s.criteria.trim_end()) };
+        // Within the limit the edit form and edit_task hold criteria to,
+        // so a later edit does not cut the answers off.
+        s.criteria = clip(&all, MAX_CRITERIA);
         true
     });
     if added {
         emit_notice(call.sink, call.run_id, "已把你的回答加進驗收條件".into());
+    }
+}
+
+/// The user's answer to an intake question, or `None` once the task was
+/// ended or replaced: the run stops waiting on a questionnaire about a
+/// task that is gone (the UI dismisses it).
+async fn intake_wait(hub: &TaskHub, epoch: u64, mut rx: tokio::sync::oneshot::Receiver<String>) -> Option<String> {
+    loop {
+        // Ending and starting a task bump the epoch, then kick.
+        let kicked = hub.kick.notified();
+        tokio::pin!(kicked);
+        kicked.as_mut().enable();
+        if hub.epoch() != epoch {
+            return None;
+        }
+        tokio::select! {
+            body = &mut rx => {
+                let body = body.unwrap_or_else(|_| cancelled_json());
+                return (hub.epoch() == epoch).then_some(body);
+            }
+            _ = kicked => {}
+        }
     }
 }
 
@@ -2554,7 +2643,7 @@ mod proxy_tests {
         hub.start_goal("做登入");
         let rec = Rec(Mutex::new(Vec::new()));
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        let out = prepare_first_turn(&call, &[]).await.expect("a plan message");
+        let out = prepare_first_turn(&call, &[], true).await.expect("a plan message");
         assert!(out.contains("再跑一次測試"), "{out}");
         let reqs = provider.calls.lock().unwrap();
         assert_eq!(reqs.len(), MAX_PROXY_TOOL_CALLS + 1);
@@ -2574,7 +2663,7 @@ mod proxy_tests {
         let hub = TaskHub::new("");
         hub.start_goal("x");
         let call = proxy_call(&hub, &stubborn, dir.path(), &rec);
-        assert!(prepare_first_turn(&call, &[]).await.is_none());
+        assert!(prepare_first_turn(&call, &[], true).await.is_none());
         assert!(stubborn.n() <= 2 * (MAX_PROXY_TOOL_CALLS + 1), "{}", stubborn.n());
         assert!(hub.snapshot().paused);
     }
@@ -2608,7 +2697,7 @@ mod proxy_tests {
             Err(Error::Provider("HTTP 503".into())),
             says(json!({"status": "continue", "message": "開始吧"})),
         ]);
-        let out = prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await;
+        let out = prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await;
         assert!(out.unwrap().contains("開始吧"));
         assert!(!hub.snapshot().paused);
         // Two failures: paused with a note; no more calls while paused.
@@ -2643,7 +2732,7 @@ mod proxy_tests {
             Err(Error::Provider("HTTP 400: model does not support reasoning effort".into())),
             says(json!({"status": "continue", "message": "go"})),
         ]);
-        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await.unwrap();
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await.unwrap();
         let reqs = provider.calls.lock().unwrap();
         assert!(reqs[0].send_reasoning && !reqs[1].send_reasoning);
     }
@@ -2662,7 +2751,7 @@ mod proxy_tests {
             says(json!({"status": "satisfied", "checklist": [], "note": "驗收", "reason": "cargo test: 4 passed; form.rs read"})),
         ]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        prepare_first_turn(&call, &[]).await.unwrap();
+        prepare_first_turn(&call, &[], true).await.unwrap();
         let out = after_natural_stop(&call, &[], "done").await.unwrap();
         assert!(out.contains("still open") && out.contains("做表單"), "{out}");
         assert!(!hub.ending_pending());
@@ -2703,7 +2792,7 @@ mod proxy_tests {
             says(json!({"status": "continue", "message": "改用 OAuth 吧"})),
         ]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        prepare_first_turn(&call, &[]).await.unwrap();
+        prepare_first_turn(&call, &[], true).await.unwrap();
         assert!(after_wait(&call, &[], "", &["用 SQLite 就好".into()]).await.is_none(), "the worker handles the user first");
         hub.edit_task("做 OAuth 登入", "要有測試，不要密碼");
         let out = after_wait(&call, &[], "", &[]).await.expect("an edit asks for a review");
@@ -2745,7 +2834,7 @@ mod proxy_tests {
             workspace: dir.path(),
             sink: &rec,
         };
-        assert!(prepare_first_turn(&call, &[]).await.is_none());
+        assert!(prepare_first_turn(&call, &[], true).await.is_none());
         let s = hub.snapshot();
         assert_eq!((s.goal.as_str(), s.phase, s.rounds), ("別的目標", TaskPhase::NeedPlan, 0));
     }
@@ -2762,7 +2851,7 @@ mod proxy_tests {
             says(json!({"status": "continue", "message": "同一個指令失敗三次了，先讀錯誤訊息"})),
         ]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        prepare_first_turn(&call, &[]).await.unwrap();
+        prepare_first_turn(&call, &[], true).await.unwrap();
         assert!(checkpoint(&call, &[], "", "30 tool rounds").await.is_none());
         assert_eq!(hub.snapshot().review_note, "還在正軌上");
         assert_eq!(hub.snapshot().rounds, 1);
@@ -2783,12 +2872,12 @@ mod proxy_tests {
             says(json!({"status": "impossible", "reason": "沒有任何憑證"})),
         ]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        let out = prepare_first_turn(&call, &[]).await.unwrap();
+        let out = prepare_first_turn(&call, &[], true).await.unwrap();
         assert!(out.starts_with("[user-proxy] The user's proxy is handing this back to the user: 要部署到哪個區域只有你能決定. Stop working"), "{out}");
         assert!(after_natural_stop(&call, &[], "summary").await.is_none());
         assert_eq!(hub.snapshot().phase, TaskPhase::HandedBack);
         hub.start_goal("部署到正式環境");
-        let out = prepare_first_turn(&call, &[]).await.unwrap();
+        let out = prepare_first_turn(&call, &[], true).await.unwrap();
         assert!(out.contains("cannot be completed: 沒有任何憑證"), "{out}");
         assert_eq!(hub.snapshot().phase, TaskPhase::ExplainingFail);
         assert!(after_natural_stop(&call, &[], "沒做完").await.is_none());
@@ -2804,7 +2893,7 @@ mod proxy_tests {
         hub.start_goal("x");
         let provider = Proxy::new(vec![says(json!({"status": "continue", "message": "go"}))]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        prepare_first_turn(&call, &[]).await.unwrap();
+        prepare_first_turn(&call, &[], true).await.unwrap();
         hub.accept_done();
         assert!(after_natural_stop(&call, &[], "more").await.is_none());
         assert!(checkpoint(&call, &[], "", "x").await.is_none());
@@ -2876,11 +2965,14 @@ mod proxy_tests {
             dispatcher: false,
             child_model: "grok-child".into(),
             task_model: String::new(),
+            task_reasoning_effort: ReasoningEffort::Low,
+            task_send_reasoning: false,
             search: false,
         }));
         assert_eq!(proxy_settings(Some(&knobs), "x", ReasoningEffort::Low), ("grok-main".into(), ReasoningEffort::Xhigh, true));
         knobs.lock().unwrap().task_model = " other-proxy ".into();
-        assert_eq!(proxy_settings(Some(&knobs), "x", ReasoningEffort::Low).0, "other-proxy");
+        // A task model of its own gets the effort worked out for it.
+        assert_eq!(proxy_settings(Some(&knobs), "x", ReasoningEffort::High), ("other-proxy".into(), ReasoningEffort::Low, false));
         assert_eq!(proxy_settings(None, "cli-model", ReasoningEffort::Low), ("cli-model".into(), ReasoningEffort::Low, true));
     }
 
@@ -2898,7 +2990,7 @@ mod proxy_tests {
             says(json!({"status": "continue", "message": "測試呢？"})),
         ]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        prepare_first_turn(&call, &[]).await.unwrap();
+        prepare_first_turn(&call, &[], true).await.unwrap();
         let out = after_natural_stop(&call, &[], "done").await.unwrap();
         assert!(!out.contains("I accept") && out.contains("still open") && out.contains("寫測試"), "{out}");
         assert!(!hub.ending_pending());
@@ -2942,23 +3034,188 @@ mod proxy_tests {
         hub.start_goal("做登入");
         let rec = Rec(Mutex::new(Vec::new()));
         let provider = Proxy::new(vec![says(json!({"status": "satisfied", "reason": "cargo test: 3 passed"}))]);
-        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await.unwrap();
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await.unwrap();
         let saved = serde_json::to_string(&hub.snapshot()).unwrap();
         let back: TaskState = serde_json::from_str(&saved).unwrap();
         assert_eq!(back.ending, Some(Ending { phase: TaskPhase::Done, reason: "cargo test: 3 passed".into() }));
         let hub = TaskHub::from_state("", back);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
-        // A new run asks for the closing summary again; idle wakes do not push.
-        let out = prepare_first_turn(&call, &[]).await.unwrap();
+        // A run the user starts with a message of their own leaves it the
+        // floor; the ending waits for the next stop.
+        assert!(prepare_first_turn(&call, &[], false).await.is_none());
+        assert!(hub.ending_pending());
+        // A run the UI starts asks for the closing summary again; an idle
+        // wake does not push, a review request asks again (after an Esc).
+        let out = prepare_first_turn(&call, &[], true).await.unwrap();
         assert!(out.starts_with("[user-proxy] The user's proxy is satisfied: cargo test: 3 passed. Write the final summary"), "{out}");
-        hub.request_review();
         assert!(after_wait(&call, &[], "", &[]).await.is_none());
+        hub.set_skip_steer(true);
+        hub.request_review();
+        assert_eq!(after_wait(&call, &[], "", &[]).await, Some(out));
         // The next stop ends it.
         assert!(after_natural_stop(&call, &[], "總結").await.is_none());
         let s = hub.snapshot();
         assert_eq!(s.phase, TaskPhase::Done);
         assert!(s.ending.is_none());
         assert_eq!(provider.n(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edit_while_the_worker_explains_a_failure_is_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TaskHub::new("");
+        hub.start_goal("部署到正式環境");
+        let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Proxy::new(vec![
+            says(json!({"status": "impossible", "reason": "沒有任何憑證"})),
+            says(json!({"status": "continue", "message": "憑證在 .env，用它部署"})),
+        ]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        prepare_first_turn(&call, &[], true).await.unwrap();
+        assert_eq!(hub.snapshot().phase, TaskPhase::ExplainingFail);
+        hub.edit_task("部署到正式環境", "憑證現在在 .env");
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::Active);
+        assert!(s.fail_reason.is_empty());
+        // The worker's explanation ends; the proxy reviews the change.
+        let out = after_natural_stop(&call, &[], "沒有憑證，做不到").await.expect("a review of the edit");
+        assert!(out.contains("憑證在 .env"), "{out}");
+        assert_eq!(hub.snapshot().phase, TaskPhase::Active);
+        let prompt = provider.calls.lock().unwrap()[1].input[0]["content"].as_str().unwrap().to_string();
+        assert!(prompt.contains("The user changed the task.") && prompt.contains("憑證現在在 .env"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_pause_or_esc_while_winding_down_still_ends_or_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Rec(Mutex::new(Vec::new()));
+        // Paused while the worker explains: its stop still ends the task.
+        let hub = TaskHub::new("");
+        hub.start_goal("部署");
+        let provider = Proxy::new(vec![says(json!({"status": "impossible", "reason": "沒有憑證"}))]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        prepare_first_turn(&call, &[], true).await.unwrap();
+        hub.set_paused(true);
+        assert!(after_natural_stop(&call, &[], "解釋").await.is_none());
+        assert_eq!(hub.snapshot().phase, TaskPhase::Failed);
+        // Esc'd while the worker explains: a resume or a review asks for
+        // the explanation again; a bare wake does not.
+        let hub = TaskHub::new("");
+        hub.start_goal("部署");
+        let provider = Proxy::new(vec![says(json!({"status": "impossible", "reason": "沒有憑證"}))]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        prepare_first_turn(&call, &[], true).await.unwrap();
+        hub.set_skip_steer(true);
+        assert!(after_wait(&call, &[], "", &[]).await.is_none());
+        hub.set_paused(true);
+        hub.set_paused(false);
+        let out = after_wait(&call, &[], "", &[]).await.expect("asked again");
+        assert!(out.contains("cannot be completed: 沒有憑證"), "{out}");
+        assert!(!hub.snapshot().skip_steer);
+        // A run started for it asks again too, not "work toward it".
+        let again = prepare_first_turn(&call, &[], true).await.unwrap();
+        assert!(again.contains("cannot be completed"), "{again}");
+        assert!(after_natural_stop(&call, &[], "解釋").await.is_none());
+        assert_eq!(hub.snapshot().phase, TaskPhase::Failed);
+        assert_eq!(provider.n(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_started_for_a_live_task_takes_the_look_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let hub = TaskHub::from_state("", TaskState {
+            goal: "ship it".into(),
+            criteria: "with a test".into(),
+            phase: TaskPhase::Active,
+            rounds: 3,
+            ..TaskState::default()
+        });
+        let provider = Proxy::new(vec![says(json!({"status": "continue", "message": "先跑測試給我看"}))]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        // Nothing asked: no look.
+        assert!(prepare_first_turn(&call, &[], true).await.is_none());
+        // A message of the user's own goes first even when a look is asked.
+        hub.request_review();
+        assert!(prepare_first_turn(&call, &[], false).await.is_none());
+        assert_eq!(provider.n(), 0);
+        let history = [json!({"role": "assistant", "content": "上次做到一半"})];
+        let out = prepare_first_turn(&call, &history, true).await.expect("the asked-for look");
+        assert!(out.contains("先跑測試給我看") && out.contains("Criteria: with a test"), "{out}");
+        let prompt = provider.calls.lock().unwrap()[0].input[0]["content"].as_str().unwrap().to_string();
+        assert!(prompt.contains("Review kind: push") && prompt.contains("the user asked you to look now"), "{prompt}");
+        assert!(prompt.contains("The worker's latest reply:\n上次做到一半"), "{prompt}");
+        assert!(!hub.take_review_request());
+    }
+
+    #[tokio::test]
+    async fn intake_keeps_the_criteria_within_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = AskUserHub::new();
+        let hub = TaskHub::new("");
+        hub.start_task("做登入", "x".repeat(1_900));
+        hub.set_ask_hub(Some(ask.clone()));
+        let provider = Proxy::new(vec![
+            says(json!({"ask": true, "questions": [{"question": "要哪種登入？", "options": ["密碼"]}]})),
+            says(json!({"status": "continue", "message": "開始"})),
+        ]);
+        let human = Human::new(&ask, vec![pick(INTAKE_OTHER, INTAKE_OTHER_LABEL, Some(&"y".repeat(250)))]);
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[], true).await.unwrap();
+        let s = hub.snapshot();
+        assert_eq!(s.criteria.chars().count(), MAX_CRITERIA);
+        assert!(s.criteria.contains("用戶補充：要哪種登入？ → yyy"));
+        // The full answer stays in the proxy's memory, and an edit that keeps
+        // the criteria cuts nothing.
+        assert!(s.proxy_log.iter().any(|t| t.who == "user" && t.text.ends_with(&"y".repeat(250))));
+        hub.edit_task("做登入", s.criteria.clone());
+        assert_eq!(hub.snapshot().criteria, s.criteria);
+    }
+
+    #[tokio::test]
+    async fn ending_the_task_during_intake_stops_waiting_for_the_answer() {
+        /// Ends the task while the proxy works out its intake questions.
+        struct EndDuring<'a>(&'a TaskHub, Proxy);
+        impl Provider for EndDuring<'_> {
+            async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+                self.0.end();
+                self.1.complete(req).await
+            }
+            async fn compact(&self, r: crate::provider::CompactRequest) -> Result<crate::provider::CompactResponse> {
+                self.1.compact(r).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ask = AskUserHub::new();
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        hub.set_ask_hub(Some(ask.clone()));
+        let rec = Rec(Mutex::new(Vec::new()));
+        let provider = EndDuring(&hub, Proxy::new(vec![says(json!({"ask": true, "questions": [{"question": "要哪種登入？", "options": ["密碼"]}]}))]));
+        let call = ProxyCall {
+            hub: &hub,
+            provider: &provider,
+            model: "m".into(),
+            effort: ReasoningEffort::Low,
+            send_reasoning: false,
+            run_id: "r",
+            workspace: dir.path(),
+            sink: &rec,
+        };
+        let out = tokio::time::timeout(Duration::from_secs(5), prepare_first_turn(&call, &[], true)).await.expect("no stale wait");
+        assert!(out.is_none());
+        assert!(!rec.0.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::AskUser { .. })), "no question about an ended task");
+        // Ended or replaced while the question is open: the wait ends.
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        let rx = ask.register();
+        let epoch = hub.epoch();
+        let waiting = intake_wait(&hub, epoch, rx);
+        let ender = async {
+            tokio::task::yield_now().await;
+            hub.start_goal("別的目標");
+        };
+        let (got, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(waiting, ender) }).await.expect("the wait ends");
+        assert!(got.is_none());
     }
 
     #[tokio::test]
@@ -3052,7 +3309,7 @@ mod proxy_tests {
         let human = Human::new(&ask, vec![pick("opt1", "網頁", None), pick(INTAKE_OTHER, INTAKE_OTHER_LABEL, Some("打開頁面看得到今天的天氣"))]);
         let call = proxy_call(&hub, &provider, dir.path(), &human);
         let history = [json!({"role": "user", "content": "天氣資料用中央氣象署的"})];
-        let out = prepare_first_turn(&call, &history).await.expect("a plan");
+        let out = prepare_first_turn(&call, &history, true).await.expect("a plan");
         let s = hub.snapshot();
         assert_eq!(s.criteria, "要有測試\n用戶補充：最後要交出什麼？ → 網頁\n用戶補充：你會怎麼確認它能用？ → 打開頁面看得到今天的天氣");
         assert!(s.intake_done);
@@ -3084,7 +3341,7 @@ mod proxy_tests {
         hub.set_ask_hub(Some(ask.clone()));
         let provider = Proxy::new(vec![says(json!({"ask": false})), says(json!({"status": "continue", "message": "改吧"}))]);
         let human = Human::new(&ask, vec![]);
-        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[]).await.unwrap();
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[], true).await.unwrap();
         assert!(human.asked().is_empty());
         assert_eq!(provider.n(), 2);
         let s = hub.snapshot();
@@ -3105,7 +3362,7 @@ mod proxy_tests {
                 says(json!({"status": "continue", "message": "開始"})),
             ]);
             let human = Human::new(&ask, answers);
-            prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[]).await.unwrap();
+            prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[], true).await.unwrap();
             assert_eq!(human.asked().len(), 1, "skip and cancel stop the asking");
             let s = hub.snapshot();
             assert_eq!(s.criteria, "");
@@ -3122,7 +3379,7 @@ mod proxy_tests {
         hub.start_task("做登入", "");
         hub.set_ask_hub(None);
         let provider = Proxy::new(vec![says(json!({"status": "continue", "message": "開始"}))]);
-        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await.unwrap();
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await.unwrap();
         assert_eq!(provider.n(), 1);
         assert!(!is_intake(&provider.calls.lock().unwrap()[0]));
         assert!(!rec.0.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::AskUser { .. })));
@@ -3146,7 +3403,7 @@ mod proxy_tests {
         let human = Human::new(&ask, vec![pick("opt1", "OAuth", None), pick("opt0", "密碼", None)]);
         let call = proxy_call(&hub, &provider, dir.path(), &human);
         // The plan fails after intake: paused.
-        assert!(prepare_first_turn(&call, &[]).await.is_none());
+        assert!(prepare_first_turn(&call, &[], true).await.is_none());
         assert!(hub.snapshot().paused);
         // Resuming retries the plan, not intake.
         hub.set_paused(false);

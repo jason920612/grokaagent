@@ -49,7 +49,7 @@
   let localView = {};
   let taskDraft = { goal: "", criteria: "" };
   let taskFormNote = "";
-  let taskEndArmedAt = 0;   // 結束任務 pressed once; a second press soon after ends it
+  let taskEndArm = null;    // {at, sid}: 結束任務 pressed once in that session; a second press soon after ends it
   let apiKeyDraft = null;   // typed in this tab; the server never sends the key
   let overlayTop = null;
   let overlayShownAt = 0;
@@ -143,7 +143,9 @@
       const t = snap.task_summary || {};
       taskDraft = { goal: t.goal || "", criteria: t.criteria || "" };
       taskFormNote = "";
-      localView = { task: { mode: "edit" } };
+      // The goal it was opened for: a task ended or replaced meanwhile
+      // takes the form back to the status view.
+      localView = { task: { mode: "edit", base: t.goal || "" } };
       renderOverlay(); return true;
     }
     if (obj.type === "task_status") { localView = { task: { mode: "status" } }; renderOverlay(); return true; }
@@ -245,11 +247,20 @@
       draftSession = s.session_id;
       composer.value = drafts.get(draftSession) || "";
       localView = {};
+      taskEndArm = null;
       // Agent tabs belong to a session.
       openTabs.length = 0;
       activeTab = "";
     }
     snap = s;
+    // A form this tab left open does not outlive the task it was for: a
+    // task started elsewhere turns the new-task form into its status, and
+    // an edit form whose task was ended or replaced goes back to status.
+    const tv = localView.task;
+    const goal = s.task_summary?.goal || "";
+    if (tv && ((tv.mode === "form" && goal) || (tv.mode === "edit" && goal !== tv.base))) {
+      localView = { task: { mode: "status" } };
+    }
     if (awaitingReceipt) {
       const receipt = (s.receipts || []).find(([id]) => id === awaitingReceipt.request_id);
       if (receipt) {
@@ -492,7 +503,8 @@
 
   const TASK_END_CONFIRM_MS = 4000;
   function taskEndArmed() {
-    return taskEndArmedAt > 0 && performance.now() - taskEndArmedAt < TASK_END_CONFIRM_MS;
+    return !!taskEndArm && !!snap && taskEndArm.sid === snap.session_id
+      && performance.now() - taskEndArm.at < TASK_END_CONFIRM_MS;
   }
 
   function taskActionLabel(name) {
@@ -504,7 +516,7 @@
   function taskAction(name) {
     const sid = snap.session_id;
     const armed = taskEndArmed();
-    taskEndArmedAt = 0;
+    taskEndArm = null;
     if (name === "pause" || name === "resume") return send({ type: "set_task_paused", session_id: sid, paused: name === "pause" });
     if (name === "review") return send({ type: "review_task", session_id: sid });
     if (name === "accept") return send({ type: "accept_task", session_id: sid });
@@ -512,7 +524,7 @@
     if (name === "end" && !armed) {
       // Ending wipes the goal, the progress notes and the proxy's memory:
       // one stray key or click must not do that.
-      taskEndArmedAt = performance.now();
+      taskEndArm = { at: performance.now(), sid };
       $("delivery").textContent = "再按一次「結束任務」確認：目標、進度筆記和用戶代理的記憶都會清除";
       renderAll();
       setTimeout(() => { if (!taskEndArmed()) renderAll(); }, TASK_END_CONFIRM_MS + 50);

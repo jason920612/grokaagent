@@ -1117,6 +1117,8 @@ impl App {
             dispatcher: opts.dispatcher,
             child_model: opts.child_model.clone(),
             task_model: String::new(),
+            task_reasoning_effort: opts.reasoning_effort,
+            task_send_reasoning: true,
             search: opts.web_search,
         }));
         let current = boot.id().to_string();
@@ -1814,6 +1816,7 @@ impl App {
         let criteria = criteria.trim().to_string();
         let s = self.cur_mut();
         s.task.start_task(goal.clone(), criteria.clone());
+        s.dismiss_task_ask();
         let mut line = format!("已啟動任務模式：{goal}");
         if !criteria.is_empty() {
             line.push_str(&format!("\n驗收條件：{criteria}"));
@@ -1842,9 +1845,9 @@ impl App {
             self.start_task(&goal, criteria);
             return;
         }
-        if matches!(snap.phase, TaskPhase::HandedBack | TaskPhase::Failed) {
-            // TaskHub::edit_task only reopens Done; bring these back the same
-            // way, so intake and planning do not run again.
+        if matches!(snap.phase, TaskPhase::HandedBack | TaskPhase::Failed | TaskPhase::ExplainingFail) {
+            // Bring an ended (or ending) task back as Done is, so intake and
+            // planning do not run again and the proxy reviews the change.
             self.cur().task.replace(TaskState {
                 phase: TaskPhase::Active,
                 review_note: String::new(),
@@ -1929,8 +1932,9 @@ impl App {
     fn ensure_task_run(&mut self) {
         let snap = self.cur().task.snapshot();
         if snap.phase.is_live() && !snap.paused && self.cur().inbox.is_none() {
-            // A fresh run's first turn only plans a new task. Past planning,
-            // ask the proxy to look, so the run starts with its review.
+            // A fresh run's first turn plans a new task. Past planning, ask
+            // the proxy to look, so the run starts with its review (or with
+            // the closing turn the worker still owes).
             if snap.phase != TaskPhase::NeedPlan {
                 self.cur().task.request_review();
             }
@@ -1942,6 +1946,7 @@ impl App {
         if self.cur().task.snapshot().phase != TaskPhase::Inactive {
             let s = self.cur_mut();
             s.task.end();
+            s.dismiss_task_ask();
             s.agents.log("", EventKind::Message, "任務模式由使用者結束");
             s.chat.push(Row::meta("已結束任務模式"));
             s.dirty = true;

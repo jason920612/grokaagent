@@ -30,6 +30,10 @@ pub struct SessionKnobs {
     pub child_model: String,
     /// Model for the task-mode user proxy. Empty = follow [`Self::model`].
     pub task_model: String,
+    /// The effort for a set [`Self::task_model`], and whether to send it:
+    /// worked out for that model, which may not take the main one's.
+    pub task_reasoning_effort: ReasoningEffort,
+    pub task_send_reasoning: bool,
     /// The user's search toggle. [`Self::server_tools`] is what the live
     /// model gets; this is what new child agents inherit.
     pub search: bool,
@@ -659,10 +663,15 @@ fn user_texts(msgs: &[UserTurn]) -> Vec<String> {
 }
 
 /// Real user messages that reach a working run go into the user proxy's
-/// memory (task mode); the worker handles them first.
+/// memory (task mode); the worker handles them first. One also lifts an
+/// Esc stop kept from an earlier run.
 fn note_user_turns(cfg: &RunConfig, msgs: &[UserTurn]) {
     if let Some(hub) = &cfg.task {
-        for t in user_texts(msgs) {
+        let texts = user_texts(msgs);
+        if !texts.is_empty() {
+            hub.set_skip_steer(false);
+        }
+        for t in texts {
             hub.note_user(&t);
         }
     }
@@ -683,9 +692,26 @@ async fn wait_for_work<P: Provider>(
     last_text: &str,
     interrupted: bool,
 ) -> bool {
+    wait_for_input(cfg, provider, sink, run_id, history, pending, last_text, interrupted).await.is_some()
+}
+
+/// [`wait_for_work`], saying what woke it: `Some(true)` = a message (the
+/// user's, a background exit, a child's), `Some(false)` = the user proxy
+/// alone, `None` = the session ended.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_input<P: Provider>(
+    cfg: &mut RunConfig,
+    provider: &P,
+    sink: &dyn EventSink,
+    run_id: &str,
+    history: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    last_text: &str,
+    interrupted: bool,
+) -> Option<bool> {
     loop {
         let Some(msgs) = wait_session(cfg).await else {
-            return false;
+            return None;
         };
         let msgs: Vec<UserTurn> = msgs
             .into_iter()
@@ -706,10 +732,10 @@ async fn wait_for_work<P: Provider>(
         let users = user_texts(&msgs);
         if let Some(instr) = task_idle(cfg, provider, sink, run_id, history, last_text, &users).await {
             append_user(history, pending, &UserTurn::from(instr), &cfg.workspace);
-            return true;
+            return Some(woke);
         }
         if woke || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
-            return true;
+            return Some(woke);
         }
         // Only a kick, and the proxy had nothing to say (it failed and
         // paused, or the task is over): still idle. Say so again, so
@@ -1066,6 +1092,9 @@ pub async fn run<P: Provider + Clone + 'static>(
         ));
         note_user_turns(&cfg, &[UserTurn { text: cfg.prompt.clone(), images: cfg.images.clone() }]);
     }
+    // A kick-started task run with nothing to start on (the proxy failed
+    // and paused the task, or it is not live) waits for the user instead.
+    let mut idle_start = false;
     if let Some(hub) = cfg.task.clone() {
         if let Some(instr) = task_first_turn(&cfg, provider, sink, &run_id, &history).await {
             history.push(crate::vision::user_message(
@@ -1074,13 +1103,15 @@ pub async fn run<P: Provider + Clone + 'static>(
                 &cfg.workspace,
             ));
         } else if skip_prompt {
-            let goal = hub.snapshot().goal;
-            if !goal.is_empty() {
+            let s = hub.snapshot();
+            if s.phase.is_live() && !s.paused && !s.goal.is_empty() {
                 history.push(crate::vision::user_message(
-                    &format!("{}\n{goal}\nWork toward it.", crate::notice::TASK_MODE),
+                    &format!("{}\n{}\nWork toward it.", crate::notice::TASK_MODE, s.goal),
                     &[],
                     &cfg.workspace,
                 ));
+            } else {
+                idle_start = true;
             }
         }
     } else if skip_prompt {
@@ -1132,6 +1163,20 @@ pub async fn run<P: Provider + Clone + 'static>(
 
     // Signs the worker is stuck mid-run, for the user proxy (task mode).
     let mut watch = crate::task::Watch::default();
+
+    if idle_start {
+        sink.emit(&AgentEvent::AwaitingInput {
+            meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+        });
+        if !wait_for_work(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &last_text, false).await {
+            sink.emit(&AgentEvent::RunFinished {
+                meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                reason: "stop".into(),
+                text: last_text.clone(),
+            });
+            return Ok(outcome(&cfg, &history, run_id, last_text, total_turns, cache_turns, compacted));
+        }
+    }
 
     'run: loop {
         if seen_model {
@@ -1910,6 +1955,8 @@ pub async fn run<P: Provider + Clone + 'static>(
         }
 
         checkpoint(&cfg, &history);
+        // The proxy's pushes share the turn budget: a cap (headless
+        // --max-turns) bounds a task the proxy never accepts.
         if let Some(instr) = task_after_stop(&cfg, provider, sink, &run_id, &history, &last_text).await {
             append_user(
                 &mut history,
@@ -1917,7 +1964,6 @@ pub async fn run<P: Provider + Clone + 'static>(
                 &UserTurn::from(instr),
                 &cfg.workspace,
             );
-            turn = 0;
             continue;
         }
         if cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
@@ -1926,23 +1972,26 @@ pub async fn run<P: Provider + Clone + 'static>(
         sink.emit(&AgentEvent::AwaitingInput {
             meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
         });
-        if !wait_for_work(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &last_text, false).await {
-            sink.emit(&AgentEvent::RunFinished {
-                meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
-                reason: "stop".into(),
-                text: last_text.clone(),
-            });
-            return Ok(outcome(
-                &cfg,
-                &history,
-                run_id,
-                last_text,
-                total_turns,
-                cache_turns,
-                compacted,
-            ));
+        match wait_for_input(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &last_text, false).await {
+            Some(true) => turn = 0,
+            Some(false) => {}
+            None => {
+                sink.emit(&AgentEvent::RunFinished {
+                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                    reason: "stop".into(),
+                    text: last_text.clone(),
+                });
+                return Ok(outcome(
+                    &cfg,
+                    &history,
+                    run_id,
+                    last_text,
+                    total_turns,
+                    cache_turns,
+                    compacted,
+                ));
+            }
         }
-        turn = 0;
     }
 }
 
@@ -1978,7 +2027,8 @@ fn proxy_call<'a, P: Provider>(
     }
 }
 
-/// Task mode at run start: the proxy's opening brief. Esc aborts it.
+/// Task mode at run start: the proxy's opening brief, or in a run started
+/// for a live task the look or closing turn it is owed. Esc aborts it.
 async fn task_first_turn<P: Provider>(
     cfg: &RunConfig,
     provider: &P,
@@ -1988,7 +2038,8 @@ async fn task_first_turn<P: Provider>(
 ) -> Option<String> {
     let hub = cfg.task.as_ref()?;
     let call = proxy_call(cfg, hub, provider, sink, run_id);
-    race_cancel(&cfg.cancel, crate::task::prepare_first_turn(&call, history)).await.ok().flatten()
+    let kick = crate::task::is_kick(&cfg.prompt);
+    race_cancel(&cfg.cancel, crate::task::prepare_first_turn(&call, history, kick)).await.ok().flatten()
 }
 
 /// Task mode after the worker stopped on its own.
@@ -2564,6 +2615,8 @@ mod agent_tests {
                 dispatcher: false,
                 child_model: String::new(),
                 task_model: String::new(),
+                task_reasoning_effort: crate::provider::ReasoningEffort::High,
+                task_send_reasoning: true,
                 search: false,
             }));
             let provider = Arc::new(Switching {
@@ -2754,6 +2807,8 @@ mod tests {
             dispatcher: true,
             child_model: String::new(),
             task_model: String::new(),
+            task_reasoning_effort: crate::provider::ReasoningEffort::High,
+            task_send_reasoning: true,
             search: false,
         })));
         let text = live_instructions(&c);
@@ -5669,15 +5724,117 @@ mod task_proxy_tests {
                 text("did it"),
             ],
         );
-        let (c, closer, tx) = task_run(&hub, |_| true);
+        let (mut c, closer, tx) = task_run(&hub, |_| true);
         drop(tx);
+        c.prompt = "build it".into();
         let tools = ToolRegistry::new(vec![Cmd::new(vec![fail.clone(), fail.clone(), fail])]);
         go(&provider, tools, &closer, c).await;
         assert!(provider.proxy_calls.lock().unwrap().is_empty());
         assert!(closer.intents().is_empty());
         let worker = provider.worker_calls.lock().unwrap();
-        assert!(last_user_text(&worker[0]).starts_with("Task mode is on. Goal:\nx"));
+        assert_eq!(worker.len(), 4);
+        assert_eq!(last_user_text(&worker[0]), "build it");
         assert_eq!(hub.snapshot().phase, TaskPhase::NeedPlan);
+    }
+
+    #[tokio::test]
+    async fn a_run_started_for_a_paused_task_waits_instead_of_working() {
+        let hub = TaskHub::new("");
+        hub.start_goal("ship it");
+        let provider = Duo::new(
+            vec![
+                // The plan fails twice: the task pauses.
+                Err(Error::Provider("HTTP 500".into())),
+                Err(Error::Provider("HTTP 500".into())),
+                says(json!({"status": "hand_back", "reason": "need a decision"})),
+            ],
+            vec![text("summary")],
+        );
+        let (h, p) = (hub.clone(), provider.clone());
+        let (c, closer, tx) = task_run(&hub, move |n| {
+            if n == 1 {
+                assert!(h.snapshot().paused);
+                assert!(p.worker_calls.lock().unwrap().is_empty(), "no work on a paused task");
+                h.set_paused(false);
+                return false;
+            }
+            true
+        });
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        assert_eq!(closer.intents(), ["hand_back"]);
+        let worker = provider.worker_calls.lock().unwrap();
+        assert_eq!(worker.len(), 1);
+        let first = last_user_text(&worker[0]);
+        assert!(first.contains("handing this back") && !first.contains("Task mode is on"), "{first}");
+        assert_eq!(hub.snapshot().phase, TaskPhase::HandedBack);
+    }
+
+    #[tokio::test]
+    async fn a_run_started_for_a_live_task_opens_with_the_asked_look() {
+        let hub = TaskHub::from_state("", crate::task::TaskState {
+            goal: "ship it".into(),
+            criteria: "with a test".into(),
+            phase: TaskPhase::Active,
+            rounds: 3,
+            ..crate::task::TaskState::default()
+        });
+        // What the UI does for 立即審查 / 繼續 / 修改 when no run is alive.
+        hub.request_review();
+        let provider = Duo::new(
+            vec![
+                says(json!({"status": "continue", "message": "Run the tests first and show me."})),
+                says(json!({"status": "hand_back", "reason": "r"})),
+            ],
+            vec![text("ran them: 2 passed"), text("summary")],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        assert_eq!(closer.intents(), ["push", "hand_back"]);
+        assert!(provider.proxy_prompt(0).contains("Review kind: push") && provider.proxy_prompt(0).contains("the user asked you to look now"));
+        let worker = provider.worker_calls.lock().unwrap();
+        let first = last_user_text(&worker[0]);
+        assert!(first.contains("Run the tests first") && first.contains("Criteria: with a test"), "{first}");
+    }
+
+    #[tokio::test]
+    async fn a_kept_esc_stop_lifts_on_the_users_own_message() {
+        let hub = TaskHub::from_state("", crate::task::TaskState {
+            goal: "ship it".into(),
+            phase: TaskPhase::Active,
+            skip_steer: true,
+            ..crate::task::TaskState::default()
+        });
+        let provider = Duo::new(vec![says(json!({"status": "hand_back", "reason": "r"}))], vec![text("continuing"), text("summary")]);
+        let (mut c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        c.prompt = "please continue the task".into();
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        let s = hub.snapshot();
+        assert!(!s.skip_steer);
+        assert_eq!(s.phase, TaskPhase::HandedBack);
+        assert_eq!(provider.proxy_calls.lock().unwrap().len(), 1, "the proxy looked at the worker's stop");
+        assert!(provider.proxy_prompt(0).contains("[user] please continue the task"));
+    }
+
+    #[tokio::test]
+    async fn a_kept_ending_leaves_the_users_new_message_alone() {
+        let hub = TaskHub::from_state("", crate::task::TaskState {
+            goal: "ship it".into(),
+            phase: TaskPhase::Active,
+            ending: Some(crate::task::Ending { phase: TaskPhase::Done, reason: "tests pass".into() }),
+            ..crate::task::TaskState::default()
+        });
+        let provider = Duo::new(vec![], vec![text("Added the README.")]);
+        let (mut c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        c.prompt = "also add a README please".into();
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        let worker = provider.worker_calls.lock().unwrap();
+        assert_eq!(last_user_text(&worker[0]), "also add a README please", "the user's message is the latest input");
+        assert_eq!(hub.snapshot().phase, TaskPhase::Done);
+        assert!(provider.proxy_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5728,6 +5885,8 @@ mod task_proxy_tests {
                 dispatcher: false,
                 child_model: "child-model".into(),
                 task_model: task_model.into(),
+                task_reasoning_effort: crate::provider::ReasoningEffort::Medium,
+                task_send_reasoning: true,
                 search: false,
             })));
             go(&provider, ToolRegistry::new(vec![]), &closer, c).await;

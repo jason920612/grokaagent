@@ -234,6 +234,10 @@ impl App {
         // Search and reasoning passthrough exist on the xAI route only.
         let openai = st.conn.route_for(&model).is_openai();
         let choice = clamp_effort_for_model(&st.catalog, &model, self.opts.reasoning_effort);
+        // A task model of its own may not take the main model's effort.
+        let task_model = st.task_model.trim().to_string();
+        let task_choice = clamp_effort_for_model(&st.catalog, &task_model, self.opts.reasoning_effort);
+        let task_openai = st.conn.route_for(&task_model).is_openai();
         if let Ok(mut k) = self.knobs.lock() {
             k.model = model;
             k.reasoning_effort = choice.effort;
@@ -242,7 +246,9 @@ impl App {
             k.search = self.opts.web_search;
             k.dispatcher = self.opts.dispatcher;
             k.child_model = self.opts.child_model.trim().to_string();
-            k.task_model = st.task_model.trim().to_string();
+            k.task_reasoning_effort = task_choice.effort;
+            k.task_send_reasoning = task_choice.send_reasoning && !task_openai;
+            k.task_model = task_model;
         }
     }
 

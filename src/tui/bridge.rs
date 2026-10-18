@@ -454,6 +454,12 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
         }
         UiCommand::StartTask { session_id, goal, criteria } => {
             if session_id == app.current && !goal.trim().is_empty() {
+                // A form left open while a task started elsewhere must not
+                // replace it; the TUI offers a new task only with none set.
+                if app.cur().task.snapshot().phase != task::TaskPhase::Inactive {
+                    app.flash("已有任務，請先結束目前的任務");
+                    return;
+                }
                 let goal: String = goal.chars().take(task::MAX_GOAL).collect();
                 let criteria: String = criteria.chars().take(task::MAX_CRITERIA).collect();
                 app.start_task(&goal, &criteria);

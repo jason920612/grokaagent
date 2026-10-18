@@ -492,6 +492,14 @@ impl Session {
         }
     }
 
+    /// The task proxy's intake question belongs to the task that asked it:
+    /// ending or replacing that task closes it.
+    pub fn dismiss_task_ask(&mut self) {
+        if self.ask.as_ref().is_some_and(|a| a.from_proxy) {
+            self.cancel_ask();
+        }
+    }
+
     /// Answer the open questionnaire. `Err` keeps it open with a message.
     pub fn submit_ask(&mut self) -> Result<(), String> {
         let Some(ask) = self.ask.take() else {
