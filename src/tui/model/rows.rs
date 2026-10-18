@@ -263,7 +263,30 @@ pub(crate) fn picture_from_tool(name: &str, output: &str) -> Option<(String, Str
     if path.is_empty() {
         return None;
     }
-    Some((path.clone(), format!("模型在看  {name}  {path}")))
+    let mut label = format!("模型在看  {name}  {path}");
+    if let Some(r) = v.get("region") {
+        label.push_str(&format!("  區域 {},{} {}×{}", r["x"], r["y"], r["width"], r["height"]));
+    }
+    // read_image's prepared copy: it keeps showing what the model saw even
+    // after the file at `path` is overwritten.
+    let shown = v.get("view").and_then(Value::as_str).filter(|s| !s.is_empty());
+    Some((shown.map_or(path, str::to_string), label))
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn picture_rows_show_the_copy_the_model_was_sent() {
+        let out = r#"{"attach_image":true,"path":"page.png","view":".groka/seen/ab.jpg","region":{"x":0,"y":1280,"width":640,"height":1280}}"#;
+        let (path, label) = picture_from_tool("read_image", out).unwrap();
+        assert_eq!(path, ".groka/seen/ab.jpg");
+        assert_eq!(label, "模型在看  read_image  page.png  區域 0,1280 640×1280");
+        let (path, label) = picture_from_tool("screenshot", r#"{"attach_image":true,"path":"s.jpg"}"#).unwrap();
+        assert_eq!((path.as_str(), label.as_str()), ("s.jpg", "模型在看  screenshot  s.jpg"));
+        assert!(picture_from_tool("read_image", r#"{"attach_image":false,"path":"a.png"}"#).is_none());
+    }
 }
 
 #[cfg(test)]

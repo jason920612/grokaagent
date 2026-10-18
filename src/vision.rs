@@ -54,12 +54,26 @@ pub fn data_uri_for_tool(workspace: &Path, output: &str) -> Result<Option<String
     if v.get("attach_image").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
+    // read_image already wrote the exact JPEG to send. Anything at `view`
+    // that model_jpeg could not have written is ignored in favor of `path`.
+    if let Some(view) = v.get("view").and_then(Value::as_str) {
+        if let Some(bytes) = resolve_in_workspace(workspace, view).ok().and_then(|abs| ready_jpeg(&abs)) {
+            return Ok(Some(jpeg_data_uri(&bytes)));
+        }
+    }
     let path = v
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Tool("attach_image missing path".into()))?;
     let resolved = resolve_in_workspace(workspace, path)?;
-    Ok(Some(data_uri_from_file(&resolved)?))
+    Ok(Some(data_uri_from_region(&resolved, output_region(&v))?))
+}
+
+/// A read_image `region` echoed in its result: the crop that was sent.
+fn output_region(v: &Value) -> Option<(u32, u32, u32, u32)> {
+    let r = v.get("region")?;
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+    Some((n("x")?, n("y")?, n("width")?, n("height")?))
 }
 
 pub fn function_call_output(call_id: &str, output: &str, image_uri: Option<&str>) -> Value {
@@ -227,6 +241,10 @@ pub fn open_image(path: &Path) -> Result<DynamicImage> {
         .map_err(|e| Error::Tool(format!("open image: {e}")))?
         .into_decoder()
         .map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    // `from_decoder` skips the allocation cap `image::open` applies (512 MiB).
+    image::Limits::default()
+        .reserve(dec.total_bytes())
+        .map_err(|e| Error::Tool(format!("open image: {e}")))?;
     let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| Error::Tool(format!("open image: {e}")))?;
     img.apply_orientation(orientation);
@@ -254,7 +272,14 @@ pub fn flatten_alpha(img: &DynamicImage, bg: [u8; 3]) -> DynamicImage {
     if !img.color().has_alpha() {
         return img.clone();
     }
-    let rgba = img.to_rgba8();
+    let owned;
+    let rgba = match img {
+        DynamicImage::ImageRgba8(b) => b,
+        _ => {
+            owned = img.to_rgba8();
+            &owned
+        }
+    };
     let mut out = RgbImage::new(rgba.width(), rgba.height());
     for (o, p) in out.pixels_mut().zip(rgba.pixels()) {
         let a = p[3] as u32;
@@ -358,53 +383,188 @@ fn unquote_path(s: &str) -> String {
     s.to_string()
 }
 
-pub fn rel_inbox_path() -> PathBuf {
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+/// `<timestamp>-<short uuid>.jpg`, unique even for saves in the same instant
+/// (several calls in one response, or child agents sharing the workspace).
+fn stamped_jpg_name() -> String {
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%3f");
     let id = uuid::Uuid::new_v4();
-    let short = &id.to_string()[..8];
-    PathBuf::from(".groka")
-        .join("inbox")
-        .join(format!("{ts}-{short}.jpg"))
+    format!("{ts}-{}.jpg", &id.to_string()[..8])
+}
+
+pub fn rel_inbox_path() -> PathBuf {
+    PathBuf::from(".groka").join("inbox").join(stamped_jpg_name())
 }
 
 pub fn save_user_image(workspace: &Path, img: &DynamicImage) -> Result<String> {
     let rel = rel_inbox_path();
-    let abs = workspace.join(&rel);
-    save_jpeg(&abs, img)?;
+    groka_dir(workspace, "inbox")?;
+    save_jpeg(&workspace.join(&rel), img)?;
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
 pub fn ingest_image_file(workspace: &Path, src: &Path) -> Result<String> {
-    let meta = std::fs::metadata(src).map_err(|e| Error::Tool(format!("read image: {e}")))?;
-    if meta.len() > MAX_SOURCE_BYTES {
-        return Err(Error::Tool("image file larger than 32MiB".into()));
-    }
-    let img = image::open(src).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    check_source_size(src)?;
+    let img = open_image(src)?;
     save_user_image(workspace, &img)
 }
 
-pub fn save_jpeg(path: &Path, img: &DynamicImage) -> Result<(u32, u32, usize)> {
-    let prepared = prepare(img);
-    let (w, h) = (prepared.width(), prepared.height());
-    let bytes = encode_jpeg(&prepared)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Refuse source files too large to decode in reasonable time and memory.
+pub fn check_source_size(path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::Tool(format!("read image: {e}")))?;
+    if meta.len() > MAX_SOURCE_BYTES {
+        return Err(Error::Tool("image file larger than 32MiB".into()));
     }
-    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
+pub fn save_jpeg(path: &Path, img: &DynamicImage) -> Result<(u32, u32, usize)> {
+    let (bytes, w, h) = model_jpeg(img)?;
+    write_replacing(path, &bytes)?;
     Ok((w, h, bytes.len()))
 }
 
+/// Write through a sibling temp file and a rename: a reader never sees a
+/// half-written image, and a symlink at `path` is replaced, not followed.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let id = uuid::Uuid::new_v4();
+    let tmp = path.with_extension(format!("{}.part", &id.to_string()[..8]));
+    // A failed write (disk full) must not leave the partial file behind either.
+    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Seen copies kept: the newest, up to a count and a total size.
+const SEEN_KEEP: usize = 200;
+const SEEN_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Keep the exact JPEG the model was sent as `.groka/seen/<hash>.jpg`. Picture
+/// rows point here, so the history still shows what the model saw after the
+/// source file is overwritten.
+pub fn save_seen(workspace: &Path, jpeg: &[u8]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(jpeg));
+    let name = format!("{}.jpg", &hash[..16]);
+    groka_dir(workspace, "seen")?;
+    // A committed `.groka` symlink must not carry the copy out of the
+    // workspace, where it could not be read back either.
+    let dir = resolve_in_workspace(workspace, ".groka/seen")?;
+    let file = dir.join(&name);
+    // Not `is_file`: a planted link of that name is replaced, not touched.
+    if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+        // Seen again: count it as new so the prune keeps it.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    } else {
+        write_replacing(&file, jpeg)?;
+        prune_seen(&dir, SEEN_KEEP, SEEN_MAX_BYTES);
+    }
+    Ok(format!(".groka/seen/{name}"))
+}
+
+/// Drop the oldest `.jpg` files in `dir` beyond `keep` files or `max_bytes`
+/// in all. The newest always stays; older picture rows lose their preview.
+fn prune_seen(dir: &Path, keep: usize, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let path = e.path();
+            if !meta.is_file() || path.extension().map_or(true, |x| x != "jpg") {
+                return None;
+            }
+            Some((meta.modified().ok()?, meta.len(), path))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut total = 0u64;
+    for (i, (_, len, path)) in files.iter().enumerate() {
+        total += len;
+        if i > 0 && (i >= keep || total > max_bytes) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub fn data_uri_from_file(path: &Path) -> Result<String> {
-    let img = image::open(path).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    data_uri_from_region(path, None)
+}
+
+/// `data_uri_from_file`, cropped first to `(x, y, width, height)` when given.
+fn data_uri_from_region(path: &Path, region: Option<(u32, u32, u32, u32)>) -> Result<String> {
+    check_source_size(path)?;
+    if region.is_none() {
+        if let Some(bytes) = ready_jpeg(path) {
+            return Ok(jpeg_data_uri(&bytes));
+        }
+    }
+    let mut img = open_image(path)?;
+    if let Some((x, y, w, h)) = region {
+        img = img.crop_imm(x, y, w, h);
+    }
     if below_vision_min(img.width(), img.height()) {
         return Err(Error::Tool(enlarge_yourself_note(img.width(), img.height())));
     }
-    let prepared = prepare(&img);
-    let bytes = encode_jpeg(&prepared)?;
-    Ok(format!(
-        "data:image/jpeg;base64,{}",
-        STANDARD.encode(bytes)
-    ))
+    let (bytes, _, _) = model_jpeg(&img)?;
+    Ok(jpeg_data_uri(&bytes))
+}
+
+fn jpeg_data_uri(bytes: &[u8]) -> String {
+    format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
+}
+
+/// The file's own bytes when it already is what `model_jpeg` makes (a
+/// screenshot or an inbox copy), so it is not decoded and re-encoded again.
+fn ready_jpeg(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).ok()?.len() > MAX_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if !plain_jpeg(&bytes) {
+        return None;
+    }
+    let mut dec = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&bytes)).ok()?;
+    let (w, h) = dec.dimensions();
+    let upright = matches!(dec.orientation(), Ok(Orientation::NoTransforms));
+    (upright && w.max(h) <= MAX_EDGE && !below_vision_min(w, h)).then_some(bytes)
+}
+
+/// An 8-bit baseline or progressive JPEG in gray or YCbCr, like the ones
+/// `encode_jpeg` writes. CMYK and the rarer coding modes are re-encoded.
+fn plain_jpeg(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return false;
+    }
+    let mut i = 2;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return false;
+        }
+        let marker = bytes[i + 1];
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
+        match marker {
+            // SOF0-2: length(2) precision(1) height(2) width(2) components(1)
+            0xC0..=0xC2 => {
+                return bytes.get(i + 4) == Some(&8) && matches!(bytes.get(i + 9), Some(1 | 3));
+            }
+            // Other frame types, or a scan before any frame.
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xDA => return false,
+            _ => {}
+        }
+        i += 2 + u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+    }
+    false
 }
 
 pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<DynamicImage> {
@@ -414,13 +574,30 @@ pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<DynamicImage>
 }
 
 pub fn rel_shot_path() -> PathBuf {
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    PathBuf::from(".groka")
-        .join("shots")
-        .join(format!("{ts}.jpg"))
+    PathBuf::from(".groka").join("shots").join(stamped_jpg_name())
+}
+
+/// Transparent pixels are shown on white, as image viewers do.
+const ALPHA_BG: [u8; 3] = [255, 255, 255];
+
+/// What the model is sent: alpha flattened, long edge at most `MAX_EDGE`,
+/// JPEG. Returns the bytes and the width and height actually sent.
+pub fn model_jpeg(img: &DynamicImage) -> Result<(Vec<u8>, u32, u32)> {
+    let prepared = prepare(img);
+    let bytes = encode_jpeg(&prepared)?;
+    Ok((bytes, prepared.width(), prepared.height()))
 }
 
 fn prepare(img: &DynamicImage) -> DynamicImage {
+    // Flatten before resizing: the resize filter does not premultiply alpha,
+    // so transparent pixels (usually stored black) would darken the edges.
+    if img.color().has_alpha() {
+        return fit_edge(&flatten_alpha(img, ALPHA_BG));
+    }
+    fit_edge(img)
+}
+
+fn fit_edge(img: &DynamicImage) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     let edge = w.max(h);
     if edge <= MAX_EDGE {
@@ -451,6 +628,280 @@ fn encode_jpeg(img: &DynamicImage) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) mod vision_tests {
+    use super::*;
+    use image::ImageEncoder;
+
+    /// A 64x32 JPEG (left half red, right half blue) tagged EXIF Orientation=6,
+    /// so it shows as 32x64 with the red half on top.
+    pub(crate) fn rotated_jpeg(path: &Path) {
+        let mut rgb = RgbImage::new(64, 32);
+        for (x, _, p) in rgb.enumerate_pixels_mut() {
+            p.0 = if x < 32 { [255, 0, 0] } else { [0, 0, 255] };
+        }
+        // Little-endian TIFF, one IFD entry: 0x0112 Orientation, SHORT, 6.
+        let exif = vec![
+            0x49, 0x49, 0x2A, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut buf = Vec::new();
+        let mut enc = image::codecs::jpeg::JpegEncoder::new(&mut buf);
+        enc.set_exif_metadata(exif).unwrap();
+        enc.write_image(rgb.as_raw(), 64, 32, image::ExtendedColorType::Rgb8).unwrap();
+        std::fs::write(path, buf).unwrap();
+    }
+
+    pub(crate) fn decode_uri(uri: &str) -> DynamicImage {
+        let b64 = uri.strip_prefix("data:image/jpeg;base64,").expect(uri);
+        image::load_from_memory(&STANDARD.decode(b64).unwrap()).unwrap()
+    }
+
+    /// Opaque black square in the middle of a fully transparent (0,0,0,0) canvas.
+    fn black_on_clear(w: u32, h: u32) -> DynamicImage {
+        let mut rgba = RgbaImage::new(w, h);
+        for (x, y, p) in rgba.enumerate_pixels_mut() {
+            if x >= w / 4 && x < w * 3 / 4 && y >= h / 4 && y < h * 3 / 4 {
+                p.0 = [0, 0, 0, 255];
+            }
+        }
+        DynamicImage::ImageRgba8(rgba)
+    }
+
+    fn is_white(p: [u8; 3]) -> bool {
+        p.iter().all(|&c| c > 240)
+    }
+
+    #[test]
+    fn transparent_pixels_reach_the_model_white_not_black() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("logo.png");
+        black_on_clear(64, 64).save(&png).unwrap();
+        let seen = decode_uri(&data_uri_from_file(&png).unwrap()).to_rgb8();
+        assert!(is_white(seen.get_pixel(2, 2).0), "{:?}", seen.get_pixel(2, 2));
+        assert!(seen.get_pixel(32, 32).0.iter().all(|&c| c < 20), "{:?}", seen.get_pixel(32, 32));
+        let rel = ingest_image_file(dir.path(), &png).unwrap();
+        let copy = open_image(&dir.path().join(rel)).unwrap().to_rgb8();
+        assert!(is_white(copy.get_pixel(2, 2).0), "{:?}", copy.get_pixel(2, 2));
+        let big = prepare(&black_on_clear(2600, 400)).to_rgb8();
+        assert_eq!(big.dimensions(), (MAX_EDGE, 197));
+        assert!(is_white(big.get_pixel(1, 1).0), "{:?}", big.get_pixel(1, 1));
+    }
+
+    #[test]
+    fn alpha_is_flattened_before_the_resize() {
+        // Opaque white stripe on transparent black: resizing first would blend
+        // the black into the stripe's edge before the flatten.
+        let mut rgba = RgbaImage::new(2560, 64);
+        for (x, _, p) in rgba.enumerate_pixels_mut() {
+            if x >= 1280 {
+                p.0 = [255, 255, 255, 255];
+            }
+        }
+        let out = prepare(&DynamicImage::ImageRgba8(rgba)).to_rgb8();
+        assert!(out.pixels().all(|p| is_white(p.0)), "dark fringe");
+    }
+
+    #[test]
+    fn exif_orientation_is_applied_on_ingest_and_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("phone.jpg");
+        rotated_jpeg(&src);
+        let seen = decode_uri(&data_uri_from_file(&src).unwrap()).to_rgb8();
+        assert_eq!(seen.dimensions(), (32, 64));
+        assert!(seen.get_pixel(16, 4)[0] > 200, "red half on top: {:?}", seen.get_pixel(16, 4));
+        let rel = ingest_image_file(dir.path(), &src).unwrap();
+        let copy = dir.path().join(rel);
+        assert_eq!(image_dimensions(&copy).unwrap(), (32, 64));
+        assert_eq!(image::image_dimensions(&copy).unwrap(), (32, 64), "copy is stored upright");
+    }
+
+    #[test]
+    fn misnamed_and_newer_formats_decode_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = black_on_clear(40, 40);
+        let png_as_jpg = dir.path().join("logo.jpg");
+        img.write_to(&mut std::fs::File::create(&png_as_jpg).unwrap(), image::ImageFormat::Png).unwrap();
+        for name in ["a.gif", "a.webp", "a.bmp"] {
+            img.save(dir.path().join(name)).unwrap();
+        }
+        for name in ["logo.jpg", "a.gif", "a.webp", "a.bmp"] {
+            let path = dir.path().join(name);
+            let seen = decode_uri(&data_uri_from_file(&path).unwrap());
+            assert_eq!((seen.width(), seen.height()), (40, 40), "{name}");
+            assert!(ingest_image_file(dir.path(), &path).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_ready_jpeg_is_sent_as_is_and_others_are_re_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("shot.jpg");
+        save_jpeg(&shot, &black_on_clear(64, 48)).unwrap();
+        let uri = data_uri_from_file(&shot).unwrap();
+        assert_eq!(uri, jpeg_data_uri(&std::fs::read(&shot).unwrap()));
+        // Too large for the model as is: decoded and downscaled.
+        let big = dir.path().join("big.jpg");
+        DynamicImage::new_rgb8(2000, 100).save(&big).unwrap();
+        assert_eq!(decode_uri(&data_uri_from_file(&big).unwrap()).width(), MAX_EDGE);
+        // Upright only after the EXIF rotation: re-encoded.
+        let phone = dir.path().join("phone.jpg");
+        rotated_jpeg(&phone);
+        assert_ne!(data_uri_from_file(&phone).unwrap(), jpeg_data_uri(&std::fs::read(&phone).unwrap()));
+    }
+
+    #[test]
+    fn plain_jpeg_accepts_only_what_the_encoder_writes() {
+        let (bytes, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        assert!(plain_jpeg(&bytes));
+        let sof = bytes.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        let mut cmyk = bytes.clone();
+        cmyk[sof + 9] = 4;
+        assert!(!plain_jpeg(&cmyk));
+        let mut lossless = bytes.clone();
+        lossless[sof + 1] = 0xC3;
+        assert!(!plain_jpeg(&lossless));
+        assert!(!plain_jpeg(b"\x89PNG\r\n\x1a\n"));
+        assert!(!plain_jpeg(&bytes[..sof]));
+    }
+
+    #[test]
+    fn open_image_keeps_the_allocation_cap() {
+        // A 30000x30000 24-bit BMP header (2.7 GB decoded) and no pixel data.
+        let mut bmp = b"BM".to_vec();
+        for v in [54u32, 0, 54, 40, 30000, 30000] {
+            bmp.extend_from_slice(&v.to_le_bytes());
+        }
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&[0; 24]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.bmp");
+        std::fs::write(&path, bmp).unwrap();
+        assert_eq!(image_dimensions(&path).unwrap(), (30000, 30000));
+        let err = open_image(&path).unwrap_err().to_string();
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn default_names_are_unique_and_pastes_are_git_ignored() {
+        let a = rel_shot_path();
+        assert!(a.starts_with(".groka/shots"), "{}", a.display());
+        assert_ne!(a, rel_shot_path());
+        assert_ne!(rel_inbox_path(), rel_inbox_path());
+        let ws = tempfile::tempdir().unwrap();
+        let rel = save_user_image(ws.path(), &black_on_clear(32, 32)).unwrap();
+        assert!(rel.starts_with(".groka/inbox/"), "{rel}");
+        assert_eq!(std::fs::read_to_string(ws.path().join(".groka/.gitignore")).unwrap().trim(), "*");
+    }
+
+    #[test]
+    fn seen_copies_are_content_addressed_and_preferred_for_attach() {
+        let ws = tempfile::tempdir().unwrap();
+        let (jpeg, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        let view = save_seen(ws.path(), &jpeg).unwrap();
+        assert!(view.starts_with(".groka/seen/") && view.ends_with(".jpg"), "{view}");
+        assert_eq!(save_seen(ws.path(), &jpeg).unwrap(), view);
+        assert_eq!(std::fs::read(ws.path().join(&view)).unwrap(), jpeg);
+        assert!(ws.path().join(".groka/.gitignore").is_file());
+        // The source changed (or is gone) since: the model still gets the view bytes.
+        let out = json!({"attach_image": true, "path": "gone.png", "view": view}).to_string();
+        assert_eq!(data_uri_for_tool(ws.path(), &out).unwrap().unwrap(), jpeg_data_uri(&jpeg));
+    }
+
+    #[test]
+    fn a_view_that_is_not_a_prepared_jpeg_falls_back_to_the_path() {
+        let ws = tempfile::tempdir().unwrap();
+        black_on_clear(40, 40).save(ws.path().join("a.png")).unwrap();
+        std::fs::write(ws.path().join("big.bin"), vec![0xFFu8; 4096]).unwrap();
+        DynamicImage::new_rgb8(2000, 100).save(ws.path().join("wide.jpg")).unwrap();
+        let want = data_uri_from_file(&ws.path().join("a.png")).unwrap();
+        for view in ["big.bin", "wide.jpg", "missing.jpg", "../out.jpg"] {
+            let out = json!({"attach_image": true, "path": "a.png", "view": view}).to_string();
+            assert_eq!(data_uri_for_tool(ws.path(), &out).unwrap().unwrap(), want, "{view}");
+        }
+        // Without a view, a read_image region is cropped from the path again.
+        let out = json!({"attach_image": true, "path": "a.png", "region": {"x": 10, "y": 10, "width": 20, "height": 30}});
+        let seen = decode_uri(&data_uri_for_tool(ws.path(), &out.to_string()).unwrap().unwrap()).to_rgb8();
+        assert_eq!(seen.dimensions(), (20, 30));
+        assert!(seen.get_pixel(15, 5)[0] < 20, "{:?}", seen.get_pixel(15, 5));
+        assert!(is_white(seen.get_pixel(15, 28).0), "{:?}", seen.get_pixel(15, 28));
+    }
+
+    #[test]
+    fn seen_copies_are_pruned_oldest_first_and_a_reread_counts_as_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(1000);
+        let age = |f: &Path, t: std::time::SystemTime| {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(t).unwrap();
+        };
+        for i in 0..5u64 {
+            let f = dir.path().join(format!("{i}.jpg"));
+            std::fs::write(&f, vec![0u8; 100]).unwrap();
+            age(&f, old + std::time::Duration::from_secs(i));
+        }
+        std::fs::write(dir.path().join("notes.txt"), "not ours").unwrap();
+        let left = || {
+            let mut v: Vec<String> =
+                std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        prune_seen(dir.path(), 3, u64::MAX);
+        assert_eq!(left(), ["2.jpg", "3.jpg", "4.jpg", "notes.txt"]);
+        prune_seen(dir.path(), 50, 250);
+        assert_eq!(left(), ["3.jpg", "4.jpg", "notes.txt"]);
+
+        let ws = tempfile::tempdir().unwrap();
+        let (jpeg, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        let file = ws.path().join(save_seen(ws.path(), &jpeg).unwrap());
+        age(&file, old);
+        save_seen(ws.path(), &jpeg).unwrap();
+        let touched = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(touched > old + std::time::Duration::from_secs(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seen_copies_never_land_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join(".groka")).unwrap();
+        let (jpeg, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        assert!(save_seen(&ws, &jpeg).is_err());
+        let copies = std::fs::read_dir(outside.join("seen")).map_or(0, |d| d.count());
+        assert_eq!(copies, 0);
+        // A link planted under the copy's name is replaced; its target is untouched.
+        let ws2 = dir.path().join("ws2");
+        std::fs::create_dir_all(&ws2).unwrap();
+        let rel = save_seen(&ws2, &jpeg).unwrap();
+        std::fs::remove_file(ws2.join(&rel)).unwrap();
+        std::fs::write(outside.join("victim"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), ws2.join(&rel)).unwrap();
+        assert_eq!(save_seen(&ws2, &jpeg).unwrap(), rel);
+        assert!(!ws2.join(&rel).is_symlink());
+        assert_eq!(std::fs::read(ws2.join(&rel)).unwrap(), jpeg);
+        assert_eq!(std::fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_jpeg_replaces_a_symlink_instead_of_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("bashrc");
+        std::fs::write(&victim, "keep me").unwrap();
+        let link = dir.path().join("shot.jpg");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        save_jpeg(&link, &black_on_clear(32, 32)).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(!link.is_symlink());
+        assert_eq!(image_dimensions(&link).unwrap(), (32, 32));
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left.len(), 2, "no temp file left: {left:?}");
+    }
 }
 
 #[cfg(test)]

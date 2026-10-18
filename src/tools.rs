@@ -376,7 +376,8 @@ fn granted_target(workspace: &Path, requested: &str) -> Option<PathBuf> {
             other => lexical.push(other.as_os_str()),
         }
     }
-    let resolved = if lexical.exists() {
+    // A dangling symlink fails to canonicalize: not a granted target.
+    let resolved = if entry_exists(&lexical) {
         lexical.canonicalize().ok()?
     } else {
         let parent = lexical.parent()?.canonicalize().ok()?;
@@ -401,17 +402,24 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
         .map_err(|e| Error::Tool(format!("workspace not found: {e}")))?;
     if Path::new(requested).is_absolute() {
         let joined = PathBuf::from(requested);
-        let parent = joined.parent().unwrap_or(Path::new("."));
-        if parent.exists() {
-            let parent = parent
-                .canonicalize()
-                .map_err(|_| Error::Tool(format!("path not found: {requested}")))?;
-            if !parent.starts_with(&workspace) {
-                return Err(Error::Tool(escape_message(requested)));
-            }
-            return Ok(parent.join(joined.file_name().unwrap_or_default()));
+        let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) else {
+            return Err(Error::Tool(escape_message(requested)));
+        };
+        if !parent.exists() {
+            return Err(Error::Tool(escape_message(requested)));
         }
-        return Err(Error::Tool(escape_message(requested)));
+        let parent = parent
+            .canonicalize()
+            .map_err(|_| Error::Tool(format!("path not found: {requested}")))?;
+        if !parent.starts_with(&workspace) {
+            return Err(Error::Tool(escape_message(requested)));
+        }
+        // The last component may itself be a symlink out of the workspace.
+        let target = parent.join(name);
+        if entry_exists(&target) {
+            return canonicalize_in_workspace(&workspace, &target);
+        }
+        return Ok(target);
     }
     let mut out = workspace.clone();
     for c in Path::new(requested).components() {
@@ -427,7 +435,7 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
             }
             Component::Normal(s) => {
                 out.push(s);
-                if out.exists() {
+                if entry_exists(&out) {
                     out = canonicalize_in_workspace(&workspace, &out)?;
                 }
             }
@@ -436,7 +444,7 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
             }
         }
     }
-    if out.exists() {
+    if entry_exists(&out) {
         return canonicalize_in_workspace(&workspace, &out);
     }
     if let Some(parent) = out.parent() {
@@ -452,13 +460,88 @@ pub fn resolve_target_in_workspace(workspace: &Path, requested: &str) -> Result<
 }
 
 fn canonicalize_in_workspace(workspace: &Path, path: &Path) -> Result<PathBuf> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| Error::Tool("path escapes workspace".into()))?;
+    let canonical = path.canonicalize().map_err(|_| {
+        if path.is_symlink() {
+            // Writing would create the link's target, wherever it points.
+            Error::Tool(format!("dangling symlink: {} points to a missing target", path.display()))
+        } else {
+            Error::Tool("path escapes workspace".into())
+        }
+    })?;
     if !canonical.starts_with(workspace) {
         return Err(Error::Tool("path escapes workspace".into()));
     }
     Ok(canonical)
+}
+
+/// Something is at `path`, possibly a dangling symlink (`exists()` follows links).
+fn entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(all(test, unix))]
+mod target_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// `(tempdir, workspace with docs/, a folder outside it)`.
+    fn ws_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        (dir, ws, outside)
+    }
+
+    #[test]
+    fn a_final_symlink_out_of_the_workspace_is_refused() {
+        let (_dir, ws, outside) = ws_and_outside();
+        fs::write(outside.join("bashrc"), "keep").unwrap();
+        symlink(outside.join("bashrc"), ws.join("docs/shot.jpg")).unwrap();
+        let abs = ws.join("docs/shot.jpg");
+        for req in ["docs/shot.jpg", abs.to_str().unwrap()] {
+            let err = resolve_target_in_workspace(&ws, req).unwrap_err().to_string();
+            assert!(err.contains("escapes"), "{req}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_never_written_through() {
+        let (_dir, ws, outside) = ws_and_outside();
+        symlink(outside.join("new.txt"), ws.join("docs/x.txt")).unwrap();
+        symlink(outside.join("nodir"), ws.join("gone")).unwrap();
+        let abs = ws.join("docs/x.txt");
+        for req in ["docs/x.txt", abs.to_str().unwrap(), "gone/y.txt"] {
+            let err = resolve_target_in_workspace(&ws, req).unwrap_err().to_string();
+            assert!(err.contains("dangling"), "{req}: {err}");
+        }
+        let tool = WriteFileTool::new(ws.clone());
+        assert!(tool.call_sync(&json!({"path": "docs/x.txt", "contents": "echo pwned"})).is_err());
+        assert!(!outside.join("new.txt").exists());
+    }
+
+    #[test]
+    fn a_dangling_symlink_in_a_granted_folder_is_refused() {
+        let (dir, ws, outside) = ws_and_outside();
+        let granted = dir.path().join("granted");
+        fs::create_dir_all(&granted).unwrap();
+        crate::grants::add_session(&ws, &granted);
+        assert!(resolve_target_in_workspace(&ws, granted.join("ok.txt").to_str().unwrap()).is_ok());
+        symlink(outside.join("new.txt"), granted.join("x.txt")).unwrap();
+        assert!(resolve_target_in_workspace(&ws, granted.join("x.txt").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_symlink_inside_the_workspace_resolves_to_its_target() {
+        let (_dir, ws, _outside) = ws_and_outside();
+        fs::write(ws.join("docs/real.txt"), "x").unwrap();
+        symlink(ws.join("docs/real.txt"), ws.join("alias.txt")).unwrap();
+        let real = ws.join("docs/real.txt").canonicalize().unwrap();
+        let abs = ws.join("alias.txt");
+        assert_eq!(resolve_target_in_workspace(&ws, "alias.txt").unwrap(), real);
+        assert_eq!(resolve_target_in_workspace(&ws, abs.to_str().unwrap()).unwrap(), real);
+    }
 }
 
 fn read_utf8_capped(path: &Path) -> Result<String> {
@@ -764,15 +847,25 @@ impl WriteFileTool {
             ));
         }
         let target = resolve_target_in_workspace(&self.workspace, path)?;
-        if target.exists() {
-            return Err(Error::Tool(format!(
-                "file exists: {path}. write_file cannot overwrite; use edit_file (old_string/new_string for a replacement, or a unified diff)."
-            )));
-        }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&target, contents)?;
+        // create_new fails on anything already at the path, a dangling symlink
+        // included, so write_file never overwrites or writes through a link.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Error::Tool(format!(
+                        "file exists: {path}. write_file cannot overwrite; use edit_file (old_string/new_string for a replacement, or a unified diff)."
+                    ))
+                } else {
+                    e.into()
+                }
+            })?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
         if let Some(v) = &self.views {
             v.remember(&target, contents.as_bytes());
         }
@@ -1665,8 +1758,9 @@ impl ReadImageTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Tool("path is required".into()))?;
         let resolved = resolve_in_workspace(&self.workspace, path)?;
-        let img = image::open(&resolved).map_err(|e| Error::Tool(format!("open image: {e}")))?;
-        let (width, height) = (img.width(), img.height());
+        crate::vision::check_source_size(&resolved)?;
+        // Header only: a tiny image or a bad region fails before any decode.
+        let (width, height) = crate::vision::image_dimensions(&resolved)?;
         if crate::vision::below_vision_min(width, height) {
             return Ok(json!({
                 "path": path.replace('\\', "/"),
@@ -1678,26 +1772,93 @@ impl ReadImageTool {
             })
             .to_string());
         }
-        Ok(json!({
+        let region = image_region(args, width, height)?;
+        let mut img = crate::vision::open_image(&resolved)?;
+        if let Some((x, y, w, h)) = region {
+            img = img.crop_imm(x, y, w, h);
+        }
+        let (jpeg, sent_width, sent_height) = crate::vision::model_jpeg(&img)?;
+        let scale = (sent_width as f64 / img.width().max(1) as f64 * 1000.0).round() / 1000.0;
+        let mut out = json!({
             "path": path.replace('\\', "/"),
             "attach_image": true,
             "mime": "image/jpeg",
             "width": width,
-            "height": height
-        })
-        .to_string())
+            "height": height,
+            "sent_width": sent_width,
+            "sent_height": sent_height,
+            "scale": scale
+        });
+        // The exact pixels sent: attached from here and shown in the picture
+        // row. Best effort (a read-only workspace): the attach then re-reads
+        // `path` and `region`.
+        if let Ok(view) = crate::vision::save_seen(&self.workspace, &jpeg) {
+            out["view"] = json!(view);
+        }
+        if let Some((x, y, w, h)) = region {
+            out["region"] = json!({"x": x, "y": y, "width": w, "height": h});
+        }
+        if sent_width < img.width() {
+            out["note"] = json!(format!(
+                "Downscaled from {}x{}; small text may be unreadable. Pass region (x, y, width, height in original pixels) to see a part at full detail.",
+                img.width(),
+                img.height()
+            ));
+        }
+        Ok(out.to_string())
     }
+}
+
+/// The optional `region` crop, clamped to the image. Coordinates are in
+/// original pixels, after EXIF orientation.
+fn image_region(args: &Value, width: u32, height: u32) -> Result<Option<(u32, u32, u32, u32)>> {
+    let Some(r) = args.get("region").filter(|r| !r.is_null()) else {
+        return Ok(None);
+    };
+    let num = |k: &str| -> Result<u32> {
+        r.get(k)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| n.round().min(u32::MAX as f64) as u32)
+            .ok_or_else(|| Error::Tool(format!("region.{k} must be a number >= 0")))
+    };
+    let (x, y, w, h) = (num("x")?, num("y")?, num("width")?, num("height")?);
+    if x >= width || y >= height || w == 0 || h == 0 {
+        return Err(Error::Tool(format!(
+            "region x={x} y={y} width={w} height={h} is empty or outside the {width}x{height} image"
+        )));
+    }
+    let (w, h) = (w.min(width - x), h.min(height - y));
+    if crate::vision::below_vision_min(w, h) {
+        return Err(Error::Tool(format!(
+            "region {w}x{h} is under the {} pixels xAI vision accepts; pick a larger region",
+            crate::vision::MIN_VISION_PIXELS
+        )));
+    }
+    Ok(Some((x, y, w, h)))
 }
 
 impl ClientTool for ReadImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_image".into(),
-            description: "Load a PNG or JPEG from the workspace and attach the pixels so you can see the image on the next turn. xAI rejects images under 512 total pixels (for example 16x16); those are not attached — enlarge or regenerate the file, then call again.".into(),
+            description: "Load an image (PNG, JPEG, GIF, WebP or BMP) from the workspace and attach the pixels so you can see it on the next turn. It is sent with the long edge at most 1280 px; sent_width/sent_height/scale in the result say what you got. Pass region to crop in original pixels before that downscale, e.g. to read part of a tall full-page screenshot. xAI rejects images under 512 total pixels (for example 16x16); those are not attached — enlarge or regenerate the file, then call again.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative PNG or JPEG path inside the workspace"}
+                    "path": {"type": "string", "description": "Relative image path inside the workspace"},
+                    "region": {
+                        "type": "object",
+                        "description": "Optional crop in original-image pixels, applied before downscaling",
+                        "properties": {
+                            "x": {"type": "integer", "description": "Left edge"},
+                            "y": {"type": "integer", "description": "Top edge"},
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"}
+                        },
+                        "required": ["x", "y", "width", "height"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1706,7 +1867,161 @@ impl ClientTool for ReadImageTool {
     }
 
     fn call(&self, args: &Value) -> ToolCallFut<'_> {
-        ready(self.call_sync(args))
+        // Decoding a large image takes a while: keep it off the async workers.
+        let tool = Self::new(self.workspace.clone());
+        let args = args.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || tool.call_sync(&args))
+                .await
+                .map_err(|e| Error::Tool(format!("read_image join: {e}")))?
+        })
+    }
+}
+
+#[cfg(test)]
+mod read_image_tests {
+    use super::*;
+    use crate::vision::vision_tests::{decode_uri, rotated_jpeg};
+
+    fn read(ws: &Path, args: Value) -> Value {
+        serde_json::from_str(&ReadImageTool::new(ws.to_path_buf()).call_sync(&args).unwrap()).unwrap()
+    }
+
+    /// What the model gets for a read_image result.
+    fn sent(ws: &Path, out: &Value) -> image::RgbImage {
+        let uri = crate::vision::data_uri_for_tool(ws, &out.to_string()).unwrap().unwrap();
+        decode_uri(&uri).to_rgb8()
+    }
+
+    #[test]
+    fn a_tall_image_reports_what_was_sent_and_region_zooms_in() {
+        let ws = tempfile::tempdir().unwrap();
+        // 640x2560: white top half, black bottom half.
+        let page = image::RgbImage::from_fn(640, 2560, |_, y| {
+            image::Rgb(if y < 1280 { [255; 3] } else { [0; 3] })
+        });
+        page.save(ws.path().join("page.png")).unwrap();
+        let out = read(ws.path(), json!({"path": "page.png"}));
+        assert_eq!((out["width"].as_u64(), out["height"].as_u64()), (Some(640), Some(2560)));
+        assert_eq!((out["sent_width"].as_u64(), out["sent_height"].as_u64()), (Some(320), Some(1280)));
+        assert_eq!(out["scale"], 0.5);
+        assert!(out["note"].as_str().unwrap().contains("region"), "{out}");
+        assert_eq!(sent(ws.path(), &out).dimensions(), (320, 1280));
+
+        let region = json!({"x": 0, "y": 1280, "width": 640, "height": 5000});
+        let out = read(ws.path(), json!({"path": "page.png", "region": region}));
+        assert_eq!(out["region"], json!({"x": 0, "y": 1280, "width": 640, "height": 1280}));
+        assert_eq!((out["sent_width"].as_u64(), out["sent_height"].as_u64()), (Some(640), Some(1280)));
+        assert_eq!(out["scale"], 1.0);
+        assert!(out.get("note").is_none(), "{out}");
+        let pixels = sent(ws.path(), &out);
+        assert_eq!(pixels.dimensions(), (640, 1280));
+        assert!(pixels.pixels().all(|p| p[0] < 40), "only the black half was sent");
+    }
+
+    #[test]
+    fn a_bad_region_is_refused_before_decoding() {
+        let ws = tempfile::tempdir().unwrap();
+        image::RgbImage::new(100, 100).save(ws.path().join("a.png")).unwrap();
+        let tool = ReadImageTool::new(ws.path().to_path_buf());
+        for (region, want) in [
+            (json!({"x": 100, "y": 0, "width": 10, "height": 10}), "outside"),
+            (json!({"x": 0, "y": 0, "width": 0, "height": 10}), "empty"),
+            (json!({"x": 0, "y": 0, "width": 10, "height": 10}), "512"),
+            (json!({"x": "a", "y": 0, "width": 10, "height": 10}), "region.x"),
+        ] {
+            let err = tool.call_sync(&json!({"path": "a.png", "region": region})).unwrap_err().to_string();
+            assert!(err.contains(want), "{region}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_view_keeps_what_the_model_saw_after_the_source_changes() {
+        let ws = tempfile::tempdir().unwrap();
+        let src = ws.path().join("ui.png");
+        image::RgbImage::from_pixel(40, 40, image::Rgb([255, 255, 255])).save(&src).unwrap();
+        let first = read(ws.path(), json!({"path": "ui.png"}));
+        let view = first["view"].as_str().unwrap();
+        assert!(view.starts_with(".groka/seen/"), "{first}");
+        image::RgbImage::from_pixel(40, 40, image::Rgb([0, 0, 0])).save(&src).unwrap();
+        let second = read(ws.path(), json!({"path": "ui.png"}));
+        assert_ne!(second["view"], first["view"]);
+        assert!(sent(ws.path(), &first).pixels().all(|p| p[0] > 200), "first view is still white");
+        assert!(ws.path().join(".groka/.gitignore").is_file());
+    }
+
+    #[test]
+    fn every_listed_format_and_exif_orientation_is_read_by_content() {
+        let ws = tempfile::tempdir().unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 30, image::Rgb([9, 99, 199])));
+        for name in ["a.gif", "a.webp", "a.bmp", "a.jfif"] {
+            let format = image::ImageFormat::from_path(name).unwrap();
+            img.write_to(&mut fs::File::create(ws.path().join(name)).unwrap(), format).unwrap();
+        }
+        img.write_to(&mut fs::File::create(ws.path().join("png.jpg")).unwrap(), image::ImageFormat::Png).unwrap();
+        for name in ["a.gif", "a.webp", "a.bmp", "a.jfif", "png.jpg"] {
+            assert!(crate::vision::is_image_ext(Path::new(name)), "{name}");
+            let out = read(ws.path(), json!({"path": name}));
+            assert_eq!(out["attach_image"], true, "{name}: {out}");
+            assert_eq!((out["width"].as_u64(), out["height"].as_u64()), (Some(40), Some(30)), "{name}");
+            assert_eq!(sent(ws.path(), &out).dimensions(), (40, 30), "{name}");
+        }
+        rotated_jpeg(&ws.path().join("phone.jpg"));
+        let out = read(ws.path(), json!({"path": "phone.jpg"}));
+        assert_eq!((out["width"].as_u64(), out["height"].as_u64()), (Some(32), Some(64)), "{out}");
+        assert_eq!(sent(ws.path(), &out).dimensions(), (32, 64));
+    }
+
+    #[test]
+    fn an_oversized_source_file_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let f = fs::File::create(ws.path().join("huge.png")).unwrap();
+        f.set_len(33 * 1024 * 1024).unwrap();
+        let err = ReadImageTool::new(ws.path().to_path_buf())
+            .call_sync(&json!({"path": "huge.png"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("32MiB"), "{err}");
+    }
+
+    #[test]
+    fn the_registry_call_runs_on_the_blocking_pool() {
+        let ws = tempfile::tempdir().unwrap();
+        image::RgbImage::new(40, 40).save(ws.path().join("a.png")).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).build().unwrap();
+        rt.block_on(async {
+            // Hold the only blocking thread, so a read sent to the pool cannot
+            // finish on its first poll, as one run inline would.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || held.recv());
+            let reg = ToolRegistry::new(vec![Box::new(ReadImageTool::new(ws.path().to_path_buf()))]);
+            let args = json!({"path": "a.png"});
+            let mut call = std::pin::pin!(reg.call("read_image", &args));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            release.send(()).unwrap();
+            holder.await.unwrap().unwrap();
+            let out: Value = serde_json::from_str(&call.await.unwrap()).unwrap();
+            assert_eq!(out["attach_image"], true, "{out}");
+        });
+    }
+
+    #[test]
+    fn without_a_seen_copy_the_attach_still_sends_what_was_read() {
+        let ws = tempfile::tempdir().unwrap();
+        // `.groka` cannot be created: as in a read-only checkout.
+        fs::write(ws.path().join(".groka"), "not a folder").unwrap();
+        let page = image::RgbImage::from_fn(640, 2560, |_, y| {
+            image::Rgb(if y < 1280 { [255; 3] } else { [0; 3] })
+        });
+        page.save(ws.path().join("page.png")).unwrap();
+        let out = read(ws.path(), json!({"path": "page.png"}));
+        assert!(out.get("view").is_none(), "{out}");
+        assert_eq!(sent(ws.path(), &out).dimensions(), (320, 1280));
+        let region = json!({"x": 0, "y": 1280, "width": 640, "height": 1280});
+        let out = read(ws.path(), json!({"path": "page.png", "region": region}));
+        assert!(out.get("view").is_none(), "{out}");
+        let pixels = sent(ws.path(), &out);
+        assert_eq!(pixels.dimensions(), (640, 1280));
+        assert!(pixels.pixels().all(|p| p[0] < 40), "only the black half was sent");
     }
 }
 
