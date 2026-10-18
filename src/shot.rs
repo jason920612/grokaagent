@@ -55,7 +55,7 @@ impl ShotFilter<'_> {
 
 pub const MIN_EDGE: u32 = 160;
 
-fn contains_ci(hay: &str, needle: &str) -> bool {
+pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
     let n = needle.trim();
     if n.is_empty() {
         return true;
@@ -243,7 +243,7 @@ pub fn looks_browser(app: &str) -> bool {
     BROWSER_APPS.contains(&a.as_str()) || BROWSER_APPS.contains(&short)
 }
 
-fn title_looks_local(title: &str) -> bool {
+pub(crate) fn title_looks_local(title: &str) -> bool {
     let t = title.to_lowercase();
     t.contains("localhost") || t.contains("127.0.0.1") || t.contains("[::1]")
 }

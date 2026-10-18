@@ -1,5 +1,6 @@
 //! Prepare workspace images for Grok vision (`input_image` on the Responses API).
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -123,25 +124,38 @@ pub fn retain_recent_images(items: &mut [Value], keep: usize) {
         return;
     }
     for i in idxs.iter().take(idxs.len() - keep).copied() {
-        strip_one_item_images(&mut items[i], None);
+        strip_one_item_images(&mut items[i], Strip::Detached);
     }
 }
 
 /// Drop every attached image for `model`, which cannot view any: tool
 /// results say no pixels were attached, user turns keep their paths, and
-/// neither invites read_image again. Returns the call ids of the tool
-/// results rewritten.
-pub fn strip_images_for_blind_model(items: &mut [Value], model: &str) -> Vec<String> {
+/// neither invites read_image again. The results in `seen` went to a model
+/// that sees images, so they lose the pixels but keep their claim. Returns
+/// the call ids of the tool results rewritten.
+pub fn strip_images_for_blind_model(items: &mut [Value], model: &str, seen: &HashSet<String>) -> Vec<String> {
     let mut rewritten = Vec::new();
     for item in items.iter_mut().filter(|item| value_has_image(item)) {
-        strip_one_item_images(item, Some(model));
-        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
-            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
-                rewritten.push(id.to_string());
-            }
+        let id = tool_call_id(item).map(str::to_string);
+        if id.as_ref().is_some_and(|id| seen.contains(id)) {
+            strip_one_item_images(item, Strip::Blind);
+            continue;
         }
+        strip_one_item_images(item, Strip::Unsent(model));
+        rewritten.extend(id);
     }
     rewritten
+}
+
+/// Call ids of the tool results in `items` that carry pixels.
+pub fn image_call_ids(items: &[Value]) -> impl Iterator<Item = String> + '_ {
+    items.iter().filter(|item| value_has_image(item)).filter_map(|item| tool_call_id(item).map(str::to_string))
+}
+
+fn tool_call_id(item: &Value) -> Option<&str> {
+    (item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .then(|| item.get("call_id").and_then(Value::as_str))
+        .flatten()
 }
 
 /// [`retain_recent_images`], but the image items in `items[seen..]` are
@@ -162,8 +176,19 @@ pub fn prune_attached_images(items: &mut [Value], turns_seen: u32) {
     }
 }
 
-/// `blind`: the model the pixels were for cannot view images at all.
-fn strip_one_item_images(item: &mut Value, blind: Option<&str>) {
+/// What a stripped item says about its pixels.
+#[derive(Clone, Copy)]
+enum Strip<'a> {
+    /// Expired or dropped: read_image brings them back.
+    Detached,
+    /// The model now asked cannot view images; an earlier one was sent them.
+    Blind,
+    /// Never sent: this model cannot view images.
+    Unsent(&'a str),
+}
+
+fn strip_one_item_images(item: &mut Value, how: Strip) {
+    let blind = !matches!(how, Strip::Detached);
     if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
         let Some(arr) = item.get("output").and_then(Value::as_array).cloned() else {
             return;
@@ -179,7 +204,7 @@ fn strip_one_item_images(item: &mut Value, blind: Option<&str>) {
             .find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
             .and_then(|p| p.get("text").and_then(Value::as_str))
             .unwrap_or("");
-        if let (Some(model), Ok(Value::Object(mut o))) = (blind, serde_json::from_str::<Value>(text)) {
+        if let (Strip::Unsent(model), Ok(Value::Object(mut o))) = (how, serde_json::from_str::<Value>(text)) {
             o.insert("attach_image".into(), json!(false));
             o.insert(
                 "attach_error".into(),
@@ -188,12 +213,12 @@ fn strip_one_item_images(item: &mut Value, blind: Option<&str>) {
             item["output"] = Value::String(Value::Object(o).to_string());
             return;
         }
-        let note = detached_note(1, blind.is_some());
+        let note = detached_note(1, blind);
         item["output"] = Value::String(if text.is_empty() { note } else { format!("{text}\n{note}") });
         return;
     }
     if item.get("role").and_then(Value::as_str) == Some("user") {
-        strip_user_content_images(item, blind.is_some());
+        strip_user_content_images(item, blind);
     }
 }
 
@@ -321,7 +346,7 @@ mod agent_tests {
         save_jpeg(&dir.path().join(".groka/inbox/u.jpg"), &img).unwrap();
         let tool = function_call_output("c1", r#"{"path":"c1.jpg","attach_image":true}"#, Some("data:image/jpeg;base64,AAAA"));
         let mut items = vec![user_message("fix this", &[PathBuf::from(".groka/inbox/u.jpg")], dir.path()), tool];
-        let rewritten = strip_images_for_blind_model(&mut items, "text-model");
+        let rewritten = strip_images_for_blind_model(&mut items, "text-model", &HashSet::new());
         assert_eq!(rewritten, ["c1"]);
         assert_eq!(image_item_count(&items), 0);
         let user = items[0]["content"].as_str().unwrap();
@@ -331,6 +356,20 @@ mod agent_tests {
         assert_eq!(out["attach_image"], false);
         assert!(out["attach_error"].as_str().unwrap().starts_with("text-model cannot view images"), "{out}");
         assert!(!out.to_string().contains("read_image"), "{out}");
+    }
+
+    #[test]
+    fn a_blind_strip_keeps_the_claim_of_pixels_a_seeing_model_was_sent() {
+        let tool = |id: &str| function_call_output(id, &format!(r#"{{"path":"{id}.jpg","attach_image":true}}"#), Some("data:image/jpeg;base64,AAAA"));
+        let mut items = vec![tool("c1"), tool("c2")];
+        assert_eq!(image_call_ids(&items).collect::<Vec<_>>(), ["c1", "c2"]);
+        let seen = HashSet::from(["c1".to_string()]);
+        assert_eq!(strip_images_for_blind_model(&mut items, "text-model", &seen), ["c2"]);
+        assert_eq!(image_item_count(&items), 0);
+        let looked = items[0]["output"].as_str().unwrap();
+        assert_eq!(looked, format!(r#"{{"path":"c1.jpg","attach_image":true}}"#) + "\n" + &detached_note(1, true));
+        let out: Value = serde_json::from_str(items[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(out["attach_image"], false, "{out}");
     }
 
     #[test]

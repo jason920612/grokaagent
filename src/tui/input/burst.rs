@@ -14,6 +14,12 @@ const MIN_KEYS: usize = 6;
 /// A console may deliver a long paste over several reads: a text run that
 /// opens a read this soon after the loop waits again continues the paste.
 const CONTINUE: Duration = Duration::from_millis(50);
+/// A read this soon after the loop waits again was already queued: it came
+/// while the loop was busy, not as a paste into an idle one.
+const QUEUED: Duration = Duration::from_millis(5);
+/// Busy this long, the loop may have queued a typed line: MIN_KEYS keys take
+/// a fast typist longer.
+const STALL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 pub(crate) struct PasteBurst {
@@ -21,6 +27,10 @@ pub(crate) struct PasteBurst {
     open: Option<Open>,
     /// `open` was set by the last read and `waiting` has not restarted it yet.
     fresh: bool,
+    /// The loop stopped listening for input: a read, or another wakeup.
+    woke: Option<Instant>,
+    /// The loop last waited for input then, after being busy this long.
+    waited: Option<(Instant, Duration)>,
 }
 
 /// Line breaks a paste held back at the end of a read: trailing ones are
@@ -29,8 +39,8 @@ pub(crate) struct PasteBurst {
 struct Open {
     at: Instant,
     held: usize,
-    /// One line of plain text and its Enter may be typing that queued up
-    /// during a slow frame: that Enter is pressed after all if the paste
+    /// One line of plain text and its Enter that queued up while the loop
+    /// was busy may be typing: that Enter is pressed after all if the paste
     /// does not go on.
     enter: Vec<Event>,
 }
@@ -79,6 +89,10 @@ fn text_key(ev: &Event) -> Option<TextKey> {
 impl PasteBurst {
     /// Replace paste-like runs of key presses in one read with `Event::Paste`.
     pub fn coalesce(&mut self, batch: Vec<Event>, now: Instant) -> Vec<Event> {
+        self.woke.get_or_insert(now);
+        let queued = self
+            .waited
+            .is_some_and(|(at, busy)| busy >= STALL && now.saturating_duration_since(at) <= QUEUED);
         let mut out = self.lapse(now);
         if !batch.is_empty() && batch.iter().all(|e| matches!(e, Event::Key(k) if k.kind != KeyEventKind::Press)) {
             // Releases alone (a modifier's, an Alt code's) neither go on
@@ -88,7 +102,10 @@ impl PasteBurst {
             return out;
         }
         self.fresh = false;
-        let mut cont = self.open.take().map(|o| o.held);
+        let open = self.open.take();
+        let mut cont = open.as_ref().map(|o| o.held);
+        // A typed line's Enter, pressed unless this read goes on with the paste.
+        let mut enter = open.map(|o| o.enter).unwrap_or_default();
         out.reserve(batch.len());
         let mut run = Run::default();
         // Nothing but key releases came yet.
@@ -105,8 +122,10 @@ impl PasteBurst {
                 continue;
             }
             let Some(key) = key else {
-                self.finish(std::mem::take(&mut run), &mut cont, &mut out, None);
-                cont = None;
+                self.finish(std::mem::take(&mut run), &mut cont, &mut out, None, queued);
+                if cont.take().is_some() {
+                    out.append(&mut enter);
+                }
                 lead = false;
                 out.push(ev);
                 continue;
@@ -118,8 +137,26 @@ impl PasteBurst {
             }
             run.push(ev, key);
         }
-        self.finish(run, &mut cont, &mut out, Some(now));
+        self.finish(run, &mut cont, &mut out, Some(now), queued);
+        if cont.is_some() {
+            out.append(&mut enter);
+        }
         out
+    }
+
+    /// One read on Windows: pastes come back together and an IME's
+    /// confirming Enter goes, but a typed line's Enter that came due
+    /// meanwhile goes first, out of the IME's reach.
+    pub fn read(&mut self, batch: Vec<Event>, now: Instant) -> Vec<Event> {
+        let mut late = self.expired(now);
+        late.extend(super::coalesce_ime_enter(self.coalesce(batch, now)));
+        late
+    }
+
+    /// The loop woke up (a timer, a message) and stops listening for input
+    /// until it waits again. A read counts as waking too.
+    pub fn woke(&mut self, now: Instant) {
+        self.woke.get_or_insert(now);
     }
 
     /// The loop is about to wait for input again. A paste the last read left
@@ -127,6 +164,8 @@ impl PasteBurst {
     /// take longer than the window while the rest of the paste is already
     /// queued. Only once per read, so other wakeups cannot keep it open.
     pub fn waiting(&mut self, now: Instant) {
+        let busy = self.woke.take().map_or(Duration::ZERO, |w| now.saturating_duration_since(w));
+        self.waited = Some((now, busy));
         if std::mem::take(&mut self.fresh) {
             if let Some(o) = self.open.as_mut() {
                 o.at = now;
@@ -153,7 +192,9 @@ impl PasteBurst {
     }
 
     /// Emit a run as a paste or as its own keys. `end` = the run ends the read.
-    fn finish(&mut self, run: Run, cont: &mut Option<usize>, out: &mut Vec<Event>, end: Option<Instant>) {
+    /// `queued`: the read came at once after the loop was busy long enough
+    /// for typing to pile up; a paste into an idle loop keeps its Enter.
+    fn finish(&mut self, run: Run, cont: &mut Option<usize>, out: &mut Vec<Event>, end: Option<Instant>, queued: bool) {
         if run.raw.is_empty() {
             return;
         }
@@ -167,7 +208,7 @@ impl PasteBurst {
         text.push_str(&run.text);
         let body = text.trim_end_matches('\n').len();
         let trailing = text.len() - body;
-        let typed = held.is_none() && trailing == 1 && text.is_ascii() && !text[..body].contains('\n');
+        let typed = queued && held.is_none() && trailing == 1 && text.is_ascii() && !text[..body].contains('\n');
         let enter = if typed { vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))] } else { Vec::new() };
         text.truncate(body);
         if !text.is_empty() {
@@ -307,39 +348,99 @@ mod tests {
         assert_eq!(presses(&out), 0);
     }
 
+    /// The loop was busy from `from` (a slow frame) and waits again at `to`.
+    fn busy(burst: &mut PasteBurst, from: Instant, to: Instant) {
+        burst.woke(from);
+        burst.waiting(to);
+    }
+
     #[test]
     fn a_typed_line_queued_in_a_slow_frame_still_sends() {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let mut burst = PasteBurst::default();
-        let out = burst.coalesce(console_keys("ok thanks\r"), t0);
+        busy(&mut burst, t0, t0 + ms(600));
+        let t1 = t0 + ms(601);
+        let out = burst.coalesce(console_keys("ok thanks\r"), t1);
         assert_eq!(pastes(&out), ["ok thanks"]);
         assert_eq!(presses(&out), 0, "held while the paste may go on");
-        assert!(burst.expired(t0 + ms(80)).is_empty(), "the window starts when the loop waits");
-        burst.waiting(t0 + ms(80));
-        assert!(burst.expired(t0 + ms(100)).is_empty());
-        let late = burst.expired(t0 + ms(140));
+        assert!(burst.expired(t1 + ms(80)).is_empty(), "the window starts when the loop waits");
+        burst.waiting(t1 + ms(80));
+        assert!(burst.expired(t1 + ms(100)).is_empty());
+        let late = burst.expired(t1 + ms(140));
         assert_eq!(presses(&late), 1, "the Enter sends after all");
-        assert!(burst.expired(t0 + ms(300)).is_empty(), "once");
+        assert!(burst.expired(t1 + ms(300)).is_empty(), "once");
 
         // The next read finds it due first.
-        burst.coalesce(console_keys("ok thanks\r"), t0);
-        let next = burst.coalesce(console_keys("x"), t0 + ms(200));
+        busy(&mut burst, t0, t0 + ms(600));
+        burst.coalesce(console_keys("ok thanks\r"), t1);
+        let next = burst.coalesce(console_keys("x"), t1 + ms(200));
         assert!(matches!(&next[0], Event::Key(k) if k.code == KeyCode::Enter && k.kind == KeyEventKind::Press), "{next:?}");
         assert_eq!(presses(&next), 2);
 
         // Followed by another event in the same read: no paste can go on.
         let mut keys = console_keys("ok thanks\r");
         keys.push(press(KeyCode::Up, KeyModifiers::NONE));
-        let out = PasteBurst::default().coalesce(keys, t0);
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(600));
+        let out = burst.coalesce(keys, t1);
         assert_eq!(pastes(&out), ["ok thanks"]);
         assert_eq!(presses(&out), 2, "Enter, then Up");
 
         // A multi-line paste keeps its trailing break as a held line break.
         let mut burst = PasteBurst::default();
-        burst.coalesce(console_keys("first line\rsecond\r"), t0);
-        burst.waiting(t0);
-        assert!(burst.expired(t0 + ms(500)).is_empty());
+        busy(&mut burst, t0, t0 + ms(600));
+        burst.coalesce(console_keys("first line\rsecond\r"), t1);
+        burst.waiting(t1);
+        assert!(burst.expired(t1 + ms(500)).is_empty());
+    }
+
+    #[test]
+    fn a_line_pasted_into_an_idle_loop_does_not_send() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        for line in ["git status\r", "src/tui/input/burst.rs\r", "first line\r"] {
+            let mut burst = PasteBurst::default();
+            busy(&mut burst, t0, t0 + ms(3));
+            let out = burst.coalesce(console_keys(line), t0 + ms(30));
+            assert_eq!(pastes(&out), [line.trim_end()]);
+            assert_eq!(presses(&out), 0, "{line:?}");
+            burst.waiting(t0 + ms(40));
+            assert!(burst.expired(t0 + ms(200)).is_empty(), "{line:?} must stay a draft");
+        }
+        // After a slow frame too, unless it was already there when the loop waited.
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(600));
+        burst.coalesce(console_keys("git status\r"), t0 + ms(630));
+        burst.waiting(t0 + ms(640));
+        assert!(burst.expired(t0 + ms(800)).is_empty());
+    }
+
+    #[test]
+    fn a_typed_lines_enter_survives_the_next_read() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let moved = Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, column: 3, row: 4, modifiers: KeyModifiers::NONE });
+        for other in [moved, Event::FocusLost, Event::Resize(80, 24), press(KeyCode::Left, KeyModifiers::NONE)] {
+            let mut burst = PasteBurst::default();
+            busy(&mut burst, t0, t0 + ms(600));
+            burst.coalesce(console_keys("ok thanks\r"), t0 + ms(601));
+            burst.waiting(t0 + ms(620));
+            let out = burst.coalesce(vec![other.clone()], t0 + ms(640));
+            assert_eq!(presses(&out[..1]), 1, "the Enter first: {out:?}");
+            assert!(matches!(&out[0], Event::Key(k) if k.code == KeyCode::Enter));
+            assert_eq!(out[1], other);
+            burst.waiting(t0 + ms(650));
+            assert!(burst.expired(t0 + ms(900)).is_empty(), "once");
+        }
+        // Due by the time an IME commit arrives: the commit's Enter rule spares it.
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(600));
+        burst.coalesce(console_keys("ok thanks\r"), t0 + ms(601));
+        burst.waiting(t0 + ms(620));
+        let out = burst.read(vec![press(KeyCode::Char('好'), KeyModifiers::NONE)], t0 + ms(690));
+        assert!(matches!(&out[0], Event::Key(k) if k.code == KeyCode::Enter), "{out:?}");
+        assert_eq!(presses(&out), 2);
     }
 
     #[test]

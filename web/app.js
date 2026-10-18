@@ -1491,6 +1491,12 @@
       if (msg.type === "hello") {
         denied = linkUsed = false;
         connectionState(true, "● 已連線");
+        // The key may have come from another tab after this one's /auth;
+        // images that failed without the token are built again.
+        if (msg.media && msg.media !== mediaToken) {
+          mediaToken = msg.media;
+          chatKey = pendingKey = overlayKey = "";
+        }
         onHello(msg);
       } else if (msg.type === "delta") {
         onDelta(msg);

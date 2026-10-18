@@ -1531,15 +1531,16 @@ impl ScreenshotTool {
             || target.eq_ignore_ascii_case("desktop");
         let workspace = self.workspace.clone();
         let written = dest.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            let out = if want_monitor {
-                capture_monitor_to(&dest, &rel, extra)
+        let bound = query.bound.as_ref().map(|b| (b.name.clone(), b.id));
+        let out = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>)> {
+            let (out, settle) = if want_monitor {
+                (capture_monitor_to(&dest, &rel, extra)?, None)
             } else {
-                capture_window_to(&dest, &rel, &query, extra)
-            }?;
+                capture_window_to(&dest, &rel, &query, extra)?
+            };
             // Default names are unique; a path the model names may be shot
             // again, so its picture row points at an immutable copy.
-            Ok(if reused_path { with_seen_view(&workspace, &dest, out) } else { out })
+            Ok((if reused_path { with_seen_view(&workspace, &dest, out) } else { out }, settle))
         })
         .await
         .map_err(|e| Error::Tool(format!("screenshot join: {e}")))?;
@@ -1548,7 +1549,11 @@ impl ScreenshotTool {
                 w.insert(rel);
             }
         }
-        out
+        let (out, settle) = out?;
+        if let (Some(title), Some((name, id)), Some(hub)) = (settle, bound, self.windows.as_ref()) {
+            hub.set_title(&name, id, &title);
+        }
+        Ok(out)
     }
 }
 
@@ -1653,30 +1658,39 @@ fn resolve_shot_pid(
         .filter(|p| *p > 0);
     // The pid of a window bound in a browser is the whole browser, the
     // user's windows included: alone it means that window, as name= would.
-    let picks = ["title", "app"]
-        .iter()
-        .any(|k| args.get(*k).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()));
+    // Only a title picks among its windows; they all share one app name.
+    let picks = args.get("title").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
     if let Some(p) = pid.filter(|_| !picks) {
-        let mut shared: Vec<wintrack::BoundWindow> = windows
-            .map(|h| h.all())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| b.pid == p && !b.own_process)
-            .collect();
-        shared.sort_by(|a, b| a.name.cmp(&b.name));
-        match shared.len() {
-            0 => {}
-            1 => return Ok((pid, shared.pop())),
-            _ => {
-                let names: Vec<&str> = shared.iter().map(|b| b.name.as_str()).collect();
-                return Err(Error::Tool(format!(
-                    "pid {p} is a browser that also shows the user's windows; pass name= one of {}",
-                    names.join(", ")
-                )));
-            }
-        }
+        let shared: Vec<wintrack::BoundWindow> =
+            windows.map(|h| h.all()).unwrap_or_default().into_iter().filter(|b| !b.own_process && b.pid > 0).collect();
+        // The pid may be the shell that started the browser (run_background's).
+        let parents = if shared.iter().any(|b| b.pid != p) {
+            crate::shot::parent_map(&shared.iter().map(|b| b.pid).collect::<Vec<_>>())
+        } else {
+            HashMap::new()
+        };
+        return browser_binding(p, shared, &parents).map(|b| (pid, b));
     }
     Ok((pid, None))
+}
+
+/// The one browser binding whose browser is `p` or was started by `p`.
+fn browser_binding(
+    p: u32,
+    shared: Vec<wintrack::BoundWindow>,
+    parents: &HashMap<u32, u32>,
+) -> Result<Option<wintrack::BoundWindow>> {
+    let mut shared: Vec<wintrack::BoundWindow> =
+        shared.into_iter().filter(|b| crate::shot::descends_from(b.pid, &[p], Some(parents))).collect();
+    shared.sort_by(|a, b| a.name.cmp(&b.name));
+    if shared.len() > 1 {
+        let names: Vec<&str> = shared.iter().map(|b| b.name.as_str()).collect();
+        return Err(Error::Tool(format!(
+            "pid {p} is (or started) a browser that also shows the user's windows; pass name= one of {}",
+            names.join(", ")
+        )));
+    }
+    Ok(shared.pop())
 }
 
 /// What the model asked to capture, gathered before the blocking capture.
@@ -1808,7 +1822,8 @@ fn capture_monitor_to(target: &Path, rel: &str, mut extra: Value) -> Result<Stri
 
 /// Captures only a window the request points at; when none can be taken it
 /// captures nothing (never the whole display) and lists the open windows.
-fn capture_window_to(target: &Path, rel: &str, q: &ShotQuery, mut extra: Value) -> Result<String> {
+/// Also returns the title the binding behind `name` should now go by.
+fn capture_window_to(target: &Path, rel: &str, q: &ShotQuery, mut extra: Value) -> Result<(String, Option<String>)> {
     let listed = crate::shot::collect_windows()?;
     let metas: Vec<_> = listed.iter().map(|(_, m)| m.clone()).collect();
     let ctx = ShotContext::of(&metas, q);
@@ -1845,7 +1860,7 @@ fn capture_window_to(target: &Path, rel: &str, q: &ShotQuery, mut extra: Value) 
         if let Some(note) = q.bound.as_ref().and_then(|b| bound_drift(b, meta)) {
             extra["bound_note"] = json!(note);
         }
-        return shot_json(target, rel, &img, extra);
+        return Ok((shot_json(target, rel, &img, extra)?, settled_title(q, meta)));
     }
     if let (Some(b), Some(title)) = (&q.bound, moved) {
         let mut out: Value = serde_json::from_str(&no_capture_json(q, &metas, &ctx, true, None)).unwrap_or_default();
@@ -1853,20 +1868,51 @@ fn capture_window_to(target: &Path, rel: &str, q: &ShotQuery, mut extra: Value) 
             "window {} now shows another page (\"{title}\"; it was \"{}\" when bound), which may be the user's; nothing was captured. If it is still your page under a new title, pass name={} title=<part of that title>; otherwise ask the user to switch that window back to your page.",
             b.name, b.title, b.name
         ));
-        return Ok(out.to_string());
+        return Ok((out.to_string(), None));
     }
-    Ok(no_capture_json(q, &metas, &ctx, !order.is_empty(), failed.as_deref()))
+    Ok((no_capture_json(q, &metas, &ctx, !order.is_empty(), failed.as_deref()), None))
 }
 
-/// `name` was bound to an existing window of the user's that changed its
-/// title (a new tab in their browser), and that window now shows something
-/// else: whatever tab the user switched to. A title= that matches it says
-/// the model means it.
+/// A binding whose window may come to show the user's pages: a tab opened
+/// in their browser window, or a browser window the agent opened, where the
+/// browser also puts links the user clicks elsewhere.
+fn guards_tabs(b: &wintrack::BoundWindow) -> bool {
+    !b.own_process && (b.retitled || crate::shot::looks_browser(&b.app))
+}
+
+/// The title the binding behind `name` goes by once `meta` was captured: a
+/// title= the model confirmed, or the first look at the page, which may
+/// have been loading when bound. Later name= calls compare against it.
+fn settled_title(q: &ShotQuery, meta: &crate::shot::WinMeta) -> Option<String> {
+    q.bound
+        .as_ref()
+        .filter(|b| guards_tabs(b) && b.is_window(meta) && (q.title.is_some() || !b.settled))
+        .map(|_| meta.title.clone())
+}
+
+/// What a browser shows while the page loads: its address or a blank tab.
+fn loading_title(title: &str) -> bool {
+    let t = title.trim().to_lowercase();
+    wintrack::squash(title).is_empty()
+        || t.contains("://")
+        || crate::shot::title_looks_local(title)
+        || t.starts_with("new tab")
+        || t.starts_with("untitled")
+}
+
+/// The window behind `name` now shows something else than when it was bound
+/// (or last captured): whatever tab the user switched to. A title= that
+/// matches it says the model means it. A window the agent opened that was
+/// bound while its page loaded is taken once, which settles its title; a
+/// tab in the user's window never is.
 fn shows_other_page(q: &ShotQuery, meta: &crate::shot::WinMeta) -> bool {
-    let Some(b) = q.bound.as_ref().filter(|b| b.retitled && !b.own_process && b.is_window(meta)) else {
+    let Some(b) = q.bound.as_ref().filter(|b| guards_tabs(b) && b.is_window(meta)) else {
         return false;
     };
-    !q.title.as_deref().is_some_and(|t| !t.trim().is_empty()) && wintrack::squash(&b.title) != wintrack::squash(&meta.title)
+    if q.title.as_deref().is_some_and(|t| !t.trim().is_empty()) || (!b.retitled && !b.settled && loading_title(&b.title)) {
+        return false;
+    }
+    wintrack::squash(&b.title) != wintrack::squash(&meta.title)
 }
 
 /// How the captured window differs from the one `name` was bound to.
@@ -1903,6 +1949,13 @@ fn no_capture_reason(
             return format!(
                 "window {} now shows the grokaagent workbench tab, which is never captured (its address bar holds the session token); nothing was captured. Ask the user to switch that window back to your page, or open the page in a window of its own and launch it with window={}.",
                 b.name, b.name
+            );
+        }
+        let shown = metas.iter().find(|m| b.is_window(m)).filter(|m| q.title.as_deref().is_some_and(|t| !crate::shot::contains_ci(&m.title, t)));
+        if let (Some(m), Some(t)) = (shown, q.title.as_deref()) {
+            return format!(
+                "window {} is open but now shows \"{}\", which does not match title=\"{t}\"; nothing was captured. If it is still your page, pass name={} title=<part of that title>; otherwise ask the user to switch that window back to your page.",
+                b.name, m.title, b.name
             );
         }
         return format!(
@@ -2184,10 +2237,57 @@ mod shot_tool_tests {
         assert!(!shows_other_page(&q, &win(5, "(2) Vite + React + TS - Google Chrome", "Google-chrome", 50, 1920, 1080)), "a counter is the same page");
         let asked = ShotQuery { title: Some("Inbox".into()), ..q };
         assert!(!shows_other_page(&asked, &mail), "title= says the model means it");
-        // A window the launch opened for the page keeps the note only.
-        let own = BoundWindow::from_meta("web".into(), &win(5, "Vite + React + TS - Google Chrome", "Google-chrome", 50, 1920, 1080), false);
-        let q = ShotQuery { pid: Some(50), bound: Some(own.clone()), known: vec![own], ..query() };
-        assert!(!shows_other_page(&q, &mail));
+        assert_eq!(settled_title(&asked, &mail).as_deref(), Some(mail.title.as_str()), "and later calls go by it");
+        // A browser window the agent opened: the browser puts the user's links there too.
+        let vite = win(5, "Vite + React + TS - Google Chrome", "Google-chrome", 50, 1920, 1080);
+        let bind = |title: &str| BoundWindow::from_meta("web".into(), &win(5, title, "Google-chrome", 50, 1920, 1080), false);
+        let on = |b: &BoundWindow| ShotQuery { pid: Some(50), bound: Some(b.clone()), known: vec![b.clone()], ..query() };
+        assert!(shows_other_page(&on(&bind(&vite.title)), &mail));
+        assert!(!shows_other_page(&on(&bind(&vite.title)), &vite));
+        // Bound while the page loaded: the first capture settles the title.
+        for loading in ["localhost:5173/ - Google Chrome", "http://127.0.0.1:8000/ - Google Chrome", "New Tab - Google Chrome", "Untitled"] {
+            let q = on(&bind(loading));
+            assert!(!shows_other_page(&q, &vite), "{loading}");
+            assert_eq!(settled_title(&q, &vite).as_deref(), Some(vite.title.as_str()), "{loading}");
+        }
+        let mut settled = bind("localhost:5173/ - Google Chrome");
+        settled.settled = true;
+        assert!(shows_other_page(&on(&settled), &mail), "a page that never got a title is settled too");
+        settled.title = vite.title.clone();
+        assert_eq!(settled_title(&on(&settled), &vite), None, "nothing new to settle");
+        // A tab in the user's window is not taken on trust, loading or not.
+        let mut tab = bind("localhost:3000/ - Google Chrome");
+        tab.retitled = true;
+        assert!(shows_other_page(&on(&tab), &vite));
+        // Another app's window the agent did not start keeps the note only.
+        let ed = BoundWindow::from_meta("ed".into(), &win(8, "notes.txt - Editor", "gedit", 60, 900, 700), false);
+        let q = ShotQuery { pid: Some(60), bound: Some(ed.clone()), known: vec![ed], ..query() };
+        assert!(!shows_other_page(&q, &win(8, "todo.txt - Editor", "gedit", 60, 900, 700)));
+    }
+
+    #[test]
+    fn a_settled_title_replaces_the_bound_one() {
+        let hub = WindowHub::new();
+        let found = wintrack::Appeared {
+            origin: wintrack::Origin::NewWindow,
+            windows: vec![win(3, "localhost:5173/ - Google Chrome", "Google-chrome", 50, 1280, 800)],
+        };
+        wintrack::bind_appeared(&hub, "web", &found);
+        hub.set_title("web", 4, "Inbox - Google Chrome");
+        assert!(!hub.get("web").unwrap().settled, "another window by now");
+        hub.set_title("web", 3, "Vite App - Google Chrome");
+        let web = hub.get("web").unwrap();
+        assert!(web.settled);
+        assert_eq!(web.title, "Vite App - Google Chrome");
+    }
+
+    #[test]
+    fn a_bound_window_under_another_title_is_named_not_called_closed() {
+        let rec = BoundWindow::from_meta("web".into(), &win(5, "Login | Acme - Google Chrome", "Google-chrome", 50, 1280, 800), false);
+        let q = ShotQuery { title: Some("Login".into()), pid: Some(50), bound: Some(rec.clone()), known: vec![rec], ..query() };
+        let metas = vec![win(5, "Dashboard | Acme - Google Chrome", "Google-chrome", 50, 1280, 800)];
+        let why = no_capture_reason(&q, &metas, false, None);
+        assert!(why.contains("now shows \"Dashboard | Acme") && !why.contains("no longer open"), "{why}");
     }
 
     #[test]
@@ -2206,6 +2306,15 @@ mod shot_tool_tests {
         assert_eq!((pid, bound), (Some(77), None), "an app the launch started is all its own");
         let (pid, bound) = resolve_shot_pid(&json!({"pid": 50, "title": "Inbox"}), Some(&hub)).unwrap();
         assert_eq!((pid, bound), (Some(50), None), "a title picks among the browser's windows");
+        for app in ["chrome", "Google-chrome"] {
+            let (_, bound) = resolve_shot_pid(&json!({"pid": 50, "app": app}), Some(&hub)).unwrap();
+            assert_eq!(bound.map(|b| b.name), Some("web".to_string()), "every window of the browser has that app");
+        }
+        // run_background's shell that started the browser.
+        let parents = HashMap::from([(50, 300), (300, 1)]);
+        let web = browser_binding(300, hub.all().into_iter().filter(|b| !b.own_process).collect(), &parents).unwrap();
+        assert_eq!(web.map(|b| b.name), Some("web".to_string()));
+        assert_eq!(browser_binding(301, hub.all().into_iter().filter(|b| !b.own_process).collect(), &parents).unwrap(), None);
         wintrack::bind_appeared(&hub, "docs", &wintrack::Appeared {
             origin: wintrack::Origin::NewWindow,
             windows: vec![win(6, "Docs - Google Chrome", "Google-chrome", 50, 1280, 800)],

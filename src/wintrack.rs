@@ -35,6 +35,9 @@ pub struct BoundWindow {
     /// Bound because an existing window changed its title, not because one
     /// opened: it may be the user's own window.
     pub retitled: bool,
+    /// `title` was seen by a capture of this very window, not taken while a
+    /// browser was still loading the page.
+    pub settled: bool,
 }
 
 impl BoundWindow {
@@ -49,6 +52,7 @@ impl BoundWindow {
             height: w.height,
             own_process,
             retitled: false,
+            settled: false,
         }
     }
 
@@ -109,6 +113,16 @@ impl WindowHub {
     fn insert(&self, rec: BoundWindow) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.insert(rec.name.clone(), rec);
+        }
+    }
+
+    /// The bound window `name`, if still window `id`, now shows `title`.
+    pub fn set_title(&self, name: &str, id: u32, title: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(rec) = inner.get_mut(name).filter(|r| r.id == id) {
+                rec.title = title.to_string();
+                rec.settled = true;
+            }
         }
     }
 

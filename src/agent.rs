@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -490,9 +491,17 @@ fn without_image(output: &str, why: &str) -> String {
 
 /// Drop every image in `history` for `model`, which cannot view them, and
 /// re-report the tool results that had claimed attached pixels, so their
-/// picture rows stop saying the model looked.
-fn strip_for_blind_model(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, history: &mut [Value], model: &str) {
-    for call_id in crate::vision::strip_images_for_blind_model(history, model) {
+/// picture rows stop saying the model looked. Results in `seen` went to a
+/// model that sees images and keep their claim and rows.
+fn strip_for_blind_model(
+    sink: &dyn EventSink,
+    cfg: &RunConfig,
+    run_id: &str,
+    history: &mut [Value],
+    model: &str,
+    seen: &HashSet<String>,
+) {
+    for call_id in crate::vision::strip_images_for_blind_model(history, model, seen) {
         let output = history
             .iter()
             .find(|i| i["type"] == "function_call_output" && i["call_id"] == call_id.as_str())
@@ -713,8 +722,17 @@ enum ImagesAfterError {
     Refused,
 }
 
+/// The request a provider error answered.
+struct Failed<'a> {
+    /// The model it went to; the live knob may have moved since.
+    model: &'a str,
+    /// Tool results whose pixels a model that sees images was sent before.
+    seen: &'a HashSet<String>,
+}
+
 /// Tell the model why the request failed (and whether its images were
 /// removed) and keep the loop going. Do not pause for the user.
+#[allow(clippy::too_many_arguments)]
 async fn recover_from_provider_error(
     cfg: &mut RunConfig,
     sink: &dyn EventSink,
@@ -723,6 +741,7 @@ async fn recover_from_provider_error(
     pending: &mut Vec<Value>,
     consecutive: &mut u32,
     last_text: &str,
+    failed: Failed<'_>,
     err: Error,
 ) -> Result<ImagesAfterError> {
     *consecutive += 1;
@@ -733,21 +752,21 @@ async fn recover_from_provider_error(
     // Pixels go when they may be the cause, or when a resend already failed
     // too; never for a repetition loop, which they have nothing to do with.
     let had_images = crate::vision::input_has_image(history) || crate::vision::input_has_image(pending);
-    let model = live_knobs(cfg).0;
+    let model = failed.model;
     let images = if !had_images || crate::repeat::is_loop(&err) {
         ImagesAfterError::Kept
-    } else if image_error(&err, &model) && crate::openai::refuses_images(&err.to_string(), &model) {
+    } else if image_error(&err, model) && crate::openai::refuses_images(&err.to_string(), model) {
         // Unverified here (no resend without the images), so the error
         // must name images, not only refuse content arrays.
         ImagesAfterError::Refused
-    } else if image_error(&err, &model) || *consecutive > 1 {
+    } else if image_error(&err, model) || *consecutive > 1 {
         ImagesAfterError::Removed
     } else {
         ImagesAfterError::Kept
     };
     if images == ImagesAfterError::Refused {
-        strip_for_blind_model(sink, cfg, run_id, history, &model);
-        crate::vision::strip_images_for_blind_model(pending, &model);
+        strip_for_blind_model(sink, cfg, run_id, history, model, failed.seen);
+        crate::vision::strip_images_for_blind_model(pending, model, failed.seen);
     } else if images != ImagesAfterError::Kept {
         crate::vision::strip_attached_images(history);
         crate::vision::strip_attached_images(pending);
@@ -836,7 +855,9 @@ async fn handle_loop(
     if *loop_trips > MAX_LOOP_RETRIES {
         *loop_trips = 0;
         // A repetition loop never touches the images.
-        return recover_from_provider_error(cfg, sink, run_id, history, pending, consecutive, last_text, trip.to_error())
+        let model = live_knobs(cfg).0;
+        let failed = Failed { model: &model, seen: &HashSet::new() };
+        return recover_from_provider_error(cfg, sink, run_id, history, pending, consecutive, last_text, failed, trip.to_error())
             .await
             .map(|_| ());
     }
@@ -1057,7 +1078,10 @@ pub async fn run<P: Provider + Clone + 'static>(
     let mut blind_noticed: Option<String> = None;
     // Models that refused image input this run, on routes whose provider
     // does not remember it (`Provider::sees_images`).
-    let mut blind: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut blind: HashSet<String> = HashSet::new();
+    // Tool results whose pixels went out in an answered request to a model
+    // that sees images: a later blind model does not take them back.
+    let mut seen_by_vision: HashSet<String> = HashSet::new();
 
     'run: loop {
         if seen_model {
@@ -1148,7 +1172,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         // A model that refused image input gets none again: images pasted
         // since give way to their paths before the request goes out.
         if blind.contains(&model) && crate::vision::input_has_image(&history) {
-            crate::vision::strip_images_for_blind_model(&mut history, &model);
+            crate::vision::strip_images_for_blind_model(&mut history, &model, &seen_by_vision);
             pending = history.clone();
             images_known = 0;
             image_turns = 0;
@@ -1541,6 +1565,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                     &mut pending,
                     &mut consecutive_provider_errors,
                     &last_text,
+                    Failed { model: &model, seen: &seen_by_vision },
                     e,
                 )
                 .await?;
@@ -1563,7 +1588,9 @@ pub async fn run<P: Provider + Clone + 'static>(
             tell_blind(sink, &cfg, &run_id, &model, &mut blind_noticed);
             // The provider sent none of these pixels: the results that
             // claimed them say so now, for the model and the picture rows.
-            strip_for_blind_model(sink, &cfg, &run_id, &mut history, &model);
+            strip_for_blind_model(sink, &cfg, &run_id, &mut history, &model, &seen_by_vision);
+        } else if has_image {
+            seen_by_vision.extend(crate::vision::image_call_ids(&history[..sent_len]));
         }
 
         last_usage = response.usage.clone();
@@ -2238,7 +2265,8 @@ mod agent_tests {
         let mut history = vec![image_turn(dir)];
         let mut pending = history.clone();
         let mut n = consecutive;
-        recover_from_provider_error(cfg, &rec, "r", &mut history, &mut pending, &mut n, "", err).await.unwrap();
+        let failed = Failed { model, seen: &HashSet::new() };
+        recover_from_provider_error(cfg, &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
         let note = history.last().unwrap()["content"].as_str().unwrap().to_string();
         (history, note)
     }
@@ -2353,6 +2381,110 @@ mod agent_tests {
             .filter(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("無法看圖")))
             .count();
         assert_eq!(told, 1, "the user hears it once");
+    }
+
+    /// Answers in order; after the second request the user picks
+    /// `text-model`, which cannot view images. xAI refuses its pixels; the
+    /// OpenAI route drops them and learns.
+    struct Switching {
+        calls: Mutex<Vec<CompleteRequest>>,
+        replies: Mutex<VecDeque<Result<CompleteResponse>>>,
+        knobs: Arc<Mutex<SessionKnobs>>,
+        refuses: bool,
+        learned: AtomicBool,
+    }
+
+    impl Provider for Switching {
+        async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+            let blind = req.model == "text-model" && crate::vision::input_has_image(&req.input);
+            let n = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(req);
+                calls.len()
+            };
+            if blind && self.refuses {
+                return Err(Error::Provider("xAI HTTP 400: Image inputs are not supported by this model.".into()));
+            }
+            if blind {
+                self.learned.store(true, Ordering::SeqCst);
+            }
+            if n == 2 {
+                self.knobs.lock().unwrap().model = "text-model".into();
+            }
+            self.replies.lock().unwrap().pop_front().unwrap_or_else(|| Err(Error::Provider("no scripted reply".into())))
+        }
+
+        async fn compact(&self, _req: CompactRequest) -> Result<CompactResponse> {
+            Err(Error::Provider("no compact".into()))
+        }
+
+        fn sees_images(&self, model: &str) -> bool {
+            model != "text-model" || !self.learned.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_blind_model_keeps_the_pictures_a_seeing_one_looked_at() {
+        for refuses in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            picture(dir.path(), "p.jpg");
+            let knobs = Arc::new(Mutex::new(SessionKnobs {
+                model: "vision-model".into(),
+                reasoning_effort: crate::provider::ReasoningEffort::High,
+                send_reasoning: true,
+                server_tools: vec![],
+                dispatcher: false,
+                child_model: String::new(),
+                search: false,
+            }));
+            let provider = Arc::new(Switching {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(VecDeque::from([
+                    calls(&[("c1", "read_image", r#"{"path":"p.jpg"}"#)]),
+                    now("c2"),
+                    now("c3"),
+                    text("fixed the CSS"),
+                ])),
+                knobs: knobs.clone(),
+                refuses,
+                learned: false.into(),
+            });
+            let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(dir.path().to_path_buf())), Box::new(NowTool)]);
+            let rec = Rec(Mutex::new(Vec::new()));
+            let mut c = config(dir.path(), "what is wrong here?");
+            c.knobs = Some(knobs);
+            run(&provider, &tools, &rec, c).await.unwrap();
+            let reqs = provider.calls.lock().unwrap();
+            assert_eq!(reqs[1].model, "vision-model");
+            assert!(crate::vision::input_has_image(&reqs[1].input), "the seeing model was sent the pixels");
+            let last = reqs.last().unwrap();
+            assert_eq!(last.model, "text-model");
+            assert!(!crate::vision::input_has_image(&last.input));
+            let out = output_of(last, "c1")["output"].as_str().unwrap();
+            assert!(out.contains(r#""attach_image":true"#) && !out.contains("no pixels were attached"), "refuses={refuses}: {out}");
+            assert!(out.contains("cannot view images") && !out.contains("read_image its path"), "refuses={refuses}: {out}");
+            let events = rec.0.lock().unwrap();
+            let reports = events.iter().filter(|e| matches!(e, AgentEvent::ToolFinished { call_id, .. } if call_id == "c1")).count();
+            assert_eq!(reports, 1, "refuses={refuses}: the picture row stays");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_model_the_request_went_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = &mut config(dir.path(), "go");
+        cfg.model = "picked-since".into();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let tool = crate::vision::function_call_output("c1", r#"{"path":"p.jpg","attach_image":true}"#, Some("data:image/jpeg;base64,AAAA"));
+        let mut history = vec![tool];
+        let mut pending = history.clone();
+        let mut n = 0;
+        let err = Error::Provider("xAI HTTP 400: Image inputs are not supported by this model.".into());
+        let failed = Failed { model: "text-model", seen: &HashSet::new() };
+        let images = recover_from_provider_error(cfg, &rec, "r", &mut history, &mut pending, &mut n, "", failed, err).await.unwrap();
+        assert_eq!(images, ImagesAfterError::Refused);
+        let out: Value = serde_json::from_str(history[0]["output"].as_str().unwrap()).unwrap();
+        assert!(out["attach_error"].as_str().unwrap().starts_with("text-model cannot view images"), "{out}");
     }
 
     /// A screenshot taken just as the user presses Esc.

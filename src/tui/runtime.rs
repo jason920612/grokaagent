@@ -135,6 +135,9 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
     let mut last_size = terminal.size().map_err(Error::Io)?;
 
     loop {
+        if cfg!(windows) {
+            burst.woke(Instant::now());
+        }
         while let Ok(ev) = ev_rx.try_recv() {
             app.route_event(ev);
             paint.content = true;
@@ -206,10 +209,11 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
                     batch.push(ev);
                 }
                 // crossterm reports no Event::Paste on Windows: pastes and drops arrive as keys.
-                if cfg!(windows) {
-                    batch = burst.coalesce(batch, Instant::now());
-                }
-                let batch = input::coalesce_ime_enter(batch);
+                let batch = if cfg!(windows) {
+                    burst.read(batch, Instant::now())
+                } else {
+                    input::coalesce_ime_enter(batch)
+                };
                 if batch.is_empty() {
                     continue;
                 }

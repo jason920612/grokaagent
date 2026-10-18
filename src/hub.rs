@@ -87,10 +87,11 @@ struct Mirror {
 }
 
 impl Mirror {
-    fn hello(&self) -> Option<String> {
+    fn hello(&self, media: &str) -> Option<String> {
         let snapshot = self.snapshot.clone()?;
         let msg = ServerMsg::Hello {
             seq: self.seq,
+            media: media.to_string(),
             snapshot,
             logs: self.logs.clone().unwrap_or_default(),
             views: self
@@ -180,6 +181,10 @@ pub enum ServerMsg {
     /// Full state: sent on connect and on a client's `resync`.
     Hello {
         seq: u64,
+        /// The `/media` token: a page whose key came from another tab after
+        /// its last `/auth` still loads images.
+        #[serde(default)]
+        media: String,
         snapshot: UiSnapshot,
         logs: UiLogs,
         views: Vec<UiView>,
@@ -647,7 +652,7 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
         .layer(middleware::from_fn(guard))
         .with_state(state);
     tokio::spawn(async move {
-        let _ = axum::serve(OwnUser(listener), app).await;
+        let _ = axum::serve(OwnUser::new(listener), app).await;
     });
     // The code sits in the browser's argv, which other local users can read
     // until the page spends it; on Linux their connections are refused.
@@ -775,7 +780,21 @@ fn workspace_of(st: &HubState) -> PathBuf {
 /// Accepts connections from this user's own processes only, where the OS
 /// says who opened them (Linux): another local user who reads the opened
 /// link from argv, or the key from a lost race, gets no further.
-struct OwnUser(TcpListener);
+struct OwnUser {
+    listener: TcpListener,
+    /// Connections whose owner is being looked up, off the runtime's workers:
+    /// the listing grows with every socket on the host.
+    checks: tokio::task::JoinSet<Option<(tokio::net::TcpStream, SocketAddr)>>,
+}
+
+/// Lookups in flight at once; a connect flood waits in the backlog instead.
+const OWNER_CHECKS: usize = 4;
+
+impl OwnUser {
+    fn new(listener: TcpListener) -> Self {
+        Self { listener, checks: tokio::task::JoinSet::new() }
+    }
+}
 
 impl axum::serve::Listener for OwnUser {
     type Io = tokio::net::TcpStream;
@@ -783,25 +802,32 @@ impl axum::serve::Listener for OwnUser {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (io, peer) = axum::serve::Listener::accept(&mut self.0).await;
-            if self.0.local_addr().is_ok_and(|local| same_user(peer, local)) {
-                return (io, peer);
+            tokio::select! {
+                (io, peer) = axum::serve::Listener::accept(&mut self.listener), if self.checks.len() < OWNER_CHECKS => {
+                    let Ok(local) = self.listener.local_addr() else { continue };
+                    self.checks.spawn_blocking(move || same_user(peer, local).then_some((io, peer)));
+                }
+                Some(done) = self.checks.join_next() => {
+                    if let Ok(Some(conn)) = done {
+                        return conn;
+                    }
+                }
             }
         }
     }
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.0.local_addr()
+        self.listener.local_addr()
     }
 }
 
 #[cfg(target_os = "linux")]
 fn same_user(peer: SocketAddr, local: SocketAddr) -> bool {
-    match std::fs::read_to_string("/proc/net/tcp") {
-        // SAFETY: geteuid has no preconditions.
-        Ok(table) => peer_allowed(&table, peer, local, unsafe { libc::geteuid() }),
-        Err(_) => true,
-    }
+    // A client on an AF_INET6 socket (`::ffff:127.0.0.1`) is listed in tcp6
+    // only; that table is read when tcp lacks the client.
+    let tables = ["/proc/net/tcp", "/proc/net/tcp6"].into_iter().filter_map(|p| std::fs::read_to_string(p).ok());
+    // SAFETY: geteuid has no preconditions.
+    peer_allowed(tables, peer, local, unsafe { libc::geteuid() })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -810,25 +836,36 @@ fn same_user(_peer: SocketAddr, _local: SocketAddr) -> bool {
 }
 
 /// The client end of a loopback connection, `peer` → `local`, is not
-/// another user's in a /proc/net/tcp listing. Root's is allowed (a WSL or
-/// container port relay; root can read our memory anyway), and so is one
-/// the listing lacks: it is outside this network namespace (WSL mirrored
-/// networking) or the listing has no sockets at all (WSL 1), and other
+/// another user's in the /proc/net/tcp and tcp6 listings. Root's is allowed
+/// (a WSL or container port relay; root can read our memory anyway), and so
+/// is one the listings lack: it is outside this network namespace (WSL
+/// mirrored networking) or they list no sockets at all (WSL 1), and other
 /// local users cannot reach this loopback from there.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn peer_allowed(table: &str, peer: SocketAddr, local: SocketAddr, me: u32) -> bool {
-    let hex = |a: SocketAddr| match a {
-        SocketAddr::V4(a) => Some(format!("{:08X}:{:04X}", u32::from_ne_bytes(a.ip().octets()), a.port())),
+fn peer_allowed(tables: impl IntoIterator<Item = String>, peer: SocketAddr, local: SocketAddr, me: u32) -> bool {
+    tables
+        .into_iter()
+        .find_map(|t| client_owner(&t, peer, local))
+        .is_none_or(|uid| uid == me || uid == 0)
+}
+
+/// Owner of the socket `from` → `to` in one listing. The hub sees an IPv4
+/// peer; tcp6 lists that client as `::ffff:a.b.c.d`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn client_owner(table: &str, from: SocketAddr, to: SocketAddr) -> Option<u32> {
+    let forms = |a: SocketAddr| match a {
+        SocketAddr::V4(a) => {
+            let ip = u32::from_ne_bytes(a.ip().octets());
+            let mapped = u32::from_ne_bytes([0, 0, 0xff, 0xff]);
+            Some([format!("{ip:08X}:{:04X}", a.port()), format!("{:016X}{mapped:08X}{ip:08X}:{:04X}", 0, a.port())])
+        }
         SocketAddr::V6(_) => None,
     };
-    let owner = |from: SocketAddr, to: SocketAddr| -> Option<u32> {
-        let (from, to) = (hex(from)?, hex(to)?);
-        table.lines().skip(1).find_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            (f.len() > 7 && f[1] == from && f[2] == to).then(|| f[7].parse().ok()).flatten()
-        })
-    };
-    owner(peer, local).is_none_or(|uid| uid == me || uid == 0)
+    let (from, to) = (forms(from)?, forms(to)?);
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() > 7 && from.iter().any(|a| a == f[1]) && to.iter().any(|a| a == f[2])).then(|| f[7].parse().ok()).flatten()
+    })
 }
 
 /// Every route: refuse foreign `Host` names; responses are never sniffed.
@@ -857,7 +894,7 @@ async fn redeem_code(State(st): State<HubState>, headers: HeaderMap, code: Strin
 }
 
 /// Whether the key still works. The page asks on load and after a socket
-/// drops; the answer also renews the cookie its `<img>` loads need.
+/// drops; the answer is the media token its `<img>` loads need.
 async fn auth(headers: HeaderMap, State(st): State<HubState>) -> Response {
     if !key_ok(&headers, &st) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -935,7 +972,7 @@ async fn ws_upgrade(
 }
 
 fn mirror_hello(st: &HubState) -> Option<String> {
-    st.mirror.lock().ok().and_then(|m| m.hello())
+    st.mirror.lock().ok().and_then(|m| m.hello(&st.media))
 }
 
 async fn client_loop(mut socket: WebSocket, st: HubState) {
@@ -1382,7 +1419,7 @@ mod tests {
         assert_eq!(d["removed"][0], "coder");
 
         let hello: serde_json::Value =
-            serde_json::from_str(&hub.handle.mirror.lock().unwrap().hello().unwrap()).unwrap();
+            serde_json::from_str(&hub.handle.mirror.lock().unwrap().hello("t").unwrap()).unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["seq"], 3);
         let views = hello["views"].as_array().unwrap();
@@ -1494,6 +1531,37 @@ mod web_tests {
         let head = String::from_utf8_lossy(&buf[..split]).to_string();
         let status = head[9..12].parse().unwrap();
         Reply { status, head, body: buf[split..].to_vec() }
+    }
+
+    /// The first text frame the hub sends after upgrading `head`.
+    async fn first_frame(port: u16, head: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut chunk))
+                .await
+                .expect("a frame in time")
+                .unwrap();
+            assert!(n > 0, "closed before a frame");
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else {
+                continue;
+            };
+            let f = &buf[at..];
+            // Server frames are unmasked: FIN|text, then a 7, 16 or 64-bit length.
+            let (len, from) = match f.get(1).map(|b| b & 0x7f) {
+                Some(126) if f.len() >= 4 => (u16::from_be_bytes([f[2], f[3]]) as usize, 4),
+                Some(127) if f.len() >= 10 => (u64::from_be_bytes(f[2..10].try_into().unwrap()) as usize, 10),
+                Some(n) if n < 126 => (n as usize, 2),
+                _ => continue,
+            };
+            if f.len() >= from + len {
+                assert_eq!(f[0], 0x81, "one text frame");
+                return String::from_utf8(f[from..from + len].to_vec()).unwrap();
+            }
+        }
     }
 
     async fn get(port: u16, path: &str, extra: &str) -> Reply {
@@ -1638,6 +1706,10 @@ mod web_tests {
         let r = send(port, &upgrade(&host, &ours, &keyed), b"").await;
         assert_eq!(r.status, 101);
         assert_eq!(r.header("sec-websocket-protocol").as_deref(), Some("groka"), "the key is not echoed");
+        // The key may have come from another tab after this one's `/auth`.
+        let hello: serde_json::Value = serde_json::from_str(&first_frame(port, &upgrade(&host, &ours, &keyed)).await).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["media"], token.as_str(), "a connected page can load images");
         let forwarded = upgrade("localhost:8080", "Origin: http://localhost:8080\r\n", &keyed);
         assert_eq!(send(port, &forwarded, b"").await.status, 101, "behind port forwarding");
     }
@@ -1803,13 +1875,28 @@ mod web_tests {
         };
         let head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
         let table = |client: u32| format!("{head}{}{}", row(0, 41873, 52000, 1000), row(1, 52000, 41873, client));
-        assert!(peer_allowed(&table(1000), peer, hub, 1000));
-        assert!(!peer_allowed(&table(1001), peer, hub, 1000), "another user's client");
-        assert!(peer_allowed(&table(0), peer, hub, 1000), "a port relay run by root");
+        let allowed = |tables: &[&str]| peer_allowed(tables.iter().map(|t| t.to_string()), peer, hub, 1000);
+        assert!(allowed(&[&table(1000)]));
+        assert!(!allowed(&[&table(1001)]), "another user's client");
+        assert!(allowed(&[&table(0)]), "a port relay run by root");
         // Another user's socket to some other port says nothing about ours.
         let other = format!("{head}{}{}", row(0, 41873, 52000, 1000), row(1, 52001, 41873, 1001));
-        assert!(peer_allowed(&other, peer, hub, 1000));
-        assert!(peer_allowed(head, peer, hub, 1000), "a table that lists no sockets cannot tell");
+        assert!(allowed(&[&other]));
+        assert!(allowed(&[head]), "a table that lists no sockets cannot tell");
+        assert!(allowed(&[]));
+
+        // An AF_INET6 client of the IPv4 hub (`::ffff:127.0.0.1`) is in tcp6 only.
+        let mapped = format!("{:016X}{:08X}{ip}", 0, u32::from_ne_bytes([0, 0, 0xff, 0xff]));
+        let row6 = |from: u16, to: u16, uid: u32| {
+            format!("   0: {mapped}:{from:04X} {mapped}:{to:04X} 01 00000000:00000000 00:00000000 00000000  {uid}        0 1 1 0 20 4 30 10 -1\n")
+        };
+        let only_hub = format!("{head}{}", row(0, 41873, 52000, 1000));
+        let tcp6 = |uid: u32| format!("{head}{}", row6(52000, 41873, uid));
+        assert!(!allowed(&[&only_hub, &tcp6(1001)]), "another user's dual-stack client");
+        assert!(allowed(&[&only_hub, &tcp6(1000)]));
+        if cfg!(target_endian = "little") {
+            assert!(tcp6(1001).contains("0000000000000000FFFF00000100007F:CB20"), "the kernel's word order");
+        }
     }
 
     #[test]
