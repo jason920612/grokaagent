@@ -1178,6 +1178,7 @@ mod tests {
             server_tools: vec![],
             dispatcher: false,
             child_model: "grok-3-mini".into(),
+            task_model: String::new(),
             search: false,
         }));
         let n = nursery(&dir, 0, Some(knobs.clone()));

@@ -960,6 +960,7 @@ impl App {
             ),
             dispatcher: opts.dispatcher,
             child_model: opts.child_model.clone(),
+            task_model: String::new(),
             search: opts.web_search,
         }));
         let current = boot.id().to_string();

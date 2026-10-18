@@ -200,6 +200,15 @@ pub enum AgentEvent {
         to: String,
         text: String,
     },
+    /// Task mode: the user proxy spoke to the worker (`intent`: plan, push,
+    /// checkpoint, answer, accept, hand_back, impossible) or the worker
+    /// reported to it (`intent`: report).
+    TaskProxy {
+        #[serde(flatten)]
+        meta: EventMeta,
+        intent: String,
+        text: String,
+    },
     /// Model posed a questionnaire; the TUI should collect a pick.
     AskUser {
         #[serde(flatten)]
@@ -239,6 +248,7 @@ impl AgentEvent {
             | Self::Notice { meta, .. }
             | Self::SessionNamed { meta, .. }
             | Self::AgentMessage { meta, .. }
+            | Self::TaskProxy { meta, .. }
             | Self::AskUser { meta, .. } => meta,
         }
     }
@@ -271,6 +281,7 @@ impl AgentEvent {
             | Self::Notice { meta, .. }
             | Self::SessionNamed { meta, .. }
             | Self::AgentMessage { meta, .. }
+            | Self::TaskProxy { meta, .. }
             | Self::AskUser { meta, .. } => meta,
         }
     }

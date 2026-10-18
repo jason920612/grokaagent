@@ -28,6 +28,8 @@ pub struct SessionKnobs {
     /// Default model for spawned child agents. Empty = follow [`Self::model`].
     /// A `model` argument on spawn_agent still wins.
     pub child_model: String,
+    /// Model for the task-mode user proxy. Empty = follow [`Self::model`].
+    pub task_model: String,
     /// The user's search toggle. [`Self::server_tools`] is what the live
     /// model gets; this is what new child agents inherit.
     pub search: bool,
@@ -2435,6 +2437,7 @@ mod agent_tests {
                 server_tools: vec![],
                 dispatcher: false,
                 child_model: String::new(),
+                task_model: String::new(),
                 search: false,
             }));
             let provider = Arc::new(Switching {
@@ -2665,6 +2668,7 @@ mod tests {
             server_tools: vec![],
             dispatcher: true,
             child_model: String::new(),
+            task_model: String::new(),
             search: false,
         })));
         let text = live_instructions(&c);

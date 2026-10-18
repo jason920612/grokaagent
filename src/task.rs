@@ -18,6 +18,7 @@ use crate::tools::{ClientTool, ToolCallFut, ToolSpec};
 pub const AGENT_NAME: &str = "任務系統";
 pub const KICK: &str = "[grokaagent task]";
 pub const MAX_GOAL: usize = 2000;
+pub const MAX_CRITERIA: usize = 2000;
 pub const MAX_ITEMS: usize = 20;
 const EXCERPT_CHARS: usize = 24_000;
 const NEXT_CHARS: usize = 1_200;
@@ -104,6 +105,30 @@ pub struct TaskState {
     pub skip_steer: bool,
     #[serde(default)]
     pub spawned: bool,
+    /// Optional acceptance criteria and preferences the user gave with the goal.
+    #[serde(default)]
+    pub criteria: String,
+    /// The user paused the proxy: the worker is not pushed until resumed.
+    #[serde(default)]
+    pub paused: bool,
+    /// The proxy's memory: what it said, what the worker answered, what the
+    /// user changed. Oldest first, kept short.
+    #[serde(default)]
+    pub proxy_log: Vec<ProxyTurn>,
+    /// Times the proxy has spoken to the worker in this task.
+    #[serde(default)]
+    pub rounds: u32,
+    /// The proxy's latest message to the worker, for the UI.
+    #[serde(default)]
+    pub last_proxy: String,
+}
+
+/// One line of the proxy's memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyTurn {
+    /// `proxy`, `worker`, `user` or `note`.
+    pub who: String,
+    pub text: String,
 }
 
 impl TaskState {
@@ -130,6 +155,7 @@ pub struct TaskHub {
     inner: Mutex<TaskState>,
     kick_pending: AtomicBool,
     kick: Notify,
+    review_now: AtomicBool,
 }
 
 impl TaskHub {
@@ -139,6 +165,7 @@ impl TaskHub {
             inner: Mutex::new(TaskState::default()),
             kick_pending: AtomicBool::new(false),
             kick: Notify::new(),
+            review_now: AtomicBool::new(false),
         })
     }
 
@@ -148,6 +175,7 @@ impl TaskHub {
             inner: Mutex::new(state),
             kick_pending: AtomicBool::new(false),
             kick: Notify::new(),
+            review_now: AtomicBool::new(false),
         })
     }
 
@@ -169,13 +197,78 @@ impl TaskHub {
     }
 
     pub fn start_goal(&self, goal: impl Into<String>) {
+        self.start_task(goal, "");
+    }
+
+    /// Start a task with optional acceptance criteria.
+    pub fn start_task(&self, goal: impl Into<String>, criteria: impl Into<String>) {
         let goal = clip(&goal.into(), MAX_GOAL);
+        let criteria = clip(criteria.into().trim(), MAX_CRITERIA);
         let mut g = self.lock();
         *g = TaskState {
             goal,
+            criteria,
             phase: TaskPhase::NeedPlan,
             ..TaskState::default()
         };
+        drop(g);
+        self.review_now.store(false, Ordering::SeqCst);
+        self.persist();
+        self.kick();
+    }
+
+    /// The user changed the goal or criteria mid-task. Progress notes stay;
+    /// the proxy is told what changed at its next look.
+    pub fn edit_task(&self, goal: impl Into<String>, criteria: impl Into<String>) {
+        let goal = clip(&goal.into(), MAX_GOAL);
+        let criteria = clip(criteria.into().trim(), MAX_CRITERIA);
+        let mut g = self.lock();
+        if !g.phase.is_live() && g.phase != TaskPhase::Done {
+            return;
+        }
+        g.proxy_log.push(ProxyTurn {
+            who: "user".into(),
+            text: format!("The user changed the task.\nGoal: {goal}\nCriteria: {}", if criteria.is_empty() { "(none)" } else { &criteria }),
+        });
+        g.goal = goal;
+        g.criteria = criteria;
+        if g.phase == TaskPhase::Done {
+            g.phase = TaskPhase::Active;
+        }
+        drop(g);
+        self.persist();
+        self.request_review();
+    }
+
+    /// Pause or resume the proxy. Resuming wakes an idle run.
+    pub fn set_paused(&self, paused: bool) {
+        self.lock().paused = paused;
+        self.persist();
+        if !paused {
+            self.kick();
+        }
+    }
+
+    /// The user asked the proxy to look now.
+    pub fn request_review(&self) {
+        self.review_now.store(true, Ordering::SeqCst);
+        self.kick();
+    }
+
+    /// Taken by the kernel when it runs a review; `true` once per request.
+    pub fn take_review_request(&self) -> bool {
+        self.review_now.swap(false, Ordering::SeqCst)
+    }
+
+    /// The user accepts the work as done, whatever the proxy thinks.
+    pub fn accept_done(&self) {
+        let mut g = self.lock();
+        if !g.phase.is_live() {
+            return;
+        }
+        g.phase = TaskPhase::Done;
+        g.review_note = "使用者判定完成".into();
+        g.proxy_log.push(ProxyTurn { who: "user".into(), text: "The user accepted the work as done.".into() });
         drop(g);
         self.persist();
         self.kick();
