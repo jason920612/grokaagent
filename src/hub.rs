@@ -8,17 +8,17 @@
 //! Access: the link the TUI opens and shows carries a one-time code. The
 //! page trades it for the hub's key and keeps that in localStorage, which is
 //! per origin: a cookie would also go to every other port on this host. The
-//! socket and uploads need the key; `/media` takes a cookie that `/auth` sets
-//! for the key, because an `<img>` cannot send one, and serves only images.
+//! socket and uploads need the key. An `<img>` cannot send it, so `/auth`
+//! trades it for a media token that `/media` URLs carry, which opens images
+//! only and, unlike a cookie, is never sent to another port.
 //! Spending a code mints the next one for the TUI to show; the saved
 //! transcript keeps only the bare origin. Every route checks `Host`, and
 //! requests that carry the key check `Origin`.
 //!
-//! Left open: the first link sits in the argv of the browser it opens, which
-//! other local users can read, until the page redeems it. One who polls for
-//! it can redeem it first; the page then says the link was already used.
-//! And the `/media` cookie also reaches `/media` on other local ports, so a
-//! server there could read workspace images, though nothing else.
+//! The first link sits in the argv of the browser it opens, which other
+//! local users can read until the page redeems it; on Linux the hub accepts
+//! connections only from processes of the user running it, so they cannot
+//! redeem it (macOS and Windows do not show argv across users).
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -35,8 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use image::codecs::jpeg::JpegEncoder;
-use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use image::{DynamicImage, ImageFormat, ImageReader};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -66,8 +65,7 @@ struct HubState {
     port: u16,
     /// What the page sends on the socket and uploads; never in a URL or cookie.
     key: String,
-    /// `/media` cookie value. Cookies reach every port of the host, so it
-    /// opens images and nothing else.
+    /// The `t` of `/media` URLs: images and nothing else.
     media: String,
     /// One-time code in the link the TUI shows.
     code: Arc<Mutex<String>>,
@@ -350,6 +348,9 @@ pub struct UiRow {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// A picture row's original file, when `path` is the copy the model saw.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -646,10 +647,10 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
         .layer(middleware::from_fn(guard))
         .with_state(state);
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(OwnUser(listener), app).await;
     });
-    // Other local users can read argv until the page spends the code (see the
-    // module doc); a page that loses that race says its link was used.
+    // The code sits in the browser's argv, which other local users can read
+    // until the page spends it; on Linux their connections are refused.
     if !env_flag("GROKA_NO_WEB_OPEN") {
         open_browser(&url);
     }
@@ -696,11 +697,6 @@ fn origin(port: u16) -> String {
 
 fn link(port: u16, code: &str) -> String {
     format!("http://127.0.0.1:{port}/?code={code}")
-}
-
-/// Per port, so two hubs do not overwrite each other's cookie.
-fn cookie_name(port: u16) -> String {
-    format!("groka_{port}")
 }
 
 /// Constant time, so response timing says nothing about a guess.
@@ -751,17 +747,6 @@ fn key_ok(headers: &HeaderMap, st: &HubState) -> bool {
         .is_some_and(|k| secret_eq(k, &st.key))
 }
 
-fn cookie_ok(headers: &HeaderMap, st: &HubState) -> bool {
-    let name = cookie_name(st.port);
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .any(|(k, v)| k == name && secret_eq(v, &st.media))
-}
-
 /// Requested by another site, or another port of this host (same-site).
 fn cross_site(headers: &HeaderMap) -> bool {
     matches!(
@@ -785,6 +770,65 @@ fn redeem(st: &HubState, code: &str) -> bool {
 
 fn workspace_of(st: &HubState) -> PathBuf {
     st.workspace.lock().ok().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Accepts connections from this user's own processes only, where the OS
+/// says who opened them (Linux): another local user who reads the opened
+/// link from argv, or the key from a lost race, gets no further.
+struct OwnUser(TcpListener);
+
+impl axum::serve::Listener for OwnUser {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (io, peer) = axum::serve::Listener::accept(&mut self.0).await;
+            if self.0.local_addr().is_ok_and(|local| same_user(peer, local)) {
+                return (io, peer);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn same_user(peer: SocketAddr, local: SocketAddr) -> bool {
+    match std::fs::read_to_string("/proc/net/tcp") {
+        // SAFETY: geteuid has no preconditions.
+        Ok(table) => peer_allowed(&table, peer, local, unsafe { libc::geteuid() }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn same_user(_peer: SocketAddr, _local: SocketAddr) -> bool {
+    true
+}
+
+/// The client end of a loopback connection, `peer` → `local`, is not
+/// another user's in a /proc/net/tcp listing. Root's is allowed (a WSL or
+/// container port relay; root can read our memory anyway), and so is one
+/// the listing lacks: it is outside this network namespace (WSL mirrored
+/// networking) or the listing has no sockets at all (WSL 1), and other
+/// local users cannot reach this loopback from there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn peer_allowed(table: &str, peer: SocketAddr, local: SocketAddr, me: u32) -> bool {
+    let hex = |a: SocketAddr| match a {
+        SocketAddr::V4(a) => Some(format!("{:08X}:{:04X}", u32::from_ne_bytes(a.ip().octets()), a.port())),
+        SocketAddr::V6(_) => None,
+    };
+    let owner = |from: SocketAddr, to: SocketAddr| -> Option<u32> {
+        let (from, to) = (hex(from)?, hex(to)?);
+        table.lines().skip(1).find_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            (f.len() > 7 && f[1] == from && f[2] == to).then(|| f[7].parse().ok()).flatten()
+        })
+    };
+    owner(peer, local).is_none_or(|uid| uid == me || uid == 0)
 }
 
 /// Every route: refuse foreign `Host` names; responses are never sniffed.
@@ -818,12 +862,7 @@ async fn auth(headers: HeaderMap, State(st): State<HubState>) -> Response {
     if !key_ok(&headers, &st) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let mut res = StatusCode::NO_CONTENT.into_response();
-    let cookie = format!("{}={}; Path=/media; HttpOnly; SameSite=Strict", cookie_name(st.port), st.media);
-    if let Ok(v) = HeaderValue::from_str(&cookie) {
-        res.headers_mut().insert(header::SET_COOKIE, v);
-    }
-    res
+    ([(header::CACHE_CONTROL, "no-store")], st.media.clone()).into_response()
 }
 
 async fn static_file(uri: Uri, headers: HeaderMap) -> Response {
@@ -958,7 +997,7 @@ async fn media(
     Query(q): Query<MediaQ>,
     State(st): State<HubState>,
 ) -> Response {
-    if !cookie_ok(&headers, &st) || cross_site(&headers) {
+    if !secret_eq(&q.t, &st.media) || cross_site(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let ws = workspace_of(&st);
@@ -990,6 +1029,9 @@ async fn media(
 struct MediaQ {
     #[serde(default)]
     path: String,
+    /// The media token from `/auth`.
+    #[serde(default)]
+    t: String,
     /// Longest edge wanted (thumbnails). An image that fits comes as is.
     max: Option<u32>,
 }
@@ -1174,19 +1216,18 @@ fn pending_full(st: &HubState, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Decode by content with EXIF orientation, as `vision::open_image` does
-/// for files, and save to the inbox. Transparency goes onto white.
+/// Decode by content as `vision::open_image` does for files (orientation,
+/// allocation cap) and save to the inbox, transparency on white.
 fn save_upload(workspace: &Path, bytes: &[u8]) -> Result<String> {
-    let unsupported = |_| Error::Tool("不是支援的圖片（PNG、JPEG、GIF、WebP、BMP）".into());
-    let mut dec = ImageReader::new(Cursor::new(bytes))
+    let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|_| Error::Tool("無法讀取圖片".into()))?
-        .into_decoder()
-        .map_err(unsupported)?;
-    let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(dec).map_err(|e| Error::Tool(format!("圖片無法解碼: {e}")))?;
-    img.apply_orientation(orientation);
-    vision::save_user_image(workspace, &vision::flatten_alpha(&img, [255, 255, 255]))
+        .map_err(|_| Error::Tool("無法讀取圖片".into()))?;
+    let img = vision::decode_capped(reader).map_err(|e| match e {
+        image::ImageError::Unsupported(_) => Error::Tool("不是支援的圖片（PNG、JPEG、GIF、WebP、BMP）".into()),
+        image::ImageError::Limits(_) => Error::Tool("圖片太大，無法解碼".into()),
+        e => Error::Tool(format!("圖片無法解碼: {e}")),
+    })?;
+    vision::save_user_image(workspace, &img)
 }
 
 fn open_browser(url: &str) {
@@ -1287,6 +1328,7 @@ mod tests {
             calls: vec![],
             path: None,
             label: None,
+            source: None,
         }
     }
 
@@ -1484,7 +1526,7 @@ mod web_tests {
     }
 
     /// Redeem the hub's current code as the page does: the key, then the
-    /// `/media` cookie that `/auth` hands out for it.
+    /// media token that `/auth` hands out for it.
     async fn access(hub: &mut Hub, port: u16) -> (String, String) {
         let r = post(port, "/redeem", &ours(port), code_of(&hub.url).as_bytes()).await;
         assert_eq!(r.status, 200);
@@ -1493,8 +1535,8 @@ mod web_tests {
             hub.url = url;
         }
         let r = get(port, "/auth", &format!("X-Groka-Key: {key}\r\n")).await;
-        let set = r.header("set-cookie").expect("a cookie");
-        (key, set.split(';').next().unwrap().to_string())
+        assert_eq!(r.status, 200);
+        (key, String::from_utf8(r.body).unwrap())
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -1538,11 +1580,11 @@ mod web_tests {
         assert_eq!(get(port, "/auth", "").await.status, 401);
         assert_eq!(get(port, "/auth", &format!("X-Groka-Key: {first}\r\n")).await.status, 401);
         let r = get(port, "/auth", &format!("X-Groka-Key: {key}\r\n")).await;
-        assert_eq!(r.status, 204);
-        let set = r.header("set-cookie").expect("the /media cookie");
-        assert!(set.starts_with(&format!("groka_{port}=")), "{set}");
-        assert!(set.contains("Path=/media") && set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
-        assert!(!set.contains(&key), "the cookie, which every port gets, is not the key");
+        assert_eq!(r.status, 200);
+        assert!(r.header("set-cookie").is_none(), "a cookie would reach every port of this host");
+        assert_eq!(r.header("cache-control").as_deref(), Some("no-store"));
+        let token = String::from_utf8(r.body).unwrap();
+        assert!(token.len() == 32 && token != key, "the media token is not the key");
     }
 
     #[tokio::test]
@@ -1577,7 +1619,7 @@ mod web_tests {
     async fn the_socket_needs_our_origin_and_the_key() {
         let (mut hub, port, _dir) = hub().await;
         hub.publish(UiSnapshot::default(), UiLogs::default(), vec![], vec![]);
-        let (key, cookie) = access(&mut hub, port).await;
+        let (key, token) = access(&mut hub, port).await;
         let upgrade = |host: &str, origin: &str, extra: &str| {
             format!(
                 "GET /ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
@@ -1591,8 +1633,8 @@ mod web_tests {
         assert_eq!(send(port, &upgrade(&host, evil, &keyed), b"").await.status, 403, "another port is another origin");
         assert_eq!(send(port, &upgrade(&host, "", &keyed), b"").await.status, 403);
         assert_eq!(send(port, &upgrade(&host, &ours, ""), b"").await.status, 401);
-        let jar = format!("Cookie: {cookie}\r\nSec-WebSocket-Protocol: groka\r\n");
-        assert_eq!(send(port, &upgrade(&host, &ours, &jar), b"").await.status, 401, "the cookie opens images only");
+        let media = format!("Sec-WebSocket-Protocol: groka, k.{token}\r\n");
+        assert_eq!(send(port, &upgrade(&host, &ours, &media), b"").await.status, 401, "the media token opens images only");
         let r = send(port, &upgrade(&host, &ours, &keyed), b"").await;
         assert_eq!(r.status, 101);
         assert_eq!(r.header("sec-websocket-protocol").as_deref(), Some("groka"), "the key is not echoed");
@@ -1601,13 +1643,16 @@ mod web_tests {
     }
 
     #[tokio::test]
-    async fn media_needs_the_cookie_revalidates_and_refuses_other_sites() {
+    async fn media_needs_the_token_revalidates_and_refuses_other_sites() {
         let (mut hub, port, dir) = hub().await;
-        let (_, cookie) = access(&mut hub, port).await;
+        let (key, token) = access(&mut hub, port).await;
         std::fs::write(dir.path().join("pic.png"), png(6, 4)).unwrap();
-        let path = "/media?path=pic.png";
-        assert_eq!(get(port, path, "").await.status, 401);
-        let with = format!("Cookie: {cookie}\r\n");
+        assert_eq!(get(port, "/media?path=pic.png", "").await.status, 401);
+        assert_eq!(get(port, "/media?path=pic.png", &format!("Cookie: groka_{port}={token}\r\n")).await.status, 401, "no cookie");
+        assert_eq!(get(port, &format!("/media?path=pic.png&t={key}"), "").await.status, 401);
+        let path = format!("/media?path=pic.png&t={token}");
+        let path = path.as_str();
+        let with = String::new();
         let r = get(port, path, &with).await;
         assert_eq!(r.status, 200);
         assert_eq!(r.body, png(6, 4));
@@ -1623,7 +1668,7 @@ mod web_tests {
         assert_eq!(r.status, 401, "a page on another local port");
         let r = get(port, path, &format!("{with}Sec-Fetch-Site: same-origin\r\n")).await;
         assert_eq!(r.status, 200);
-        assert_eq!(get(port, "/media?path=missing.png", &with).await.status, 404);
+        assert_eq!(get(port, &format!("/media?path=missing.png&t={token}"), &with).await.status, 404);
     }
 
     #[test]
@@ -1675,7 +1720,7 @@ mod web_tests {
     #[tokio::test]
     async fn an_upload_is_saved_and_handed_to_the_tui() {
         let (mut hub, port, dir) = hub().await;
-        let (key, cookie) = access(&mut hub, port).await;
+        let (key, token) = access(&mut hub, port).await;
         let upload = |extra: &str, body: &[u8]| {
             format!(
                 "POST /upload?session_id=s1&request_id=r1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
@@ -1688,8 +1733,8 @@ mod web_tests {
         let img = png(32, 32);
 
         assert_eq!(send(port, &upload(&keyed, &img), &img).await.status, 403, "no Origin");
-        let jar = format!("{}Cookie: {cookie}\r\n", self::ours(port));
-        assert_eq!(send(port, &upload(&jar, &img), &img).await.status, 401, "the cookie opens images only");
+        let media = format!("{}X-Groka-Key: {token}\r\n", self::ours(port));
+        assert_eq!(send(port, &upload(&media, &img), &img).await.status, 401, "the media token opens images only");
 
         let r = send(port, &upload(&ours, &img), &img).await;
         assert_eq!(r.status, 200);
@@ -1726,6 +1771,45 @@ mod web_tests {
         let r = send(port, &upload(&ours, &img), &img).await;
         assert_eq!(r.status, 409, "the session has all it may");
         assert!(String::from_utf8_lossy(&r.body).starts_with("未附上：最多"));
+    }
+
+    #[test]
+    fn an_upload_declaring_a_huge_image_is_refused_before_decoding() {
+        // A 30000x30000 24-bit BMP header (2.7 GB decoded) and no pixels.
+        let mut bmp = b"BM".to_vec();
+        for v in [54u32, 0, 54, 40, 30000, 30000] {
+            bmp.extend_from_slice(&v.to_le_bytes());
+        }
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&[0; 24]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_upload(dir.path(), &bmp).unwrap_err().to_string();
+        assert!(err.contains("圖片太大"), "{err}");
+        assert!(!dir.path().join(".groka/inbox").exists() || std::fs::read_dir(dir.path().join(".groka/inbox")).unwrap().all(|e| {
+            e.unwrap().file_name() == ".gitignore"
+        }));
+        let ok = save_upload(dir.path(), &png(8, 8)).unwrap();
+        assert!(dir.path().join(ok).is_file());
+    }
+
+    #[test]
+    fn only_this_users_connections_get_in() {
+        let hub: SocketAddr = "127.0.0.1:41873".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:52000".parse().unwrap();
+        let ip = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+        let row = |n: u32, from: u16, to: u16, uid: u32| {
+            format!("   {n}: {ip}:{from:04X} {ip}:{to:04X} 01 00000000:00000000 00:00000000 00000000  {uid}        0 1 1 0 20 4 30 10 -1\n")
+        };
+        let head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let table = |client: u32| format!("{head}{}{}", row(0, 41873, 52000, 1000), row(1, 52000, 41873, client));
+        assert!(peer_allowed(&table(1000), peer, hub, 1000));
+        assert!(!peer_allowed(&table(1001), peer, hub, 1000), "another user's client");
+        assert!(peer_allowed(&table(0), peer, hub, 1000), "a port relay run by root");
+        // Another user's socket to some other port says nothing about ours.
+        let other = format!("{head}{}{}", row(0, 41873, 52000, 1000), row(1, 52001, 41873, 1001));
+        assert!(peer_allowed(&other, peer, hub, 1000));
+        assert!(peer_allowed(head, peer, hub, 1000), "a table that lists no sockets cannot tell");
     }
 
     #[test]

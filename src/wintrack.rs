@@ -186,7 +186,7 @@ pub struct Before {
 
 /// A title without digits, spaces and counter punctuation: "(3) Inbox" turning
 /// into "(4) Inbox", or a clock ticking, is not something the launch opened.
-fn squash(title: &str) -> String {
+pub(crate) fn squash(title: &str) -> String {
     title
         .chars()
         .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"()[]*•·●:".contains(*c))
@@ -212,6 +212,11 @@ impl Before {
     }
 
     fn origin(&self, w: &WinMeta) -> Option<Origin> {
+        // No process reported (Tk on X11 sets no _NET_WM_PID): only a window
+        // id that was not there before tells what the launch opened.
+        if w.pid == 0 {
+            return (w.id != 0 && !self.titles.contains_key(&w.id)).then_some(Origin::NewWindow);
+        }
         let title = squash(&w.title);
         if !self.pids.contains(&w.pid) {
             return Some(Origin::NewProcess);
@@ -260,7 +265,7 @@ pub fn is_new_gui(w: &WinMeta, self_pids: &[u32]) -> bool {
     if w.title.trim().is_empty() {
         return false;
     }
-    if w.pid == 0 || self_pids.contains(&w.pid) {
+    if self_pids.contains(&w.pid) {
         return false;
     }
     !shot::is_host_ui(&w.app, &w.title)
@@ -313,7 +318,7 @@ pub fn label_appeared(name: &str, found: &Appeared) -> Vec<BoundWindow> {
             };
             // A browser the launch started (none was running) still becomes
             // the user's browser: only the bound window is the agent's.
-            let own_process = found.origin == Origin::NewProcess && !shot::looks_browser(&w.app);
+            let own_process = found.origin == Origin::NewProcess && !shot::looks_browser(&w.app) && w.pid != 0;
             let mut rec = BoundWindow::from_meta(label, w, own_process);
             rec.retitled = found.origin == Origin::Retitled;
             rec

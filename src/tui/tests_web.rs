@@ -167,3 +167,36 @@ fn the_web_link_is_shown_whole_or_not_at_all() {
     let settings = screen(&mut app, 64, 30);
     assert!(settings.iter().any(|row| row.contains(url)), "{settings:#?}");
 }
+
+#[test]
+fn a_read_image_row_carries_the_original_for_the_viewer() {
+    use super::model::rows::Row;
+    let row = Row::Picture { path: ".groka/seen/ab.jpg".into(), label: "模型在看  read_image  tall.png".into(), source: "tall.png".into() };
+    let ui = bridge::ui_row(&row);
+    assert_eq!((ui.path.as_deref(), ui.source.as_deref()), (Some(".groka/seen/ab.jpg"), Some("tall.png")));
+    let shot = Row::Picture { path: "s.jpg".into(), label: "l".into(), source: String::new() };
+    assert_eq!(bridge::ui_row(&shot).source, None);
+    let plain = Row::Picture { path: ".groka/seen/ab.jpg".into(), label: "模型在看  read_image  tall.png".into(), source: String::new() };
+    assert_ne!(bridge::row_hash(&row), bridge::row_hash(&plain));
+}
+
+#[test]
+fn a_standard_24_row_terminal_still_shows_the_web_link() {
+    let (mut app, _dir) = fixture();
+    let url = "http://127.0.0.1:41873/?code=0123456789abcdef";
+    app.web.url = Some(url.into());
+    app.cur_mut().chat.status = "待命".into();
+    app.opts.reasoning_effort = ReasoningEffort::Medium;
+    app.open_settings();
+    for openai in [false, true] {
+        app.settings.conn.kind = if openai { crate::config::ProviderKind::Openai } else { crate::config::ProviderKind::Xai };
+        for (w, h) in [(80, 24), (100, 24), (120, 24), (120, 26)] {
+            // As the TUI starts: the side bar shows where it has room.
+            app.ui.side_open = w >= crate::tui::theme::SIDEBAR_MIN_TERM;
+            let rows = screen(&mut app, w, h);
+            // Not counting the status bar.
+            let body = &rows[..rows.len() - 1];
+            assert!(body.iter().any(|row| row.contains(url)), "{w}x{h} openai={openai}: {rows:#?}");
+        }
+    }
+}

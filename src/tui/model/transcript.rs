@@ -158,7 +158,9 @@ impl Transcript {
 
     /// Finish a call: by id anywhere in the transcript, else the newest open
     /// call of that name (rows restored from before call ids existed).
-    pub fn tool_finished(&mut self, call_id: &str, name: &str, output: &str) {
+    /// Record a tool's result. A result reported again (no pixels went out
+    /// after all) replaces the first and returns it.
+    pub fn tool_finished(&mut self, call_id: &str, name: &str, output: &str) -> Option<String> {
         let by_id = (!call_id.is_empty())
             .then(|| {
                 self.rows.iter().rposition(|r| {
@@ -168,7 +170,7 @@ impl Transcript {
             .flatten();
         let group = by_id.or_else(|| self.rows.iter().rposition(|r| matches!(r, Row::Tools(_))));
         let Some(Row::Tools(g)) = group.and_then(|i| self.rows.get_mut(i)) else {
-            return;
+            return None;
         };
         let idx = (!call_id.is_empty())
             .then(|| g.calls.iter().rposition(|c| c.call_id == call_id))
@@ -176,13 +178,16 @@ impl Transcript {
             .or_else(|| g.calls.iter().rposition(|c| c.name == name && !c.done))
             .or_else(|| g.calls.iter().rposition(|c| !c.done))
             .or_else(|| g.calls.len().checked_sub(1));
-        if let Some(i) = idx {
-            let c = &mut g.calls[i];
-            c.done = true;
-            c.phase = tool_phase(name, output).into();
+        let i = idx?;
+        let c = &mut g.calls[i];
+        let again = c.done && !call_id.is_empty() && c.call_id == call_id;
+        c.done = true;
+        c.phase = tool_phase(name, output).into();
+        if !again {
             c.files.extend(parse_file_changes(output));
-            c.output = output.to_string();
         }
+        let before = std::mem::replace(&mut c.output, output.to_string());
+        again.then_some(before)
     }
 
     fn attach_file(&mut self, file: FileChange) {
@@ -348,11 +353,27 @@ impl Transcript {
                 output,
                 ..
             } => {
-                self.tool_finished(call_id, name, output);
-                if let Some((path, label)) = picture_from_tool(name, output) {
-                    self.push(Row::Picture { path, label });
+                match self.tool_finished(call_id, name, output) {
+                    None => {
+                        if let Some((path, label, source)) = picture_from_tool(name, output) {
+                            self.push(Row::Picture { path, label, source });
+                        }
+                        self.activity = "思考中".into();
+                    }
+                    // Reported again: the pixels it claimed never went out.
+                    Some(before) => {
+                        if let (Some((p, l, _)), None) = (picture_from_tool(name, &before), picture_from_tool(name, output)) {
+                            let shown = self
+                                .rows
+                                .iter()
+                                .rposition(|r| matches!(r, Row::Picture { path, label, .. } if *path == p && *label == l));
+                            if let Some(i) = shown {
+                                self.rows.remove(i);
+                                self.epoch += 1;
+                            }
+                        }
+                    }
                 }
-                self.activity = "思考中".into();
             }
             AgentEvent::ServerToolObserved { kind, payload, .. } => {
                 self.streaming = false;
@@ -609,6 +630,26 @@ mod tests {
         );
         assert_eq!(t.file_changes(), vec![(0, 0, "a.rs".to_string(), "create".to_string())]);
         assert!(matches!(t.rows.last(), Some(Row::Picture { path, .. }) if path == "p.png"));
+    }
+
+    #[test]
+    fn a_result_reported_again_without_pixels_takes_back_its_picture() {
+        let mut t = Transcript::default();
+        t.tool_started("i", "read_image", &json!({"path": "p.png"}));
+        let done = |output: &str| AgentEvent::ToolFinished {
+            meta: meta(),
+            call_id: "i".into(),
+            name: "read_image".into(),
+            output: output.into(),
+        };
+        t.apply(&done(r#"{"attach_image":true,"path":"p.png"}"#), false);
+        assert!(matches!(t.rows.last(), Some(Row::Picture { .. })));
+        t.push(Row::meta("模型 m 無法看圖"));
+        t.apply(&done(r#"{"attach_image":false,"attach_error":"m cannot view images","path":"p.png"}"#), false);
+        assert!(!t.rows.iter().any(|r| matches!(r, Row::Picture { .. })), "{:?}", t.rows.len());
+        let Row::Tools(g) = &t.rows[0] else { panic!() };
+        assert!(g.calls[0].output.contains("attach_error"));
+        assert_eq!(t.rows.len(), 2);
     }
 
     #[test]

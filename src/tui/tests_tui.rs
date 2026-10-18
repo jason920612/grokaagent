@@ -151,7 +151,7 @@ fn a_picture_followed_by_a_reply_scrolls_into_view() {
     let mut fx = fixture(Some(ProtocolType::Sixel));
     let app = &mut fx.app;
     save(app, "shot.png", 1280, 720, [0, 120, 0]);
-    app.cur_mut().chat.push(Row::Picture { path: "shot.png".into(), label: "screenshot".into() });
+    app.cur_mut().chat.push(Row::Picture { path: "shot.png".into(), label: "screenshot".into(), source: String::new() });
     for i in 0..6 {
         app.cur_mut().chat.push(Row::meta(format!("reply {i}")));
     }
@@ -180,7 +180,7 @@ fn a_rewritten_file_shows_its_new_pixels() {
     // Picture rows have no CJK caption, whose hidden second cells keep stale
     // symbols in the test backend.
     let read = |app: &mut App| {
-        app.cur_mut().chat.push(Row::Picture { path: "plot.png".into(), label: "read_image plot.png".into() });
+        app.cur_mut().chat.push(Row::Picture { path: "plot.png".into(), label: "read_image plot.png".into(), source: String::new() });
     };
     save(app, "plot.png", 40, 20, [255, 0, 0]);
     read(app);

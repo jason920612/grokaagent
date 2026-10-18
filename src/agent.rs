@@ -488,6 +488,32 @@ fn without_image(output: &str, why: &str) -> String {
     }
 }
 
+/// Drop every image in `history` for `model`, which cannot view them, and
+/// re-report the tool results that had claimed attached pixels, so their
+/// picture rows stop saying the model looked.
+fn strip_for_blind_model(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, history: &mut [Value], model: &str) {
+    for call_id in crate::vision::strip_images_for_blind_model(history, model) {
+        let output = history
+            .iter()
+            .find(|i| i["type"] == "function_call_output" && i["call_id"] == call_id.as_str())
+            .and_then(|i| i["output"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = history
+            .iter()
+            .find(|i| i["type"] == "function_call" && i["call_id"] == call_id.as_str())
+            .and_then(|i| i["name"].as_str())
+            .unwrap_or("")
+            .to_string();
+        sink.emit(&AgentEvent::ToolFinished {
+            meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+            call_id,
+            name,
+            output,
+        });
+    }
+}
+
 /// Tell the user, once per model, that the model cannot see the images
 /// it is sent.
 fn tell_blind(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, model: &str, told: &mut Option<String>) {
@@ -707,18 +733,22 @@ async fn recover_from_provider_error(
     // Pixels go when they may be the cause, or when a resend already failed
     // too; never for a repetition loop, which they have nothing to do with.
     let had_images = crate::vision::input_has_image(history) || crate::vision::input_has_image(pending);
+    let model = live_knobs(cfg).0;
     let images = if !had_images || crate::repeat::is_loop(&err) {
         ImagesAfterError::Kept
-    } else if image_error(&err) && crate::openai::refuses_images(&err.to_string()) {
+    } else if image_error(&err, &model) && crate::openai::refuses_images(&err.to_string(), &model) {
         // Unverified here (no resend without the images), so the error
         // must name images, not only refuse content arrays.
         ImagesAfterError::Refused
-    } else if image_error(&err) || *consecutive > 1 {
+    } else if image_error(&err, &model) || *consecutive > 1 {
         ImagesAfterError::Removed
     } else {
         ImagesAfterError::Kept
     };
-    if images != ImagesAfterError::Kept {
+    if images == ImagesAfterError::Refused {
+        strip_for_blind_model(sink, cfg, run_id, history, &model);
+        crate::vision::strip_images_for_blind_model(pending, &model);
+    } else if images != ImagesAfterError::Kept {
         crate::vision::strip_attached_images(history);
         crate::vision::strip_attached_images(pending);
     }
@@ -777,10 +807,13 @@ async fn recover_from_provider_error(
 }
 
 /// A provider error that may be about the attached images themselves, or
-/// about the size they add to the request.
-fn image_error(err: &Error) -> bool {
-    let s = err.to_string().to_ascii_lowercase();
-    ["image", "vision", "multimodal", "mmproj", "http 413"].iter().any(|k| s.contains(k))
+/// about the size they add to the request. Only the error's message counts,
+/// without `model`'s name ("llama3.2-vision does not support tools").
+fn image_error(err: &Error, model: &str) -> bool {
+    let text = err.to_string();
+    let words = crate::openai::error_words(&text, model);
+    ["image", "vision", "multimodal", "mmproj"].iter().any(|k| words.contains(k))
+        || text.to_ascii_lowercase().contains("http 413")
         || compact::context_overflow(err)
 }
 
@@ -1115,7 +1148,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         // A model that refused image input gets none again: images pasted
         // since give way to their paths before the request goes out.
         if blind.contains(&model) && crate::vision::input_has_image(&history) {
-            crate::vision::strip_attached_images(&mut history);
+            crate::vision::strip_images_for_blind_model(&mut history, &model);
             pending = history.clone();
             images_known = 0;
             image_turns = 0;
@@ -1528,6 +1561,9 @@ pub async fn run<P: Provider + Clone + 'static>(
         loop_trips = 0;
         if has_image && !provider.sees_images(&model) {
             tell_blind(sink, &cfg, &run_id, &model, &mut blind_noticed);
+            // The provider sent none of these pixels: the results that
+            // claimed them say so now, for the model and the picture rows.
+            strip_for_blind_model(sink, &cfg, &run_id, &mut history, &model);
         }
 
         last_usage = response.usage.clone();
@@ -1871,7 +1907,10 @@ mod agent_tests {
     struct Script {
         calls: Mutex<Vec<CompleteRequest>>,
         replies: Mutex<VecDeque<Result<CompleteResponse>>>,
-        blind: bool,
+        blind: std::sync::atomic::AtomicBool,
+        /// A request carrying pixels makes it blind, as the OpenAI route
+        /// learns when it resends one without them.
+        learns: bool,
         refuse: Option<&'static str>,
         after_fold: Mutex<Option<(mpsc::UnboundedSender<UserTurn>, UserTurn)>>,
     }
@@ -1881,7 +1920,8 @@ mod agent_tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 replies: Mutex::new(replies.into()),
-                blind: false,
+                blind: false.into(),
+                learns: false,
                 refuse: None,
                 after_fold: Mutex::new(None),
             }
@@ -1901,6 +1941,9 @@ mod agent_tests {
                 });
             }
             let refused = self.refuse.filter(|_| crate::vision::input_has_image(&req.input));
+            if self.learns && crate::vision::input_has_image(&req.input) {
+                self.blind.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.calls.lock().unwrap().push(req);
             if let Some(body) = refused {
                 return Err(Error::Provider(format!("xAI HTTP 400: {body}")));
@@ -1917,7 +1960,7 @@ mod agent_tests {
         }
 
         fn sees_images(&self, _model: &str) -> bool {
-            !self.blind
+            !self.blind.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2034,8 +2077,8 @@ mod agent_tests {
         let dir = tempfile::tempdir().unwrap();
         picture(dir.path(), "p.jpg");
         picture(dir.path(), "u.jpg");
-        let mut script = Script::new(vec![calls(&[("c1", "read_image", r#"{"path":"p.jpg"}"#)]), text("I cannot see it")]);
-        script.blind = true;
+        let script = Script::new(vec![calls(&[("c1", "read_image", r#"{"path":"p.jpg"}"#)]), text("I cannot see it")]);
+        script.blind.store(true, std::sync::atomic::Ordering::SeqCst);
         let provider = Arc::new(script);
         let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(dir.path().to_path_buf()))]);
         let rec = Rec(Mutex::new(Vec::new()));
@@ -2053,6 +2096,39 @@ mod agent_tests {
             .filter(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("無法看圖")))
             .count();
         assert_eq!(told, 1, "the user hears it once");
+    }
+
+    #[tokio::test]
+    async fn the_image_that_reveals_a_blind_model_stops_claiming_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        picture(dir.path(), "p.jpg");
+        let mut script = Script::new(vec![
+            calls(&[("c1", "read_image", r#"{"path":"p.jpg"}"#)]),
+            now("c2"),
+            text("worked from the path"),
+        ]);
+        script.learns = true;
+        let provider = Arc::new(script);
+        let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(dir.path().to_path_buf())), Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        run(&provider, &tools, &rec, config(dir.path(), "what is wrong here?")).await.unwrap();
+        let reqs = provider.calls.lock().unwrap();
+        assert!(crate::vision::input_has_image(&reqs[1].input), "attached before the provider learned");
+        let later = output_of(&reqs[2], "c1")["output"].as_str().expect("no pixels: plain text").to_string();
+        let later: Value = serde_json::from_str(&later).unwrap();
+        assert_eq!(later["attach_image"], false, "{later}");
+        assert!(later["attach_error"].as_str().unwrap().contains("cannot view images"), "{later}");
+        let events = rec.0.lock().unwrap();
+        let last = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolFinished { call_id, output, .. } if call_id == "c1" => Some(output.clone()),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        let last: Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(last["attach_image"], false, "the picture row is taken back: {last}");
     }
 
     #[tokio::test]
@@ -2152,7 +2228,12 @@ mod agent_tests {
     }
 
     async fn recover(dir: &std::path::Path, err: Error, consecutive: u32) -> (Vec<Value>, String) {
+        recover_as(dir, "grok-4.6", err, consecutive).await
+    }
+
+    async fn recover_as(dir: &std::path::Path, model: &str, err: Error, consecutive: u32) -> (Vec<Value>, String) {
         let cfg = &mut config(dir, "go");
+        cfg.model = model.into();
         let rec = Rec(Mutex::new(Vec::new()));
         let mut history = vec![image_turn(dir)];
         let mut pending = history.clone();
@@ -2200,6 +2281,17 @@ mod agent_tests {
         // missing vision here: nothing confirms it.
         let (history, note) = recover(dir.path(), Error::Provider("HTTP 400: effort must be a string".into()), 0).await;
         assert!(crate::vision::input_has_image(&history), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_vision_model_id_in_an_error_is_not_about_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = || Error::Provider(r#"HTTP 400: {"error":{"message":"registry.ollama.ai/library/llama3.2-vision:latest does not support tools","type":"api_error"}}"#.into());
+        let (history, note) = recover_as(dir.path(), "llama3.2-vision", err(), 0).await;
+        assert!(crate::vision::input_has_image(&history), "{note}");
+        assert!(!note.contains("cannot view images"), "{note}");
+        let (_, note) = recover_as(dir.path(), "llama3.2-vision", err(), 1).await;
+        assert!(!note.contains("cannot view images"), "a second failure is not a refusal either: {note}");
     }
 
     #[tokio::test]
@@ -2252,6 +2344,9 @@ mod agent_tests {
         assert!(!crate::vision::input_has_image(&reqs[2].input));
         let pasted = reqs[2].input.last().unwrap()["content"].as_str().unwrap();
         assert!(pasted.contains("and this one") && pasted.contains("(image file: u.jpg)"), "{pasted}");
+        // Nothing left in the request sends the model back to read_image.
+        let first = reqs[1].input[0]["content"].as_str().unwrap();
+        assert!(!first.contains("read_image") && !pasted.contains("read_image"), "{first}\n{pasted}");
         let events = rec.0.lock().unwrap();
         let told = events
             .iter()

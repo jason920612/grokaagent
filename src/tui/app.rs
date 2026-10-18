@@ -1158,8 +1158,12 @@ impl App {
         if from == to || self.cur().pending.is_empty() {
             return 0;
         }
-        let _ = crate::vision::groka_dir(to, "inbox");
         let pending = std::mem::take(&mut self.cur_mut().pending);
+        // A .groka that is a symlink would carry them out of the folder:
+        // they stay behind in the old inbox.
+        if crate::vision::groka_dir(to, "inbox").is_err() {
+            return pending.len();
+        }
         let total = pending.len();
         let kept: Vec<String> = pending
             .into_iter()

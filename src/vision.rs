@@ -123,8 +123,25 @@ pub fn retain_recent_images(items: &mut [Value], keep: usize) {
         return;
     }
     for i in idxs.iter().take(idxs.len() - keep).copied() {
-        strip_one_item_images(&mut items[i]);
+        strip_one_item_images(&mut items[i], None);
     }
+}
+
+/// Drop every attached image for `model`, which cannot view any: tool
+/// results say no pixels were attached, user turns keep their paths, and
+/// neither invites read_image again. Returns the call ids of the tool
+/// results rewritten.
+pub fn strip_images_for_blind_model(items: &mut [Value], model: &str) -> Vec<String> {
+    let mut rewritten = Vec::new();
+    for item in items.iter_mut().filter(|item| value_has_image(item)) {
+        strip_one_item_images(item, Some(model));
+        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                rewritten.push(id.to_string());
+            }
+        }
+    }
+    rewritten
 }
 
 /// [`retain_recent_images`], but the image items in `items[seen..]` are
@@ -145,7 +162,8 @@ pub fn prune_attached_images(items: &mut [Value], turns_seen: u32) {
     }
 }
 
-fn strip_one_item_images(item: &mut Value) {
+/// `blind`: the model the pixels were for cannot view images at all.
+fn strip_one_item_images(item: &mut Value, blind: Option<&str>) {
     if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
         let Some(arr) = item.get("output").and_then(Value::as_array).cloned() else {
             return;
@@ -161,26 +179,42 @@ fn strip_one_item_images(item: &mut Value) {
             .find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
             .and_then(|p| p.get("text").and_then(Value::as_str))
             .unwrap_or("");
-        let note = detached_note(1);
+        if let (Some(model), Ok(Value::Object(mut o))) = (blind, serde_json::from_str::<Value>(text)) {
+            o.insert("attach_image".into(), json!(false));
+            o.insert(
+                "attach_error".into(),
+                json!(format!("{model} cannot view images, so no pixels were attached. Do not guess what the image shows.")),
+            );
+            item["output"] = Value::String(Value::Object(o).to_string());
+            return;
+        }
+        let note = detached_note(1, blind.is_some());
         item["output"] = Value::String(if text.is_empty() { note } else { format!("{text}\n{note}") });
         return;
     }
     if item.get("role").and_then(Value::as_str) == Some("user") {
-        strip_user_content_images(item);
+        strip_user_content_images(item, blind.is_some());
     }
 }
 
 /// Left where stripped pixels were, so the model knows it no longer has
 /// them and how to look again (tool results and user turns name the path).
-fn detached_note(n: usize) -> String {
-    if n == 1 {
+/// A model that cannot view images is not sent back to read_image.
+fn detached_note(n: usize, blind: bool) -> String {
+    if blind {
+        if n == 1 {
+            "(image not shown: this model cannot view images; use its path for file operations)".into()
+        } else {
+            format!("({n} images not shown: this model cannot view images; use their paths for file operations)")
+        }
+    } else if n == 1 {
         "(image no longer attached; read_image its path to view it again)".into()
     } else {
         format!("({n} images no longer attached; read_image their paths to view them again)")
     }
 }
 
-fn strip_user_content_images(item: &mut Value) {
+fn strip_user_content_images(item: &mut Value, blind: bool) {
     let Some(arr) = item.get("content").and_then(Value::as_array).cloned() else {
         return;
     };
@@ -197,7 +231,7 @@ fn strip_user_content_images(item: &mut Value) {
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
-    let note = detached_note(n);
+    let note = detached_note(n, blind);
     if text.trim().is_empty() {
         text = note;
     } else {
@@ -275,9 +309,28 @@ mod agent_tests {
         let mut items = vec![shot("c1")];
         strip_attached_images(&mut items);
         let once = items[0]["output"].as_str().unwrap().to_string();
-        assert_eq!(once, format!("{{\"path\":\"c1.jpg\"}}\n{}", detached_note(1)));
+        assert_eq!(once, format!("{{\"path\":\"c1.jpg\"}}\n{}", detached_note(1, false)));
         strip_attached_images(&mut items);
         assert_eq!(items[0]["output"], once.as_str());
+    }
+
+    #[test]
+    fn a_blind_model_is_not_sent_back_to_read_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = from_rgba(32, 32, vec![0, 0, 255, 255].repeat(32 * 32)).unwrap();
+        save_jpeg(&dir.path().join(".groka/inbox/u.jpg"), &img).unwrap();
+        let tool = function_call_output("c1", r#"{"path":"c1.jpg","attach_image":true}"#, Some("data:image/jpeg;base64,AAAA"));
+        let mut items = vec![user_message("fix this", &[PathBuf::from(".groka/inbox/u.jpg")], dir.path()), tool];
+        let rewritten = strip_images_for_blind_model(&mut items, "text-model");
+        assert_eq!(rewritten, ["c1"]);
+        assert_eq!(image_item_count(&items), 0);
+        let user = items[0]["content"].as_str().unwrap();
+        assert!(user.contains("(image file: .groka/inbox/u.jpg)") && user.contains("cannot view images"), "{user}");
+        assert!(!user.contains("read_image"), "{user}");
+        let out: Value = serde_json::from_str(items[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(out["attach_image"], false);
+        assert!(out["attach_error"].as_str().unwrap().starts_with("text-model cannot view images"), "{out}");
+        assert!(!out.to_string().contains("read_image"), "{out}");
     }
 
     #[test]
@@ -313,17 +366,22 @@ pub(crate) fn is_image_ext(path: &Path) -> bool {
 /// Decode an image by its content, not its extension, and apply its EXIF
 /// orientation so phone photos come out upright.
 pub fn open_image(path: &Path) -> Result<DynamicImage> {
-    let mut dec = ImageReader::open(path)
+    let reader = ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
-        .map_err(|e| Error::Tool(format!("open image: {e}")))?
-        .into_decoder()
         .map_err(|e| Error::Tool(format!("open image: {e}")))?;
-    // `from_decoder` skips the allocation cap `image::open` applies (512 MiB).
-    image::Limits::default()
-        .reserve(dec.total_bytes())
-        .map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    decode_capped(reader).map_err(|e| Error::Tool(format!("open image: {e}")))
+}
+
+/// Decode with EXIF orientation applied, refusing images whose pixels would
+/// take more than the allocation cap `image::open` applies (512 MiB):
+/// `from_decoder` skips it, and a small file can declare a huge image.
+pub fn decode_capped<R: std::io::BufRead + std::io::Seek>(
+    reader: ImageReader<R>,
+) -> std::result::Result<DynamicImage, image::ImageError> {
+    let mut dec = reader.into_decoder()?;
+    image::Limits::default().reserve(dec.total_bytes())?;
     let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(dec).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    let mut img = DynamicImage::from_decoder(dec)?;
     img.apply_orientation(orientation);
     Ok(img)
 }

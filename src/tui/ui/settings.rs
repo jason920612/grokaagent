@@ -81,7 +81,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
     let mut y = area.y + 1;
     let mut caret = None;
     let mut drop_anchor = None;
-    let bottom = area.bottom();
+    // The web link keeps the last row however short the terminal: the
+    // status bar points here when it has no room for it.
+    let link_row = app.web.url.as_ref().map(|_| area.bottom().saturating_sub(1)).filter(|r| *r > area.y);
+    let bottom = link_row.unwrap_or(area.bottom());
 
     line(f, Rect::new(x, y, w, 1), "設定  · Tab 下一欄 · Enter/空白 切換或開啟 · Esc 關閉分頁", Style::default().fg(DIM));
     y += 2;
@@ -237,12 +240,11 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         let foc = focused && field == Field::Skills;
         line(f, Rect::new(x, y, w, 1), "技能（空白鍵 開/關 · Enter 查看）", focus_style(foc));
         y += 1;
-        let list = Rect::new(x, y, w, bottom.saturating_sub(y + 1));
+        let list = Rect::new(x, y, w, bottom.saturating_sub(y + u16::from(link_row.is_none())));
         skills(f, app, list, foc);
-        y = bottom.saturating_sub(1);
     }
-    if y < bottom {
-        web_link(f, app, Rect::new(x, bottom - 1, w, 1));
+    if let Some(r) = link_row {
+        web_link(f, app, Rect::new(x, r, w, 1));
     }
 
     if let (Some(kind), Some(anchor)) = (app.settings.drop, drop_anchor) {

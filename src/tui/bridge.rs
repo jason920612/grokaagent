@@ -271,6 +271,7 @@ fn blank(kind: &str) -> hub::UiRow {
         calls: Vec::new(),
         path: None,
         label: None,
+        source: None,
     }
 }
 
@@ -325,11 +326,12 @@ pub(crate) fn ui_row(row: &Row) -> hub::UiRow {
         },
         Row::Meta(s) => hub::UiRow { html: hub::text_html(s), text: s.clone(), ..blank("meta") },
         Row::Err(s) => hub::UiRow { html: hub::text_html(s), text: s.clone(), ..blank("err") },
-        Row::Picture { path, label } => hub::UiRow {
+        Row::Picture { path, label, source } => hub::UiRow {
             html: hub::text_html(label),
             text: label.clone(),
             path: Some(path.clone()),
             label: Some(label.clone()),
+            source: Some(source.clone()).filter(|s| !s.is_empty()),
             ..blank("picture")
         },
     }
@@ -354,7 +356,7 @@ pub(crate) fn row_hash(row: &Row) -> u64 {
         Row::Think(t) => (3u8, &t.text, t.expanded, t.done, if t.done { t.elapsed_ms } else { 0 }).hash(&mut h),
         Row::Meta(s) => (4u8, s).hash(&mut h),
         Row::Err(s) => (5u8, s).hash(&mut h),
-        Row::Picture { path, label } => (6u8, path, label).hash(&mut h),
+        Row::Picture { path, label, source } => (6u8, path, label, source).hash(&mut h),
     }
     h.finish()
 }

@@ -209,8 +209,7 @@ impl AnswerReader {
 #[cfg(unix)]
 fn query_terminal(is_tmux: bool) -> Option<Answer> {
     use ratatui_image::picker::cap_parser::QueryStdioOptions;
-    use std::time::{Duration, Instant};
-    const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+    use std::time::Duration;
     // SAFETY: isatty only inspects the descriptor.
     if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
         return None;
@@ -218,7 +217,17 @@ fn query_terminal(is_tmux: bool) -> Option<Answer> {
     let query = Parser::query(is_tmux, QueryStdioOptions { text_sizing_protocol: false });
     let mut out = io::stdout();
     out.write_all(query.as_bytes()).and_then(|_| out.flush()).ok()?;
-    let deadline = Instant::now() + QUERY_TIMEOUT;
+    read_answer(libc::STDIN_FILENO, Duration::from_secs(1), Duration::from_millis(300))
+}
+
+/// Read the reply on `fd` for `timeout`, then `grace` more and as long as
+/// bytes keep coming (up to twice that): a late reply is read to its end, or
+/// what is left of it would reach the key reader as typing ("Gi=31;OK").
+#[cfg(unix)]
+fn read_answer(fd: libc::c_int, timeout: std::time::Duration, grace: std::time::Duration) -> Option<Answer> {
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut deadline = start + timeout + grace;
     let mut reader = AnswerReader::default();
     let mut buf = [0u8; 256];
     loop {
@@ -226,9 +235,9 @@ fn query_terminal(is_tmux: bool) -> Option<Answer> {
         if left.is_zero() {
             return None;
         }
-        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis().clamp(1, 1000) as libc::c_int) };
+        let ready = unsafe { libc::poll(&mut pfd, 1, left.as_millis().clamp(1, 1000) as libc::c_int) };
         if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return None;
         }
@@ -236,7 +245,7 @@ fn query_terminal(is_tmux: bool) -> Option<Answer> {
             continue;
         }
         // SAFETY: reads at most buf.len() bytes into buf.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         }
@@ -246,6 +255,7 @@ fn query_terminal(is_tmux: bool) -> Option<Answer> {
         if let Some(answer) = reader.feed(&buf[..n as usize]) {
             return Some(answer);
         }
+        deadline = deadline.max((Instant::now() + grace).min(start + (timeout + grace) * 2));
     }
 }
 
@@ -976,6 +986,46 @@ mod tui_tests {
         assert_eq!(r.feed(b), Some(Answer { kitty: true, sixel: true, cell: Some((8, 16)) }));
         let mut r = AnswerReader::default();
         assert_eq!(r.feed(b"\x1b[?62;22c\x1b[0n"), Some(Answer::default()), "answered: no graphics");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_reply_is_read_to_its_end() {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::time::Duration;
+        let pipe = |reply: &'static [&'static [u8]], gap: Duration| {
+            let mut fds = [0; 2];
+            // SAFETY: two valid out slots.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: freshly opened descriptors, each owned once.
+            let (rx, mut tx) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+            let writer = std::thread::spawn(move || {
+                for part in reply {
+                    std::thread::sleep(gap);
+                    tx.write_all(part).unwrap();
+                }
+                tx
+            });
+            (rx, writer)
+        };
+        let ms = Duration::from_millis;
+        let reply: &[&[u8]] = &[b"\x1b_Gi=31;OK\x1b\\\x1b[?62;4;22c", b"\x1b[6;16;8t\x1b[0n"];
+        // Past the timeout, within the grace, and its second half later still.
+        let (rx, writer) = pipe(reply, ms(330));
+        let got = read_answer(rx.as_raw_fd(), ms(50), ms(500));
+        assert_eq!(got, Some(Answer { kitty: true, sixel: true, cell: Some((8, 16)) }));
+        let tx = writer.join().unwrap();
+        drop(tx);
+        let mut left = Vec::new();
+        std::io::Read::read_to_end(&mut &rx, &mut left).unwrap();
+        assert!(left.is_empty(), "nothing left for the key reader: {left:?}");
+        // No reply at all: given up after the timeout and the grace.
+        let (rx, writer) = pipe(&[b""], ms(300));
+        let t0 = std::time::Instant::now();
+        assert_eq!(read_answer(rx.as_raw_fd(), ms(100), ms(100)), None);
+        assert!(t0.elapsed() < ms(500));
+        drop(writer.join());
     }
 
     #[test]

@@ -220,7 +220,7 @@ impl Provider for OpenAiCompatProvider {
                         continue;
                     }
                 }
-                if !dropped && refuses_images(&text) && payload_has_images(&payload) {
+                if !dropped && refuses_images(&text, model) && payload_has_images(&payload) {
                     drop_images(&mut payload, model);
                     dropped = true;
                     continue;
@@ -272,7 +272,7 @@ impl Provider for OpenAiCompatProvider {
                 break resp;
             }
             let text = resp.text().await?;
-            if !dropped && refuses_images(&text) && payload_has_images(&payload) {
+            if !dropped && refuses_images(&text, model) && payload_has_images(&payload) {
                 drop_images(&mut payload, model);
                 dropped = true;
                 continue;
@@ -656,8 +656,11 @@ fn drop_images(payload: &mut Value, model: &str) {
 /// model, a llama.cpp server without its vision projector), as opposed to
 /// a failure unrelated to images. Only acted on when the request carried
 /// images, and only remembered once the same request without them succeeds.
-pub(crate) fn refuses_images(body: &str) -> bool {
-    let s = body.to_ascii_lowercase();
+/// Judges the error's message alone, without `model`'s own name: bodies
+/// echo model ids (`llama3.2-vision`) and model output (Groq's
+/// `failed_generation`) that say nothing about image support.
+pub(crate) fn refuses_images(body: &str, model: &str) -> bool {
+    let s = error_words(body, model);
     // One bad, oversized or filtered image is not a model without vision
     // (OpenAI: "You uploaded an unsupported image. Please make sure…").
     let bad_image = ["unsupported image", "invalid image", "too large", "safety", "content policy"]
@@ -666,17 +669,89 @@ pub(crate) fn refuses_images(body: &str) -> bool {
     if bad_image {
         return false;
     }
-    let about = ["image", "vision", "multimodal", "mmproj"].iter().any(|k| s.contains(k));
+    let about = ["image", "vision", "multimodal", "mmproj"];
     let refused = [
         "not support", "unsupported", "unknown variant", "only supported", "not a multimodal",
         "text-only", "text only", "does not accept", "not enabled", "mmproj",
         // OpenRouter: "No endpoints found that support image input".
         "support image input",
-    ]
-    .iter()
-    .any(|k| s.contains(k));
+    ];
     // Endpoints that take no content arrays at all say so without naming images.
-    (about && refused) || s.contains("must be a string")
+    near(&s, &about, &refused, 40) || s.contains("must be a string")
+}
+
+/// The lowercased message of a provider error, from a raw body or the
+/// agent's "HTTP 400: {…}" text (whose JSON may be cut short), with
+/// `model`'s name taken out.
+pub(crate) fn error_words(text: &str, model: &str) -> String {
+    let mut s = error_message(text).to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    let base = model.rsplit('/').next().unwrap_or("");
+    let mut names = vec![model.as_str(), base, base.split(':').next().unwrap_or("")];
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for name in names.into_iter().filter(|n| n.len() > 2) {
+        s = s.replace(name, " ");
+    }
+    s
+}
+
+fn error_message(text: &str) -> String {
+    let Some(at) = text.find('{') else {
+        return text.to_string();
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(&text[at..]) {
+        return message_of(&v).unwrap_or_else(|| text.to_string());
+    }
+    // Cut short: the first "message" string still holds what was said.
+    let rest = &text[at..];
+    let Some(key) = rest.find("\"message\"") else {
+        return text.to_string();
+    };
+    let after = rest[key + 9..].trim_start();
+    let Some(value) = after.strip_prefix(':').map(str::trim_start) else {
+        return text.to_string();
+    };
+    serde_json::Deserializer::from_str(value)
+        .into_iter::<String>()
+        .next()
+        .and_then(|r| r.ok())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn message_of(v: &Value) -> Option<String> {
+    let e = v.get("error").filter(|e| !e.is_null()).unwrap_or(v);
+    let mut msg = match e {
+        Value::String(s) => Some(s.clone()),
+        _ => ["message", "detail"]
+            .iter()
+            .find_map(|k| e.get(*k).and_then(Value::as_str))
+            .or_else(|| v.get("message").and_then(Value::as_str))
+            .map(str::to_string),
+    }?;
+    for k in ["code", "type"] {
+        if let Some(c) = e.get(k).and_then(Value::as_str) {
+            msg.push_str(&format!(" ({c})"));
+        }
+    }
+    // OpenRouter passes the upstream provider's own error along here.
+    if let Some(raw) = e.pointer("/metadata/raw").and_then(Value::as_str) {
+        msg.push_str(&format!(" {}", error_message(raw)));
+    }
+    Some(msg)
+}
+
+/// Some word of `a` within `gap` bytes of some word of `b` (in either order).
+fn near(s: &str, a: &[&str], b: &[&str], gap: usize) -> bool {
+    let spans = |words: &[&str]| -> Vec<(usize, usize)> {
+        words
+            .iter()
+            .flat_map(|w| s.match_indices(*w).map(|(i, m)| (i, i + m.len())))
+            .collect()
+    };
+    let (xs, ys) = (spans(a), spans(b));
+    xs.iter().any(|&(x0, x1)| {
+        ys.iter().any(|&(y0, y1)| y0 <= x1 + gap && x0 <= y1 + gap)
+    })
 }
 
 #[cfg(test)]
@@ -738,7 +813,7 @@ mod agent_tests {
             r#"{"error":{"message":"messages.1.content must be a string"}}"#,
             r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
         ] {
-            assert!(refuses_images(body), "{body}");
+            assert!(refuses_images(body, ""), "{body}");
         }
         for body in [
             r#"{"error":{"message":"Rate limit reached"}}"#,
@@ -748,7 +823,30 @@ mod agent_tests {
             r#"{"error":{"message":"Image too large: not supported above 20 MB"}}"#,
             r#"{"error":{"message":"Your request was rejected by our safety system: this image is not supported"}}"#,
         ] {
-            assert!(!refuses_images(body), "{body}");
+            assert!(!refuses_images(body, ""), "{body}");
+        }
+    }
+
+    #[test]
+    fn echoed_model_ids_and_model_output_are_not_refusals() {
+        // Groq repeats the model's own failed tool call; Ollama names the
+        // model, whose id says "vision".
+        let groq = r#"{"error":{"message":"Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.","type":"invalid_request_error","code":"tool_use_failed","failed_generation":"In the image the Save button is greyed out (not enabled), so"}}"#;
+        assert!(!refuses_images(groq, "meta-llama/llama-4-scout-17b-16e-instruct"));
+        assert!(!refuses_images(&format!("HTTP 400: {}", &groq[..235]), "meta-llama/llama-4-scout-17b-16e-instruct"), "cut short");
+        let ollama = r#"{"error":{"message":"registry.ollama.ai/library/llama3.2-vision:latest does not support tools","type":"api_error"}}"#;
+        assert!(!refuses_images(ollama, "llama3.2-vision"));
+        assert!(!refuses_images(ollama, "llama3.2-vision:latest"));
+        assert!(!refuses_images("HTTP 400: model grok-2-vision: tool_choice not supported", "grok-2-vision"));
+        // Words far apart in one message are not one refusal.
+        assert!(!refuses_images(r#"{"error":{"message":"Tool calling is not supported in streaming mode for this deployment. Remove tools, then retry with the same image"}}"#, "m"));
+        for (body, model) in [
+            (r#"{"error":{"message":"This model does not support image input."}}"#, "text-model"),
+            ("HTTP 400: {\"error\":{\"message\":\"Model does not support images. Please use a model that does.\"", "qwen3-8b"),
+            (r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"image input is not supported\"}}"}}}"#, "x/y"),
+            ("xAI HTTP 400: Image inputs are not supported by this model.", "grok-3-mini"),
+        ] {
+            assert!(refuses_images(body, model), "{body}");
         }
     }
 

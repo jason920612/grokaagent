@@ -110,9 +110,9 @@
     }, 8000);
   }
 
-  // Authenticated by the cookie /auth sets; `max` asks for a scaled copy.
+  // Authenticated by the media token from /auth; `max` asks for a scaled copy.
   function mediaUrl(path, max) {
-    return `/media?path=${encodeURIComponent(path)}${max ? `&max=${max}` : ""}`;
+    return `/media?path=${encodeURIComponent(path)}${max ? `&max=${max}` : ""}&t=${encodeURIComponent(mediaToken)}`;
   }
 
   function baseName(path) {
@@ -153,7 +153,7 @@
     // Reading details is local to this browser, independent of the terminal.
     const local = {
       open_tool: () => ({ tool_panel: { view: obj.view || "", group: obj.group, item: obj.item } }),
-      open_image: () => ({ image_view: obj.path }),
+      open_image: () => ({ image_view: obj.path, image_source: obj.source || "" }),
       open_monitor: () => ({ inspector: { kind: "monitor", name: obj.name } }),
       open_agent_info: () => ({ agent_info: obj.path }),
       edit_queue: () => ({ queue_editor: { index: obj.index, original: snap.queue[obj.index].text,
@@ -573,7 +573,7 @@
     const pics = row.path ? [row.path] : (row.images || []);
     if (pics.length) {
       const box = el("div", "pics");
-      pics.forEach((p) => box.append(chatPic(p, row.label)));
+      pics.forEach((p) => box.append(chatPic(p, row.label, row.source)));
       (node.querySelector(".bubble") || node).append(box);
     }
     return node;
@@ -592,12 +592,13 @@
     return img;
   }
 
-  // A button, so the keyboard can open the viewer too.
-  function chatPic(path, label) {
+  // A button, so the keyboard can open the viewer too. `source`: the file
+  // the model was shown a copy of; the viewer opens it at full size.
+  function chatPic(path, label, source) {
     const b = el("button", "pic");
     b.type = "button";
     b.title = label || path;
-    b.setAttribute("aria-label", `開啟圖片 ${baseName(path)}`);
+    b.setAttribute("aria-label", `開啟圖片 ${baseName(source || path)}`);
     // Its height is unknown until it loads; pin the view again if it was at the bottom.
     const img = picImg(path, () => {
       if (!b.querySelector("img")) b.disabled = true;
@@ -606,7 +607,7 @@
     img.loading = "lazy";
     img.src = mediaUrl(path, THUMB);
     b.append(img);
-    b.addEventListener("click", () => send({ type: "open_image", path }));
+    b.addEventListener("click", () => send({ type: "open_image", path, source }));
     return b;
   }
 
@@ -911,7 +912,7 @@
       o.rename && o.rename.id,
       o.task && { ...o.task, draft: undefined },
       o.ask && { ...o.ask, options: o.ask.options.map(x => ({ ...x, value: undefined })) },
-      o.picker, o.inspector && [o.inspector, logs.rail.monitors], o.image_view,
+      o.picker, o.inspector && [o.inspector, logs.rail.monitors], o.image_view, o.image_source,
       o.skill_view, o.queue_editor && { ...o.queue_editor, text: undefined },
       o.tool_panel && [o.tool_panel, toolCall(o.tool_panel)],
       o.agent_info && agentOf(o.agent_info)]);
@@ -1008,10 +1009,14 @@
       ]);
     } else if (top === "image_view") {
       modal.className = "modal lightbox";
-      const name = baseName(o.image_view);
+      // The original file at full size; the copy the model saw when the
+      // original is gone.
+      const seen = o.image_view;
+      const full = o.image_source || seen;
+      const name = baseName(full);
       const head = el("div", "lightbox-head");
       const original = el("a", "", "開啟原圖");
-      original.href = mediaUrl(o.image_view);
+      original.href = mediaUrl(full);
       original.target = "_blank";
       original.rel = "noopener";
       head.append(h2(name), original);
@@ -1022,10 +1027,19 @@
       img.alt = name;
       img.title = "點一下切換實際大小";
       img.addEventListener("click", () => modal.classList.toggle("actual"));
+      let fellBack = full === seen;
       img.addEventListener("error", () => {
+        if (!fellBack) {
+          fellBack = true;
+          original.textContent = "開啟模型看到的版本";
+          original.href = mediaUrl(seen);
+          frame.before(el("p", "hint", "原圖已不在，顯示模型看到的版本"));
+          img.src = mediaUrl(seen);
+          return;
+        }
         frame.replaceChildren(el("p", "hint", "圖片無法顯示：檔案可能已刪除，或不是支援的圖片格式"));
       });
-      img.src = mediaUrl(o.image_view);
+      img.src = mediaUrl(full);
       frame.append(img);
       modal.append(head, frame);
       addBtns(modal, [["實際大小", () => modal.classList.toggle("actual")], ["關閉", () => send({ type: "close_image" })]]);
@@ -1255,16 +1269,22 @@
     wrap.append(inp);
     return wrap;
   }
-  // The browser never gets the key: typing replaces it, and what this tab
-  // typed survives the form being rebuilt by the next snapshot.
+  // The browser never gets the key. Typing only edits this tab's draft,
+  // which survives the form being rebuilt by the next snapshot; Enter or
+  // leaving the field replaces the key, and only 清除金鑰 clears it.
   function apiKeyField(isSet) {
-    const wrap = textField("API 金鑰", "api_key", apiKeyDraft ?? "", (v) => {
-      apiKeyDraft = v;
-      send({ type: "set_api_key", text: v });
-    }, true);
+    const wrap = textField("API 金鑰", "api_key", apiKeyDraft ?? "", (v) => { apiKeyDraft = v; }, true);
     const inp = wrap.querySelector("input");
-    inp.placeholder = isSet ? "已設定 · 輸入新的金鑰即取代" : "未設定";
+    inp.placeholder = isSet ? "已設定 · 輸入新的金鑰後按 Enter 取代" : "未設定";
     inp.autocomplete = "off";
+    const commit = () => {
+      const v = inp.value.trim();
+      if (v && send({ type: "set_api_key", text: v })) apiKeyDraft = null;
+    };
+    inp.addEventListener("change", commit);
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); commit(); }
+    });
     if (isSet && !apiKeyDraft) {
       const clear = el("button", "", "清除金鑰");
       clear.type = "button";
@@ -1416,11 +1436,12 @@
   // —— Access ——
   // The hub's key lives in localStorage, which is per origin: a cookie
   // would also go to every other port on this host. The socket and uploads
-  // send it; /auth turns it into the cookie that <img> loads from /media need.
+  // send it; /auth trades it for the media token that /media URLs carry.
   const KEY_SLOT = "groka.key";
   const KEY_HEADER = "X-Groka-Key";
   const LINK_HINT = "用 TUI 狀態列或設定分頁顯示的網址（每個網址只能用一次）";
   let accessKey = "";
+  let mediaToken = "";
   let linkUsed = false;     // this tab's link had been spent before it got here
   let denied = false;       // the hub said the key does not work
 
@@ -1454,6 +1475,7 @@
   async function checkAccess() {
     try {
       const r = await fetch("/auth", { cache: "no-store", headers: { [KEY_HEADER]: currentKey() } });
+      if (r.ok) mediaToken = await r.text();
       denied = r.status === 401;
       if (denied && !connected) connectionState(false, deniedText());
     } catch {}
@@ -1482,7 +1504,7 @@
       setTimeout(connect, 1500);
     };
   }
-  // The cookie for /media is set before the first rows ask for images.
+  // The media token is in hand before the first rows ask for images.
   redeem().then(checkAccess).then(connect);
 
   // —— Theme: auto (follow the system) → dark → light ——

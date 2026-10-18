@@ -182,6 +182,17 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
         if app.images.redraw_due() {
             paint.content = true;
         }
+        if cfg!(windows) {
+            // A typed line's Enter, held for a paste that did not go on.
+            let late = burst.expired(Instant::now());
+            if !late.is_empty() {
+                paint.all();
+                app.web.composer_seq = app.web.composer_seq.saturating_add(1);
+                if late.into_iter().any(|ev| input::handle(&mut app, ev)) {
+                    break;
+                }
+            }
+        }
         paint.frame(terminal, &mut app)?;
         if cfg!(windows) {
             burst.waiting(Instant::now());

@@ -171,6 +171,27 @@ fn a_blank_chat_moving_to_another_folder_takes_its_attachments() {
     assert_eq!(std::fs::read_to_string(ws.join(".groka/.gitignore")).unwrap().trim(), "*");
 }
 
+#[cfg(unix)]
+#[test]
+fn attachments_never_move_through_a_symlinked_groka() {
+    let mut fx = fixture();
+    let shot = picture(&fx, "shot.png");
+    let target = fx.dir.path().join("cloned");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, target.join(".groka")).unwrap();
+    let app = &mut fx.app;
+    let old = app.workspace();
+    app.paste_text(&shot.display().to_string());
+    let rel = app.cur().pending[0].clone();
+    app.create_chat(target.clone());
+    assert!(app.cur().pending.is_empty());
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "nothing written through the link");
+    assert!(old.join(&rel).is_file(), "left in the old inbox");
+    assert!(app.cur().chat.status.contains("1 張附件無法搬移"), "{}", app.cur().chat.status);
+}
+
 #[test]
 fn four_attachments_all_get_a_chip_on_an_80_column_terminal() {
     let mut fx = fixture();
