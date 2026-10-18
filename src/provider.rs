@@ -192,6 +192,13 @@ pub trait Provider: Send + Sync {
         &self,
         req: CompactRequest,
     ) -> impl std::future::Future<Output = Result<CompactResponse>> + Send;
+
+    /// False once `model` (empty: the provider's own) has refused image
+    /// input in this process. Its images then go out as a text note, so
+    /// tool results should not claim attached pixels.
+    fn sees_images(&self, _model: &str) -> bool {
+        true
+    }
 }
 
 /// A shared provider is a provider, so one can be handed to a background
@@ -219,6 +226,10 @@ impl<T: Provider> Provider for std::sync::Arc<T> {
         req: CompactRequest,
     ) -> impl std::future::Future<Output = Result<CompactResponse>> + Send {
         (**self).compact(req)
+    }
+
+    fn sees_images(&self, model: &str) -> bool {
+        (**self).sees_images(model)
     }
 }
 
@@ -597,6 +608,20 @@ impl Provider for AnyProvider {
                     xai.compact(req).await
                 } else {
                     openai.compact(req).await
+                }
+            }
+        }
+    }
+
+    fn sees_images(&self, model: &str) -> bool {
+        match self {
+            Self::Xai(p) => p.sees_images(model),
+            Self::Openai(p) => p.sees_images(model),
+            Self::Both { xai, openai } => {
+                if self.grok_request(model) {
+                    xai.sees_images(model)
+                } else {
+                    openai.sees_images(model)
                 }
             }
         }
