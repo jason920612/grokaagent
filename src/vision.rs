@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use image::{imageops::FilterType, DynamicImage, RgbaImage};
+use image::metadata::Orientation;
+use image::{imageops::FilterType, DynamicImage, ImageDecoder, ImageReader, RgbImage, RgbaImage};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -207,14 +208,74 @@ pub fn user_message(text: &str, images: &[PathBuf], workspace: &Path) -> Value {
     }
 }
 
+/// Extensions of the formats the enabled `image` decoders can read.
 pub(crate) fn is_image_ext(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase())
             .as_deref(),
-        Some("jpg" | "jpeg" | "png")
+        Some("jpg" | "jpeg" | "jfif" | "png" | "gif" | "webp" | "bmp")
     )
+}
+
+/// Decode an image by its content, not its extension, and apply its EXIF
+/// orientation so phone photos come out upright.
+pub fn open_image(path: &Path) -> Result<DynamicImage> {
+    let mut dec = ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| Error::Tool(format!("open image: {e}")))?
+        .into_decoder()
+        .map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(dec).map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
+/// Width and height as `open_image` would return them, read from the header only.
+pub fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let mut dec = ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| Error::Tool(format!("open image: {e}")))?
+        .into_decoder()
+        .map_err(|e| Error::Tool(format!("open image: {e}")))?;
+    let (w, h) = dec.dimensions();
+    let swapped = matches!(
+        dec.orientation().unwrap_or(Orientation::NoTransforms),
+        Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH
+    );
+    Ok(if swapped { (h, w) } else { (w, h) })
+}
+
+/// Composite transparent pixels onto `bg`. Dropping alpha instead would turn
+/// them into whatever RGB they store, usually black.
+pub fn flatten_alpha(img: &DynamicImage, bg: [u8; 3]) -> DynamicImage {
+    if !img.color().has_alpha() {
+        return img.clone();
+    }
+    let rgba = img.to_rgba8();
+    let mut out = RgbImage::new(rgba.width(), rgba.height());
+    for (o, p) in out.pixels_mut().zip(rgba.pixels()) {
+        let a = p[3] as u32;
+        for c in 0..3 {
+            o[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
+        }
+    }
+    DynamicImage::ImageRgb8(out)
+}
+
+/// `<workspace>/.groka/<sub>`, created on demand. `.groka/` gets a `*`
+/// .gitignore so screenshots and pasted images never land in a commit.
+pub fn groka_dir(workspace: &Path, sub: &str) -> Result<PathBuf> {
+    let root = workspace.join(".groka");
+    let dir = root.join(sub);
+    std::fs::create_dir_all(&dir)?;
+    let ignore = root.join(".gitignore");
+    if !ignore.exists() {
+        let _ = std::fs::write(&ignore, "*\n");
+    }
+    Ok(dir)
 }
 
 pub fn parse_image_drop(text: &str) -> Vec<PathBuf> {
@@ -568,5 +629,32 @@ mod tests {
         let rel = ingest_image_file(ws.path(), &src).unwrap();
         assert!(rel.starts_with(".groka/inbox/"), "{rel}");
         assert!(ws.path().join(&rel).is_file());
+    }
+
+    #[test]
+    fn open_image_decodes_by_content_not_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("a.jpg");
+        save_jpeg(&jpg, &vision_ok_square()).unwrap();
+        let misnamed = dir.path().join("a.png");
+        std::fs::copy(&jpg, &misnamed).unwrap();
+        assert_eq!(open_image(&misnamed).unwrap().width(), 32);
+        assert_eq!(image_dimensions(&misnamed).unwrap(), (32, 32));
+    }
+
+    #[test]
+    fn flatten_alpha_composites_onto_the_background() {
+        let clear = from_rgba(2, 1, vec![0, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let flat = flatten_alpha(&clear, [255, 255, 255]).to_rgb8();
+        assert_eq!(flat.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(flat.get_pixel(1, 0).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn groka_dir_writes_a_gitignore() {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = groka_dir(ws.path(), "shots").unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_to_string(ws.path().join(".groka/.gitignore")).unwrap().trim(), "*");
     }
 }

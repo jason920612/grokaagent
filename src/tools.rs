@@ -1124,13 +1124,7 @@ fn clip_head_tail(s: &str, head: usize, tail: usize, full_at: Option<&str>) -> S
 /// Save the full output under `.groka/output/` (git-ignored) so the model
 /// can grep it. Returns the workspace-relative path.
 fn save_full_output(workspace: &Path, command: &str, stdout: &str, stderr: &str) -> Option<String> {
-    let dir = workspace.join(".groka");
-    let out = dir.join("output");
-    fs::create_dir_all(&out).ok()?;
-    let ignore = dir.join(".gitignore");
-    if !ignore.exists() {
-        let _ = fs::write(&ignore, "*\n");
-    }
+    let out = crate::vision::groka_dir(workspace, "output").ok()?;
     let name = format!("cmd-{}.log", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
     let body = format!("$ {command}\n\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
     fs::write(out.join(&name), body).ok()?;
