@@ -21,11 +21,11 @@ use crate::folderpick::{self, FolderView};
 use crate::preview::{Graphic, GraphicBlit, Placement};
 use crate::session::{self, SessionMeta, SessionStore};
 use crate::skills::SkillStore;
-use crate::task::{self, TaskHub, TaskPhase};
+use crate::task::{self, TaskHub, TaskPhase, TaskState};
 
 use super::edit::{clipboard_get, clipboard_set, clipboard_set_image, Edit};
 use super::model::agents::{AgentTree, EventKind, SavedAgent};
-use super::model::rows::Row;
+use super::model::rows::{self, Row};
 use super::model::session::{intro_rows, user_row, ChatSel, Queued, Session};
 use super::settings::Settings;
 use super::TuiOptions;
@@ -182,9 +182,10 @@ pub(crate) enum Hit {
     AskConfirm,
     AskCancel,
     TaskDraft,
+    TaskCriteria,
     TaskConfirm,
     TaskCancel,
-    TaskEnd,
+    TaskAct(TaskAction),
     WsPath,
     WsEntry(u16),
     WsConfirm,
@@ -267,8 +268,155 @@ impl WorkspacePick {
 }
 
 pub(crate) enum TaskUi {
-    Form(Edit),
-    Status,
+    Form(TaskForm),
+    Status(TaskStatus),
+}
+
+/// The task form: a new goal, or the live task's goal and criteria to edit.
+#[derive(Default)]
+pub(crate) struct TaskForm {
+    pub goal: Edit,
+    pub criteria: Edit,
+    /// Typing goes to the criteria field (Tab switches).
+    pub on_criteria: bool,
+    /// Prefilled from the current task: submitting edits it.
+    pub editing: bool,
+    /// Vertical scroll of each field, so a click lands where it was drawn.
+    pub scroll: [u16; 2],
+}
+
+impl TaskForm {
+    /// Prefilled from the task for 修改.
+    pub fn editing(t: &TaskState) -> Self {
+        Self {
+            goal: Edit::at_end(t.goal.clone()),
+            criteria: Edit::at_end(t.criteria.clone()),
+            editing: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn field_mut(&mut self) -> &mut Edit {
+        if self.on_criteria {
+            &mut self.criteria
+        } else {
+            &mut self.goal
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        if self.on_criteria {
+            task::MAX_CRITERIA
+        } else {
+            task::MAX_GOAL
+        }
+    }
+}
+
+/// The task status dialog: which action the keyboard is on, and how far the
+/// text is scrolled.
+pub(crate) struct TaskStatus {
+    pub focus: TaskAction,
+    pub scroll: u16,
+}
+
+impl Default for TaskStatus {
+    fn default() -> Self {
+        // Enter keeps closing the dialog until the user moves.
+        Self { focus: TaskAction::Close, scroll: 0 }
+    }
+}
+
+/// What the user can do to a task from the dialog, the side panel or the web.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskAction {
+    Pause,
+    Resume,
+    Review,
+    Accept,
+    Edit,
+    End,
+    Close,
+}
+
+impl TaskAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pause => "暫停",
+            Self::Resume => "繼續",
+            Self::Review => "立即審查",
+            Self::Accept => "判定完成",
+            Self::Edit => "修改",
+            Self::End => "結束任務",
+            Self::Close => "關閉",
+        }
+    }
+
+    /// Its name in the web snapshot; the page closes its dialog itself.
+    pub fn web_id(self) -> Option<&'static str> {
+        match self {
+            Self::Pause => Some("pause"),
+            Self::Resume => Some("resume"),
+            Self::Review => Some("review"),
+            Self::Accept => Some("accept"),
+            Self::Edit => Some("edit"),
+            Self::End => Some("end"),
+            Self::Close => None,
+        }
+    }
+
+    /// Pause and resume are one button that changes its label.
+    pub fn same(self, other: TaskAction) -> bool {
+        self == other || matches!((self, other), (Self::Pause, Self::Resume) | (Self::Resume, Self::Pause))
+    }
+
+    /// The letter that runs it in the status dialog.
+    pub fn key(self) -> Option<char> {
+        match self {
+            Self::Pause | Self::Resume => Some('p'),
+            Self::Review => Some('r'),
+            Self::Accept => Some('d'),
+            Self::Edit => Some('e'),
+            Self::End => Some('x'),
+            Self::Close => None,
+        }
+    }
+}
+
+/// How long a first press of 結束任務 waits for the second.
+pub(crate) const TASK_END_CONFIRM: Duration = Duration::from_secs(4);
+
+/// Why a live proxy is not pushing: paused by the user, or stopped by Esc
+/// (it stays quiet until 繼續, 立即審查 or a message of the user's own).
+pub(crate) fn task_hold(t: &TaskState) -> Option<&'static str> {
+    if !t.phase.is_live() {
+        None
+    } else if t.paused {
+        Some("已暫停")
+    } else if t.skip_steer {
+        Some("已停止")
+    } else {
+        None
+    }
+}
+
+/// The actions that make sense for the task as it stands. A paused proxy
+/// makes no calls at all, so it cannot review until resumed.
+pub(crate) fn task_actions(t: &TaskState) -> Vec<TaskAction> {
+    let mut out = Vec::new();
+    if t.phase.is_live() {
+        out.push(if task_hold(t).is_some() { TaskAction::Resume } else { TaskAction::Pause });
+        if !t.paused {
+            out.push(TaskAction::Review);
+        }
+        out.push(TaskAction::Accept);
+    }
+    if t.phase != TaskPhase::Inactive {
+        out.push(TaskAction::Edit);
+        out.push(TaskAction::End);
+    }
+    out.push(TaskAction::Close);
+    out
 }
 
 pub(crate) struct SkillView {
@@ -326,6 +474,11 @@ pub(crate) struct Ui {
     pub side_area: Rect,
     pub bottom_area: Rect,
     pub field_inner: Rect,
+    /// Inner rects of the task form's goal and criteria fields.
+    pub task_fields: [Rect; 2],
+    /// When and in which session 結束任務 was pressed once; a second press
+    /// there soon after ends the task.
+    pub task_end_armed: Option<(Instant, String)>,
     pub skill_inner: Rect,
     pub last_caret: Position,
     pub last_clock_cells: Vec<(u16, u16, Cell)>,
@@ -346,6 +499,7 @@ pub(crate) enum SideItem {
     Background(String),
     Monitor(String),
     OpenTask,
+    TaskAct(TaskAction),
 }
 
 impl Default for Ui {
@@ -383,6 +537,8 @@ impl Default for Ui {
             side_area: Rect::default(),
             bottom_area: Rect::default(),
             field_inner: Rect::default(),
+            task_fields: [Rect::default(); 2],
+            task_end_armed: None,
             skill_inner: Rect::default(),
             last_caret: Position::ORIGIN,
             last_clock_cells: Vec::new(),
@@ -1036,7 +1192,7 @@ impl App {
         });
         let rows: Vec<Row> = store
             .and_then(|s| s.load_transcript(id).ok())
-            .and_then(|v| serde_json::from_value(v).ok())
+            .map(|v| rows::decode_rows(&v))
             .unwrap_or_default();
         let task = TaskHub::from_state(
             id,
@@ -1317,7 +1473,10 @@ impl App {
         let Some(turn) = self.cur_mut().take_turn() else {
             return;
         };
-        let mode = if force_insert { SendMode::Insert } else { self.ui.send_mode };
+        // While the user proxy drives a task the run seldom waits for input:
+        // the user's own words go in as an interjection, so they come first.
+        let driving = self.cur().task.snapshot().phase.is_live();
+        let mode = if force_insert || driving { SendMode::Insert } else { self.ui.send_mode };
         let s = self.cur();
         match submit_kind(s.inbox.is_some(), s.chat.running, mode) {
             Submit::Queue => {
@@ -1619,12 +1778,13 @@ impl App {
 
     // —— Task mode ——
 
+    /// The form when there is no task, the status dialog otherwise.
     pub fn open_task(&mut self) {
         let phase = self.cur().task.snapshot().phase;
-        self.ui.task_ui = Some(if phase.is_live() || matches!(phase, TaskPhase::Done | TaskPhase::Failed) {
-            TaskUi::Status
+        self.ui.task_ui = Some(if phase == TaskPhase::Inactive {
+            TaskUi::Form(TaskForm::default())
         } else {
-            TaskUi::Form(Edit::default())
+            TaskUi::Status(TaskStatus::default())
         });
     }
 
@@ -1632,30 +1792,159 @@ impl App {
         self.ui.task_ui = None;
     }
 
-    pub fn submit_task_goal(&mut self, goal: &str) {
+    /// Submit the open form: start a task, or edit the current one.
+    pub fn submit_task_form(&mut self) {
+        let Some(TaskUi::Form(form)) = &self.ui.task_ui else {
+            return;
+        };
+        let (goal, criteria) = (form.goal.text.clone(), form.criteria.text.clone());
+        if form.editing {
+            self.edit_task(&goal, &criteria);
+        } else {
+            self.start_task(&goal, &criteria);
+        }
+    }
+
+    pub fn start_task(&mut self, goal: &str, criteria: &str) {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
             self.flash("請填寫任務目標");
             return;
         }
+        let criteria = criteria.trim().to_string();
         let s = self.cur_mut();
-        s.task.start_goal(goal.clone());
-        s.chat.push(Row::meta(format!("已啟動任務模式：{goal}")));
+        s.task.start_task(goal.clone(), criteria.clone());
+        let mut line = format!("已啟動任務模式：{goal}");
+        if !criteria.is_empty() {
+            line.push_str(&format!("\n驗收條件：{criteria}"));
+        }
+        s.chat.push(Row::meta(line));
         s.agents.log("", EventKind::Message, format!("任務目標：{goal}"));
         s.dirty = true;
-        self.ui.task_ui = Some(TaskUi::Status);
+        self.ui.task_ui = Some(TaskUi::Status(TaskStatus::default()));
         if self.cur().inbox.is_none() {
             self.start_or_send(UserTurn::from(task::KICK), false);
         }
     }
 
+    /// The user changed the goal or criteria. The proxy keeps its memory,
+    /// progress notes and rounds, so an edit after a hand-back (often the
+    /// decision it asked for) picks up where it stopped.
+    pub fn edit_task(&mut self, goal: &str, criteria: &str) {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            self.flash("請填寫任務目標");
+            return;
+        }
+        let snap = self.cur().task.snapshot();
+        if snap.phase == TaskPhase::Inactive {
+            // Ended elsewhere while the form was open: nothing left to edit.
+            self.start_task(&goal, criteria);
+            return;
+        }
+        if matches!(snap.phase, TaskPhase::HandedBack | TaskPhase::Failed) {
+            // TaskHub::edit_task only reopens Done; bring these back the same
+            // way, so intake and planning do not run again.
+            self.cur().task.replace(TaskState {
+                phase: TaskPhase::Active,
+                review_note: String::new(),
+                fail_reason: String::new(),
+                claim: None,
+                skip_steer: false,
+                ..snap
+            });
+        }
+        let s = self.cur_mut();
+        s.task.edit_task(goal.clone(), criteria.trim().to_string());
+        s.chat.push(Row::meta(format!("已修改任務：{goal}")));
+        s.agents.log("", EventKind::Message, format!("任務修改：{goal}"));
+        s.dirty = true;
+        self.ui.task_ui = Some(TaskUi::Status(TaskStatus::default()));
+        self.ensure_task_run();
+    }
+
+    /// Run one task action. Actions that do not apply to the task as it
+    /// stands (a stale web button, a hotkey) do nothing.
+    pub fn task_action(&mut self, act: TaskAction) {
+        let snap = self.cur().task.snapshot();
+        if act == TaskAction::Review && snap.paused && snap.phase.is_live() {
+            self.flash("用戶代理已暫停，請先按繼續");
+            return;
+        }
+        if !task_actions(&snap).contains(&act) {
+            return;
+        }
+        let armed = self.task_end_armed();
+        self.ui.task_end_armed = None;
+        match act {
+            TaskAction::Pause => {
+                let s = self.cur_mut();
+                s.task.set_paused(true);
+                s.chat.push(Row::meta("已暫停用戶代理：主代理不再被推進，直到你按繼續"));
+                s.dirty = true;
+            }
+            TaskAction::Resume => {
+                let s = self.cur_mut();
+                // Resume also lifts an Esc stop; the kernel only reviews on a
+                // resume once that is clear.
+                s.task.set_skip_steer(false);
+                s.task.set_paused(false);
+                s.chat.push(Row::meta("用戶代理繼續推進任務"));
+                s.dirty = true;
+                self.ensure_task_run();
+            }
+            TaskAction::Review => {
+                let t = &self.cur().task;
+                t.set_skip_steer(false);
+                t.request_review();
+                self.flash("已請用戶代理立即審查");
+                self.ensure_task_run();
+            }
+            TaskAction::Accept => {
+                let s = self.cur_mut();
+                s.task.accept_done();
+                s.chat.push(Row::meta("你已判定任務完成，用戶代理停止推進"));
+                s.agents.log("", EventKind::Message, "任務由使用者判定完成");
+                s.dirty = true;
+            }
+            TaskAction::Edit => self.ui.task_ui = Some(TaskUi::Form(TaskForm::editing(&snap))),
+            // Ending wipes the goal, the progress notes and the proxy's
+            // memory: one stray key or click must not do that.
+            TaskAction::End if armed => self.end_task(),
+            TaskAction::End => {
+                self.ui.task_end_armed = Some((Instant::now(), self.current.clone()));
+                self.flash("再按一次「結束任務」確認：目標、進度筆記和用戶代理的記憶都會清除");
+            }
+            TaskAction::Close => self.close_task(),
+        }
+    }
+
+    /// 結束任務 was pressed once and waits for the second press.
+    pub fn task_end_armed(&self) -> bool {
+        self.ui.task_end_armed.as_ref().is_some_and(|(t, id)| t.elapsed() < TASK_END_CONFIRM && *id == self.current)
+    }
+
+    /// A live task needs a run for the proxy to act in: a restored session
+    /// or a finished run has none until something starts one.
+    fn ensure_task_run(&mut self) {
+        let snap = self.cur().task.snapshot();
+        if snap.phase.is_live() && !snap.paused && self.cur().inbox.is_none() {
+            // A fresh run's first turn only plans a new task. Past planning,
+            // ask the proxy to look, so the run starts with its review.
+            if snap.phase != TaskPhase::NeedPlan {
+                self.cur().task.request_review();
+            }
+            self.start_or_send(UserTurn::from(task::KICK), false);
+        }
+    }
+
     pub fn end_task(&mut self) {
-        let phase = self.cur().task.snapshot().phase;
-        if phase.is_live() || matches!(phase, TaskPhase::Done | TaskPhase::Failed) {
+        if self.cur().task.snapshot().phase != TaskPhase::Inactive {
             let s = self.cur_mut();
             s.task.end();
             s.agents.log("", EventKind::Message, "任務模式由使用者結束");
             s.chat.push(Row::meta("已結束任務模式"));
+            s.dirty = true;
         }
         self.close_task();
     }
@@ -1867,7 +2156,7 @@ pub(crate) fn boot_session(store: Option<&SessionStore>, workspace: PathBuf) -> 
     let rows_of = |id: &str| -> Vec<Row> {
         store
             .and_then(|s| s.load_transcript(id).ok())
-            .and_then(|v| serde_json::from_value(v).ok())
+            .map(|v| rows::decode_rows(&v))
             .unwrap_or_default()
     };
     let pick = listed

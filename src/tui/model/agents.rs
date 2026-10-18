@@ -162,6 +162,7 @@ pub(crate) struct SavedAgent {
     prompt: String,
     #[serde(default = "exited")]
     state: AgentState,
+    #[serde(deserialize_with = "super::rows::lenient_rows")]
     rows: Vec<Row>,
 }
 

@@ -15,13 +15,14 @@ const LABEL_W: u16 = 18;
 const FORM_W: u16 = 84;
 
 /// Field ↔ hit id.
-pub(crate) const FIELDS: [Field; 13] = [
+pub(crate) const FIELDS: [Field; 14] = [
     Field::Kind,
     Field::Account,
     Field::Endpoint,
     Field::ApiKey,
     Field::Model,
     Field::ChildModel,
+    Field::TaskModel,
     Field::Context,
     Field::Effort,
     Field::Search,
@@ -137,6 +138,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         for (fld, label, value, kind) in [
             (Field::Model, format!("模型{status}"), app.model_label(), DropKind::Model),
             (Field::ChildModel, "子代理模型".to_string(), app.child_model_label(), DropKind::ChildModel),
+            (Field::TaskModel, "任務代理模型".to_string(), app.task_model_label(), DropKind::TaskModel),
             (Field::Effort, "思考強度".to_string(), app.effort_label(), DropKind::Effort),
         ] {
             if y + 3 > bottom {
@@ -159,6 +161,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         let context = app.settings.context.clone();
         let model_edit = app.settings.model_edit.clone();
         let child_edit = app.settings.child_model_edit.clone();
+        let task_edit = app.settings.task_model_edit.clone();
         let model_title = if has_list {
             "模型".to_string()
         } else if app.settings.custom_err.is_some() {
@@ -171,6 +174,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
             (Field::ApiKey, "API 金鑰（選填）".into()),
             (Field::Model, model_title),
             (Field::ChildModel, if has_list { "子代理模型".into() } else { "子代理（空=同主）".into() }),
+            (Field::TaskModel, if has_list { "任務代理模型".into() } else { "任務代理（空=同主）".into() }),
             (Field::Context, "上下文（如 262K）".into()),
         ];
         for (fld, label) in rows {
@@ -181,9 +185,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
             row_label(f, y, &label, on);
             let r = Rect::new(ctl_x, y, ctl_w, 3);
             match fld {
-                Field::Model | Field::ChildModel if has_list => {
-                    let kind = if fld == Field::Model { DropKind::Model } else { DropKind::ChildModel };
-                    let value = if fld == Field::Model { app.model_label() } else { app.child_model_label() };
+                Field::Model | Field::ChildModel | Field::TaskModel if has_list => {
+                    let (kind, value) = match fld {
+                        Field::Model => (DropKind::Model, app.model_label()),
+                        Field::ChildModel => (DropKind::ChildModel, app.child_model_label()),
+                        _ => (DropKind::TaskModel, app.task_model_label()),
+                    };
                     let open = app.settings.drop == Some(kind);
                     combo(f, app, Rect::new(r.x, r.y, r.width.min(48), 3), &value, on, open, field_hit(fld));
                     if open {
@@ -196,6 +203,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
                         Field::ApiKey => &api_key,
                         Field::Model => &model_edit,
                         Field::ChildModel => &child_edit,
+                        Field::TaskModel => &task_edit,
                         _ => &context,
                     };
                     let pos = boxed_edit(f, app, r, edit, on, field_hit(fld), fld == Field::ApiKey);
@@ -334,6 +342,7 @@ fn drop_list(f: &mut Frame, app: &mut App, kind: DropKind, anchor: Rect, clip: R
     let labels: Vec<String> = match kind {
         DropKind::Model => app.model_choices().into_iter().map(|(id, n)| if n.is_empty() { id } else { n }).collect(),
         DropKind::ChildModel => app.child_model_choices().into_iter().map(|(id, n)| if n.is_empty() { id } else { n }).collect(),
+        DropKind::TaskModel => app.task_model_choices().into_iter().map(|(id, n)| if n.is_empty() { id } else { n }).collect(),
         DropKind::Effort => app.effort_choices().into_iter().map(|e| e.label).collect(),
     };
     if labels.is_empty() {

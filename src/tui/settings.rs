@@ -23,6 +23,7 @@ pub(crate) enum Field {
     ApiKey,
     Model,
     ChildModel,
+    TaskModel,
     Context,
     Effort,
     Search,
@@ -42,6 +43,7 @@ impl Field {
                 Field::ApiKey,
                 Field::Model,
                 Field::ChildModel,
+                Field::TaskModel,
                 Field::Context,
                 Field::Search,
                 Field::Dispatcher,
@@ -55,6 +57,7 @@ impl Field {
                 Field::Account,
                 Field::Model,
                 Field::ChildModel,
+                Field::TaskModel,
                 Field::Effort,
                 Field::Search,
                 Field::Dispatcher,
@@ -70,6 +73,7 @@ impl Field {
 pub(crate) enum DropKind {
     Model,
     ChildModel,
+    TaskModel,
     Effort,
 }
 
@@ -109,6 +113,10 @@ pub(crate) struct Settings {
     pub api_key: Edit,
     pub model_edit: Edit,
     pub child_model_edit: Edit,
+    /// Model of the task-mode user proxy; empty = the main model. Kept for
+    /// this TUI's lifetime, like the child model.
+    pub task_model: String,
+    pub task_model_edit: Edit,
     pub context: Edit,
     pub field: Field,
     pub drop: Option<DropKind>,
@@ -147,6 +155,8 @@ impl Settings {
             api_key: Edit::at_end(conn.api_key.clone()),
             model_edit: Edit::default(),
             child_model_edit: Edit::default(),
+            task_model: String::new(),
+            task_model_edit: Edit::default(),
             context: Edit::at_end(if conn.context_window > 0 {
                 crate::compact::format_window(conn.context_window)
             } else {
@@ -186,6 +196,7 @@ impl Settings {
             Field::ApiKey => Some(&mut self.api_key),
             Field::Model if typed_models => Some(&mut self.model_edit),
             Field::ChildModel if typed_models => Some(&mut self.child_model_edit),
+            Field::TaskModel if typed_models => Some(&mut self.task_model_edit),
             Field::Context => Some(&mut self.context),
             _ => None,
         }
@@ -231,6 +242,7 @@ impl App {
             k.search = self.opts.web_search;
             k.dispatcher = self.opts.dispatcher;
             k.child_model = self.opts.child_model.trim().to_string();
+            k.task_model = st.task_model.trim().to_string();
         }
     }
 
@@ -249,6 +261,12 @@ impl App {
 
     pub fn child_model_choices(&self) -> Vec<(String, String)> {
         let mut out = vec![(String::new(), "跟隨主模型".to_string())];
+        out.extend(self.model_choices());
+        out
+    }
+
+    pub fn task_model_choices(&self) -> Vec<(String, String)> {
+        let mut out = vec![(String::new(), "跟主模型相同".to_string())];
         out.extend(self.model_choices());
         out
     }
@@ -290,6 +308,19 @@ impl App {
             .unwrap_or_else(|| id.to_string())
     }
 
+    pub fn task_model_label(&self) -> String {
+        let id = self.settings.task_model.trim();
+        if id.is_empty() {
+            return "跟主模型相同".into();
+        }
+        self.settings
+            .catalog
+            .find(id)
+            .map(|m| m.name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     pub fn effort_label(&self) -> String {
         self.effort_choices()
             .iter()
@@ -315,6 +346,13 @@ impl App {
     pub fn select_child_model(&mut self, id: String) {
         self.opts.child_model = id.trim().to_string();
         self.settings.child_model_edit = Edit::at_end(self.opts.child_model.clone());
+        self.sync_knobs();
+    }
+
+    pub fn select_task_model(&mut self, id: String) {
+        let st = &mut self.settings;
+        st.task_model = id.trim().to_string();
+        st.task_model_edit = Edit::at_end(st.task_model.clone());
         self.sync_knobs();
     }
 
@@ -369,6 +407,7 @@ impl App {
             if self.settings.custom_catalog.models.is_empty() {
                 // Typed while the endpoint has no model list.
                 self.opts.child_model = self.settings.child_model_edit.text.trim().to_string();
+                self.settings.task_model = self.settings.task_model_edit.text.trim().to_string();
             }
             self.rebuild_catalog();
         } else {
@@ -427,9 +466,10 @@ impl App {
             cat.models.push(m);
         }
         cat.ensure_current(&self.opts.model, self.opts.reasoning_effort);
-        let child = self.opts.child_model.trim();
-        if !child.is_empty() {
-            cat.ensure_current(child, self.opts.reasoning_effort);
+        for pick in [self.opts.child_model.trim(), st.task_model.trim()] {
+            if !pick.is_empty() {
+                cat.ensure_current(pick, self.opts.reasoning_effort);
+            }
         }
         st.catalog = cat;
     }
@@ -531,6 +571,7 @@ impl App {
         match self.settings.drop {
             Some(DropKind::Model) => self.model_choices().len(),
             Some(DropKind::ChildModel) => self.child_model_choices().len(),
+            Some(DropKind::TaskModel) => self.task_model_choices().len(),
             Some(DropKind::Effort) => self.effort_choices().len(),
             None => 0,
         }
@@ -543,6 +584,10 @@ impl App {
                 .child_model_choices()
                 .iter()
                 .position(|(id, _)| id == self.opts.child_model.trim()),
+            DropKind::TaskModel => self
+                .task_model_choices()
+                .iter()
+                .position(|(id, _)| id == self.settings.task_model.trim()),
             DropKind::Effort => self
                 .effort_choices()
                 .iter()
@@ -587,6 +632,11 @@ impl App {
             Some(DropKind::ChildModel) => {
                 if let Some((id, _)) = self.child_model_choices().get(index).cloned() {
                     self.select_child_model(id);
+                }
+            }
+            Some(DropKind::TaskModel) => {
+                if let Some((id, _)) = self.task_model_choices().get(index).cloned() {
+                    self.select_task_model(id);
                 }
             }
             Some(DropKind::Effort) => {

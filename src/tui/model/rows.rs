@@ -201,11 +201,58 @@ pub(crate) enum Row {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         source: String,
     },
+    /// Task mode: the user proxy spoke to the worker, or the worker reported
+    /// to it (`intent`, see [`proxy_label`]).
+    Proxy { intent: String, text: String },
 }
 
 impl Row {
     pub fn meta(s: impl Into<String>) -> Self {
         Self::Meta(s.into())
+    }
+}
+
+/// Rows of a saved transcript, read one by one: a row this version does not
+/// know (written by a newer one) becomes a note with the text it carried,
+/// instead of losing the whole history.
+pub(crate) fn decode_rows(v: &Value) -> Vec<Row> {
+    let Some(items) = v.as_array() else {
+        return Vec::new();
+    };
+    items.iter().map(|item| Row::deserialize(item).unwrap_or_else(|_| Row::meta(unknown_row_text(item)))).collect()
+}
+
+/// [`decode_rows`] for a `rows` field inside a saved struct.
+pub(crate) fn lenient_rows<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Row>, D::Error> {
+    Ok(decode_rows(&Value::deserialize(d)?))
+}
+
+/// Rows are `{"Kind": "text"}` or `{"Kind": {.., "text": ..}}`.
+fn unknown_row_text(v: &Value) -> String {
+    let text = match v.as_object().and_then(|o| o.values().next()) {
+        Some(Value::String(s)) => s.as_str(),
+        Some(Value::Object(o)) => o.get("text").and_then(Value::as_str).unwrap_or_default(),
+        _ => "",
+    };
+    if text.trim().is_empty() {
+        "（較新版本寫入的紀錄，這個版本無法顯示）".into()
+    } else {
+        text.to_string()
+    }
+}
+
+/// How a proxy row names what was said.
+pub(crate) fn proxy_label(intent: &str) -> &str {
+    match intent {
+        "plan" => "開場",
+        "push" => "要求",
+        "checkpoint" => "中途提醒",
+        "answer" => "代答",
+        "accept" => "驗收",
+        "hand_back" => "交還",
+        "impossible" => "無法完成",
+        "report" => "主代理回報",
+        other => other,
     }
 }
 

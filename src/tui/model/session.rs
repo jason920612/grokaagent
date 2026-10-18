@@ -16,7 +16,7 @@ use crate::session::SessionMeta;
 use crate::task::{self, TaskHub};
 
 use super::agents::{AgentTree, EventKind};
-use super::rows::{Row, UserMsg};
+use super::rows::{proxy_label, Row, UserMsg};
 use super::transcript::Transcript;
 use crate::tui::edit::Edit;
 
@@ -179,6 +179,8 @@ pub(crate) struct AskState {
     pub values: Vec<String>,
     pub filling: bool,
     pub fill: Edit,
+    /// Asked by the task proxy (intake), not by the agent.
+    pub from_proxy: bool,
 }
 
 impl AskState {
@@ -191,6 +193,7 @@ impl AskState {
             values: vec![String::new(); n],
             filling: false,
             fill: Edit::default(),
+            from_proxy: false,
         }
     }
 
@@ -609,19 +612,27 @@ impl Session {
             return out;
         }
         match ev {
+            // The task proxy may report itself like a child, but it is not a
+            // process: its words arrive as TaskProxy rows instead.
+            AgentEvent::ChildSpawned { name, .. } | AgentEvent::ChildExited { name, .. } if name == task::AGENT_NAME => {}
             AgentEvent::ChildSpawned { name, prompt, model, .. } => {
-                // The task supervisor reports itself like a child but is not a process.
-                if name != task::AGENT_NAME {
-                    self.agents.spawned("", &name, &prompt, &model);
-                }
+                self.agents.spawned("", &name, &prompt, &model);
                 self.chat.push(Row::meta(format!("子代理 {name} 已啟動")));
             }
             AgentEvent::ChildExited { name, detail, .. } => {
-                if name != task::AGENT_NAME {
-                    self.agents.exited("", &name, &detail);
-                }
+                self.agents.exited("", &name, &detail);
                 self.chat.mark_spawn_done(&name);
                 self.chat.push(Row::meta(format!("子代理 {name} 結束")));
+            }
+            AgentEvent::TaskProxy { intent, text, .. } => {
+                let preview: String = text.chars().take(160).collect();
+                self.agents.log(
+                    "",
+                    EventKind::Message,
+                    format!("用戶代理 {}  {}", proxy_label(&intent), preview.replace('\n', " ")),
+                );
+                self.chat.streaming = false;
+                self.chat.push(Row::Proxy { intent, text });
             }
             AgentEvent::AgentMessage { from, to, text, .. } => {
                 if from == task::AGENT_NAME || to == task::AGENT_NAME {
@@ -677,11 +688,14 @@ impl Session {
                 self.end_background(&name, "已取消", "");
                 self.chat.push(Row::meta(format!("計時器 {name} 已取消")));
             }
-            AgentEvent::AskUser { question, allow_multiple, options, .. } => {
+            AgentEvent::AskUser { meta, question, allow_multiple, options } => {
                 if options.is_empty() {
                     return out;
                 }
-                self.chat.push(Row::meta(format!("問卷  {question}")));
+                // The task proxy asks what final result the user wants.
+                let from_proxy = meta.agent_name == task::AGENT_NAME;
+                let head = if from_proxy { "任務代理提問" } else { "問卷" };
+                self.chat.push(Row::meta(format!("{head}  {question}")));
                 if !visible {
                     // Nobody can answer a hidden chat's questionnaire.
                     if let Some(h) = &self.ask_hub {
@@ -689,11 +703,13 @@ impl Session {
                     }
                     return out;
                 }
-                self.ask = Some(AskState::new(Question {
+                let mut ask = AskState::new(Question {
                     prompt: question,
                     allow_multiple,
                     options,
-                }));
+                });
+                ask.from_proxy = from_proxy;
+                self.ask = Some(ask);
                 self.chat.status = "請選擇".into();
                 out.ask_opened = true;
             }
@@ -776,9 +792,15 @@ impl Session {
         Some(UserTurn { text, images })
     }
 
-    /// Send the next queued message once the agent is waiting.
+    /// Send the next queued message once the agent is waiting. While the
+    /// user proxy drives a live task the agent may never wait, so queued
+    /// messages go in as interjections instead.
     pub fn flush_queue(&mut self) -> bool {
-        if !self.chat.awaiting || self.queue_edit.is_some() || self.chat.status == "已停止" {
+        // Runs every loop: the task snapshot only once there is something to send.
+        if self.queue.is_empty() || self.queue_edit.is_some() || self.chat.status == "已停止" {
+            return false;
+        }
+        if !self.chat.awaiting && !(self.chat.running && self.task.snapshot().phase.is_live()) {
             return false;
         }
         let Some(tx) = self.inbox.clone() else {

@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use super::{draw_edit, line, truncate};
 use crate::md;
-use crate::tui::app::{App, BottomTab, Hit, SideItem, SideView, Tab};
+use crate::tui::app::{task_actions, task_hold, App, BottomTab, Hit, SideItem, SideView, Tab, TaskAction};
 use crate::tui::edit::display_cols;
 use crate::tui::model::agents::{AgentState, EventKind};
 use crate::tui::model::tool_text::spinner;
@@ -119,7 +119,7 @@ pub(crate) fn side_bar(f: &mut Frame, app: &mut App, area: Rect) -> Option<Posit
         SideView::Agents => agent_lines(app),
         SideView::Changes => change_lines(app),
         SideView::Background => background_lines(app),
-        SideView::Task => task_lines(app),
+        SideView::Task => task_lines(app, body.width),
         SideView::Sessions => unreachable!(),
     };
     paint_lines(f, app, body, lines);
@@ -284,27 +284,65 @@ fn background_lines(app: &App) -> Vec<SideLine> {
     out
 }
 
-fn task_lines(app: &App) -> Vec<SideLine> {
+/// Wrapped side lines of `text`, indented, at most `max` lines.
+fn side_text(out: &mut Vec<SideLine>, text: &str, width: u16, max: usize, color: Color, item: &Option<SideItem>) {
+    let chars: Vec<char> = text.trim_end().chars().collect();
+    let joined: String = chars.iter().collect();
+    let ranges = crate::tui::edit::wrap_lines(&joined, width.saturating_sub(3).max(1));
+    for &(a, b) in ranges.iter().take(max) {
+        out.push((format!("   {}", chars[a..b].iter().collect::<String>()), color, item.clone(), false));
+    }
+    if ranges.len() > max {
+        out.push(("   …（開啟任務面板看全文）".into(), DIM, item.clone(), false));
+    }
+}
+
+fn task_lines(app: &App, width: u16) -> Vec<SideLine> {
     let task = app.cur().task.snapshot();
     let mut out: Vec<SideLine> = Vec::new();
+    let open = Some(SideItem::OpenTask);
     if task.goal.is_empty() {
         out.push((" 尚未設定任務目標".into(), DIM, None, false));
-        out.push((" 任務模式讓監督者檢查表".into(), DIM, None, false));
-        out.push((" 推著主代理做到完成".into(), DIM, None, false));
-        out.push((" ▸ 設定任務目標".into(), ACCENT, Some(SideItem::OpenTask), false));
+        out.push((" 任務模式讓用戶代理替你".into(), DIM, None, false));
+        out.push((" 督促主代理做到完成".into(), DIM, None, false));
+        out.push((" ▸ 設定任務目標（Ctrl+T）".into(), ACCENT, open, false));
         return out;
     }
-    out.push((format!(" 目標  {}", task.goal.replace('\n', " ")), TEXT, Some(SideItem::OpenTask), false));
+    out.push((" 目標".into(), DIM, open.clone(), false));
+    side_text(&mut out, &task.goal, width, 6, TEXT, &open);
+    if !task.criteria.trim().is_empty() {
+        out.push((" 驗收條件／偏好".into(), DIM, open.clone(), false));
+        side_text(&mut out, &task.criteria, width, 6, TEXT, &open);
+    }
     let done = task.checklist.iter().filter(|i| i.done).count();
-    let phase = if task.skip_steer { "已暫停" } else { task.phase.label() };
-    out.push((format!(" {phase} · {done}/{}", task.checklist.len()), ACCENT, Some(SideItem::OpenTask), false));
+    let hold = task_hold(&task).map(|h| format!(" · {h}")).unwrap_or_default();
+    out.push((
+        format!(" {}{hold} · 回合 {} · {done}/{}", task.phase.label(), task.rounds, task.checklist.len()),
+        ACCENT,
+        open.clone(),
+        false,
+    ));
+    if !task.last_proxy.trim().is_empty() {
+        out.push((" 用戶代理最新訊息".into(), PROXY, open.clone(), false));
+        side_text(&mut out, &task.last_proxy, width, 12, TEXT, &open);
+    }
+    if !task.checklist.is_empty() {
+        out.push((" 進度筆記".into(), DIM, None, false));
+    }
     for item in &task.checklist {
-        out.push((format!(" {} {}", if item.done { "✓" } else { "□" }, item.text), if item.done { AGENT } else { TEXT }, None, false));
+        let mark = if item.done { "✓" } else { "□" };
+        side_text(&mut out, &format!("{mark} {}", item.text), width, 3, if item.done { AGENT } else { TEXT }, &None);
     }
     if !task.review_note.is_empty() {
-        out.push((format!(" {}", task.review_note), DIM, None, false));
+        side_text(&mut out, &task.review_note, width, 4, DIM, &None);
     }
-    out.push((" ▸ 開啟任務面板".into(), ACCENT, Some(SideItem::OpenTask), false));
+    out.push((String::new(), DIM, None, false));
+    let armed = app.task_end_armed();
+    for act in task_actions(&task).into_iter().filter(|a| *a != TaskAction::Close) {
+        let label = if act == TaskAction::End && armed { "再按一次確認結束" } else { act.label() };
+        out.push((format!(" ▸ {label}"), ACCENT, Some(SideItem::TaskAct(act)), false));
+    }
+    out.push((" ▸ 開啟任務面板（Ctrl+T）".into(), ACCENT, open, false));
     out
 }
 

@@ -25,6 +25,8 @@ mod tests;
 #[cfg(test)]
 mod tests_input;
 #[cfg(test)]
+mod tests_task;
+#[cfg(test)]
 mod tests_tui;
 #[cfg(test)]
 mod tests_web;

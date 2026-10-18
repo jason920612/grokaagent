@@ -14,7 +14,7 @@ use crate::md;
 use crate::preview::{Graphic, GraphicBlit, Placement};
 use crate::tui::app::{App, GlyphLine, Hit, ImageKey, Images};
 use crate::tui::edit::{ch_width, display_cols};
-use crate::tui::model::rows::{AgentMsg, Row, Think, ToolCall, ToolGroup};
+use crate::tui::model::rows::{proxy_label, AgentMsg, Row, Think, ToolCall, ToolGroup};
 use crate::tui::model::session::{ChatSel, ChatView};
 use crate::tui::model::tool_text::{tool_finished_line, tool_started_line};
 use crate::tui::theme::*;
@@ -371,8 +371,21 @@ fn row_lines(row: &Row, child: bool, label: &str) -> Option<Vec<Line<'static>>> 
         Row::Meta(s) => dim(s),
         Row::Err(s) => vec![Line::from(Span::styled(s.clone(), Style::default().fg(WARN)))],
         Row::Picture { label, .. } => dim(label),
+        Row::Proxy { intent, text } => proxy_lines(intent, text),
         Row::Tools(_) | Row::Think(_) => return None,
     })
+}
+
+/// The user proxy's words: a header naming what it was, then the full text.
+fn proxy_lines(intent: &str, text: &str) -> Vec<Line<'static>> {
+    let head = Style::default().fg(PROXY).add_modifier(Modifier::BOLD);
+    let mut out = vec![Line::from(Span::styled(format!("用戶代理 · {}", proxy_label(intent)), head))];
+    out.extend(
+        text.trim_end()
+            .split('\n')
+            .map(|l| Line::from(vec![Span::raw("      "), Span::styled(l.to_string(), Style::default().fg(TEXT))])),
+    );
+    out
 }
 
 fn line_text(line: &Line<'_>) -> String {

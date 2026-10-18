@@ -631,7 +631,7 @@ fn paste_goes_to_the_open_field() {
     app.close_settings();
     app.open_task();
     input::handle(app, Event::Paste("goal".into()));
-    assert!(matches!(&app.ui.task_ui, Some(TaskUi::Form(e)) if e.text == "goal"));
+    assert!(matches!(&app.ui.task_ui, Some(TaskUi::Form(f)) if f.goal.text == "goal"));
 }
 
 #[test]

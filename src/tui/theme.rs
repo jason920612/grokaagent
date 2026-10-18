@@ -20,6 +20,8 @@ pub(crate) const DIFF_DEL: Color = Color::Rgb(248, 81, 73);
 pub(crate) const DIFF_HUNK: Color = Color::Rgb(88, 166, 255);
 pub(crate) const TOOL: Color = Color::Rgb(210, 180, 80);
 pub(crate) const THINK: Color = Color::Rgb(168, 148, 210);
+/// The task-mode user proxy: neither the user nor the agent.
+pub(crate) const PROXY: Color = Color::Rgb(232, 158, 102);
 
 /// Below this width the side bar floats over the editor instead of docking.
 pub(crate) const SIDEBAR_MIN_TERM: u16 = 100;
