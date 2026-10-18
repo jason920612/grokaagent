@@ -467,14 +467,12 @@ fn cancelled_tool_output() -> String {
 }
 
 /// A tool result that asks for its image to be attached (read_image,
-/// screenshot). Tools print compact JSON, so the substring test only skips
-/// parsing outputs that cannot match.
+/// screenshot). Parsed, not matched as text, so any JSON layout counts.
 fn asks_for_image(output: &str) -> bool {
-    output.contains("\"attach_image\":true")
-        && serde_json::from_str::<Value>(output)
-            .ok()
-            .and_then(|v| v.get("attach_image").and_then(Value::as_bool))
-            == Some(true)
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|v| v.get("attach_image").and_then(Value::as_bool))
+        == Some(true)
 }
 
 /// `output` with `attach_image` off and `attach_error` saying why, so
@@ -488,6 +486,22 @@ fn without_image(output: &str, why: &str) -> String {
         }
         _ => output.to_string(),
     }
+}
+
+/// Tell the user, once per model, that the model cannot see the images
+/// it is sent.
+fn tell_blind(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, model: &str, told: &mut Option<String>) {
+    if told.as_deref() == Some(model) {
+        return;
+    }
+    *told = Some(model.to_string());
+    notice(
+        sink,
+        &cfg.agent_name,
+        run_id,
+        cfg.parent_run_id.as_deref(),
+        format!("模型 {model} 無法看圖：圖片改以文字說明送出，模型看不到內容"),
+    );
 }
 
 /// Wait for the next user turn or background-exit notice. Closing the user inbox ends the session.
@@ -662,8 +676,19 @@ const MAX_CONSECUTIVE_PROVIDER_ERRORS: u32 = 3;
 /// failure does not cost fold requests on every turn.
 const COMPACT_BACKOFF_TURNS: u32 = 3;
 
-/// Tell the model why the request failed and keep the loop going.
-/// Do not pause for the user: the model should enlarge/regenerate and continue.
+/// What a provider-error recovery did with the attached images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImagesAfterError {
+    /// Left in place: the error is not about them.
+    Kept,
+    /// Removed in case they caused the error.
+    Removed,
+    /// Removed because the model refused image input.
+    Refused,
+}
+
+/// Tell the model why the request failed (and whether its images were
+/// removed) and keep the loop going. Do not pause for the user.
 async fn recover_from_provider_error(
     cfg: &mut RunConfig,
     sink: &dyn EventSink,
@@ -673,7 +698,7 @@ async fn recover_from_provider_error(
     consecutive: &mut u32,
     last_text: &str,
     err: Error,
-) -> Result<()> {
+) -> Result<ImagesAfterError> {
     *consecutive += 1;
     sink.emit(&AgentEvent::Error {
         meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
@@ -682,13 +707,28 @@ async fn recover_from_provider_error(
     // Pixels go when they may be the cause, or when a resend already failed
     // too; never for a repetition loop, which they have nothing to do with.
     let had_images = crate::vision::input_has_image(history) || crate::vision::input_has_image(pending);
-    let drop_images =
-        had_images && !crate::repeat::is_loop(&err) && (image_error(&err) || *consecutive > 1);
-    if drop_images {
+    let images = if !had_images || crate::repeat::is_loop(&err) {
+        ImagesAfterError::Kept
+    } else if image_error(&err) && crate::openai::refuses_images(&err.to_string()) {
+        // Unverified here (no resend without the images), so the error
+        // must name images, not only refuse content arrays.
+        ImagesAfterError::Refused
+    } else if image_error(&err) || *consecutive > 1 {
+        ImagesAfterError::Removed
+    } else {
+        ImagesAfterError::Kept
+    };
+    if images != ImagesAfterError::Kept {
         crate::vision::strip_attached_images(history);
         crate::vision::strip_attached_images(pending);
     }
-    let note = if drop_images {
+    let note = if images == ImagesAfterError::Refused {
+        // Inviting read_image here would only repeat the refusal.
+        format!(
+            "{} ({err}). This model cannot view images, so the attached images were removed and no more will be attached. Do not call read_image or screenshot to look at images; work from file paths and text. Continue the task yourself. Do not wait for the user.",
+            crate::notice::REQUEST_FAILED
+        )
+    } else if images == ImagesAfterError::Removed {
         format!(
             "{} ({err}). The attached images were removed from the conversation in case they caused it; read_image their paths if you still need to see them. Continue the task yourself. Do not wait for the user.",
             crate::notice::REQUEST_FAILED
@@ -703,7 +743,7 @@ async fn recover_from_provider_error(
     *pending = history.clone();
 
     if *consecutive < MAX_CONSECUTIVE_PROVIDER_ERRORS {
-        return Ok(());
+        return Ok(images);
     }
     if cfg.inbox.is_none() {
         sink.emit(&AgentEvent::RunFinished {
@@ -723,7 +763,7 @@ async fn recover_from_provider_error(
             for msg in msgs {
                 append_user(history, pending, &msg, &cfg.workspace);
             }
-            Ok(())
+            Ok(images)
         }
         None => {
             sink.emit(&AgentEvent::RunFinished {
@@ -762,8 +802,10 @@ async fn handle_loop(
     *loop_trips += 1;
     if *loop_trips > MAX_LOOP_RETRIES {
         *loop_trips = 0;
+        // A repetition loop never touches the images.
         return recover_from_provider_error(cfg, sink, run_id, history, pending, consecutive, last_text, trip.to_error())
-            .await;
+            .await
+            .map(|_| ());
     }
     notice(
         sink,
@@ -980,6 +1022,9 @@ pub async fn run<P: Provider + Clone + 'static>(
     let mut seen_upto: usize = 0;
     // The model the user was last told cannot view images.
     let mut blind_noticed: Option<String> = None;
+    // Models that refused image input this run, on routes whose provider
+    // does not remember it (`Provider::sees_images`).
+    let mut blind: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     'run: loop {
         if seen_model {
@@ -1066,6 +1111,14 @@ pub async fn run<P: Provider + Clone + 'static>(
             pending = history.clone();
             last_model = model.clone();
             last_server_tools = server_tools.clone();
+        }
+        // A model that refused image input gets none again: images pasted
+        // since give way to their paths before the request goes out.
+        if blind.contains(&model) && crate::vision::input_has_image(&history) {
+            crate::vision::strip_attached_images(&mut history);
+            pending = history.clone();
+            images_known = 0;
+            image_turns = 0;
         }
 
         sink.emit(&AgentEvent::TurnStarted {
@@ -1447,7 +1500,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                 continue;
             }
             Ok(Err(e)) => {
-                recover_from_provider_error(
+                let images = recover_from_provider_error(
                     &mut cfg,
                     sink,
                     &run_id,
@@ -1458,22 +1511,23 @@ pub async fn run<P: Provider + Clone + 'static>(
                     e,
                 )
                 .await?;
-                image_turns = 0;
-                images_known = crate::vision::image_item_count(&history);
+                // Kept images keep their clock. Removed ones are gone: any
+                // sent from now on count as new (checked at the loop top).
+                if images != ImagesAfterError::Kept {
+                    images_known = 0;
+                    image_turns = 0;
+                }
+                if images == ImagesAfterError::Refused {
+                    blind.insert(model.clone());
+                    tell_blind(sink, &cfg, &run_id, &model, &mut blind_noticed);
+                }
                 continue;
             }
         };
         consecutive_provider_errors = 0;
         loop_trips = 0;
-        if has_image && !provider.sees_images(&model) && blind_noticed.as_deref() != Some(model.as_str()) {
-            blind_noticed = Some(model.clone());
-            notice(
-                sink,
-                &cfg.agent_name,
-                &run_id,
-                cfg.parent_run_id.as_deref(),
-                format!("模型 {model} 無法看圖：圖片改以文字說明送出，模型看不到內容"),
-            );
+        if has_image && !provider.sees_images(&model) {
+            tell_blind(sink, &cfg, &run_id, &model, &mut blind_noticed);
         }
 
         last_usage = response.usage.clone();
@@ -1548,6 +1602,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             let mut interrupted = false;
             // Images attached by this batch; past the cap the rest are not.
             let mut attached = 0usize;
+            let sees = provider.sees_images(&model) && !blind.contains(&model);
             for call in response.function_calls {
                 let args: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
                 if interrupted || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
@@ -1582,7 +1637,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                 // the result says so, for the model and the picture row alike.
                 let mut image_uri = None;
                 if !cancelled && asks_for_image(&output) {
-                    if !provider.sees_images(&model) {
+                    if !sees {
                         output = without_image(
                             &output,
                             &format!("{model} cannot view images, so no pixels were attached. Do not guess what the image shows."),
@@ -1811,10 +1866,13 @@ mod agent_tests {
 
     /// Replies in order and records the working requests. Memory-fold
     /// requests get a memory and, once, put `after_fold` in the inbox.
+    /// With `refuse`, a request carrying pixels fails with it instead,
+    /// as a route that does not learn missing vision would.
     struct Script {
         calls: Mutex<Vec<CompleteRequest>>,
         replies: Mutex<VecDeque<Result<CompleteResponse>>>,
         blind: bool,
+        refuse: Option<&'static str>,
         after_fold: Mutex<Option<(mpsc::UnboundedSender<UserTurn>, UserTurn)>>,
     }
 
@@ -1824,6 +1882,7 @@ mod agent_tests {
                 calls: Mutex::new(Vec::new()),
                 replies: Mutex::new(replies.into()),
                 blind: false,
+                refuse: None,
                 after_fold: Mutex::new(None),
             }
         }
@@ -1841,7 +1900,11 @@ mod agent_tests {
                     ..CompleteResponse::new("mem")
                 });
             }
+            let refused = self.refuse.filter(|_| crate::vision::input_has_image(&req.input));
             self.calls.lock().unwrap().push(req);
+            if let Some(body) = refused {
+                return Err(Error::Provider(format!("xAI HTTP 400: {body}")));
+            }
             self.replies
                 .lock()
                 .unwrap()
@@ -2124,6 +2187,124 @@ mod agent_tests {
         let (history, note) = recover(dir.path(), trip.to_error(), 1).await;
         assert!(crate::vision::input_has_image(&history), "a repetition loop is not about images");
         assert!(!note.contains("removed"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_of_image_input_says_not_to_look_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let refusal = Error::Provider("xAI HTTP 400: Image inputs are not supported by this model.".into());
+        let (history, note) = recover(dir.path(), refusal, 0).await;
+        assert!(!crate::vision::input_has_image(&history));
+        assert!(note.contains("cannot view images") && note.contains("Do not call read_image"), "{note}");
+        // Refusing content arrays without naming images is not taken as
+        // missing vision here: nothing confirms it.
+        let (history, note) = recover(dir.path(), Error::Provider("HTTP 400: effort must be a string".into()), 0).await;
+        assert!(crate::vision::input_has_image(&history), "{note}");
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_error_leaves_the_image_clock_running() {
+        let dir = tempfile::tempdir().unwrap();
+        picture(dir.path(), "u.jpg");
+        let mut replies = vec![now("c1"), now("c2"), Err(Error::Provider("HTTP 400: tool parameters schema invalid".into()))];
+        replies.extend((3..=9).map(|i| now(&format!("c{i}"))));
+        replies.push(text("done"));
+        let provider = Arc::new(Script::new(replies));
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut c = config(dir.path(), "what is wrong here?");
+        c.images = vec![PathBuf::from("u.jpg")];
+        run(&provider, &tools, &rec, c).await.unwrap();
+        let reqs = provider.calls.lock().unwrap();
+        let with_image: Vec<usize> = (0..reqs.len()).filter(|&i| user_has_image(&reqs[i])).collect();
+        // Sent with every answered request of its keep window, plus the one
+        // that failed: the failure did not restart the window.
+        let want: Vec<usize> = (0..=crate::vision::IMAGE_KEEP_TURNS as usize).collect();
+        assert_eq!(with_image, want);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_stops_pixels_for_the_rest_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        picture(dir.path(), "p.jpg");
+        picture(dir.path(), "u.jpg");
+        let mut script = Script::new(vec![calls(&[("c1", "read_image", r#"{"path":"p.jpg"}"#)]), text("worked from the paths")]);
+        script.refuse = Some("Image inputs are not supported by this model.");
+        let provider = Arc::new(script);
+        let tools = ToolRegistry::new(vec![Box::new(ReadImageTool::new(dir.path().to_path_buf()))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        // Pasted later: it must not bring the refusal back.
+        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        tx.send(UserTurn { text: "and this one".into(), images: vec![PathBuf::from("u.jpg")] }).unwrap();
+        drop(tx);
+        let mut c = config(dir.path(), "what is wrong here?");
+        c.images = vec![PathBuf::from("u.jpg")];
+        c.inbox = Some(rx);
+        run(&provider, &tools, &rec, c).await.unwrap();
+        let reqs = provider.calls.lock().unwrap();
+        assert_eq!(reqs.len(), 3, "refused once only");
+        assert!(user_has_image(&reqs[0]));
+        let note = reqs[1].input.last().unwrap()["content"].as_str().unwrap();
+        assert!(note.contains("cannot view images") && note.contains("Do not call read_image"), "{note}");
+        let sent: Value = serde_json::from_str(output_of(&reqs[2], "c1")["output"].as_str().unwrap()).unwrap();
+        assert_eq!(sent["attach_image"], false);
+        assert!(sent["attach_error"].as_str().unwrap().contains("cannot view images"), "{sent}");
+        assert!(!crate::vision::input_has_image(&reqs[2].input));
+        let pasted = reqs[2].input.last().unwrap()["content"].as_str().unwrap();
+        assert!(pasted.contains("and this one") && pasted.contains("(image file: u.jpg)"), "{pasted}");
+        let events = rec.0.lock().unwrap();
+        let told = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("無法看圖")))
+            .count();
+        assert_eq!(told, 1, "the user hears it once");
+    }
+
+    /// A screenshot taken just as the user presses Esc.
+    struct EscShot(CancelFlag);
+
+    impl ClientTool for EscShot {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec { name: "screenshot".into(), description: "shot".into(), parameters: json!({"type": "object"}) }
+        }
+
+        fn call(&self, _args: &Value) -> ToolCallFut<'_> {
+            let esc = self.0.clone();
+            Box::pin(async move {
+                esc.trip();
+                Ok(json!({"path": "p.jpg", "attach_image": true, "mime": "image/jpeg"}).to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn esc_while_the_image_loads_says_it_was_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        picture(dir.path(), "p.jpg");
+        let provider = Arc::new(Script::new(vec![calls(&[("c1", "screenshot", "{}")]), text("stopped")]));
+        let esc = CancelFlag::new();
+        let tools = ToolRegistry::new(vec![Box::new(EscShot(esc.clone()))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        tx.send(UserTurn::from("go on".to_string())).unwrap();
+        drop(tx);
+        let mut c = config(dir.path(), "check the UI");
+        c.cancel = Some(esc);
+        c.inbox = Some(rx);
+        run(&provider, &tools, &rec, c).await.unwrap();
+        let events = rec.0.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Notice { message, .. } if message.contains("使用者中斷"))),
+            "the run takes the interrupt path"
+        );
+        let shown = finished_output(&events, "c1");
+        assert_eq!(shown["attach_image"], false, "{shown}");
+        assert!(shown["attach_error"].as_str().unwrap().contains("interrupted"), "{shown}");
+        let reqs = provider.calls.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let sent: Value = serde_json::from_str(output_of(&reqs[1], "c1")["output"].as_str().unwrap()).unwrap();
+        assert_eq!(sent, shown);
+        assert!(!crate::vision::input_has_image(&reqs[1].input));
     }
 }
 

@@ -656,12 +656,22 @@ fn drop_images(payload: &mut Value, model: &str) {
 /// model, a llama.cpp server without its vision projector), as opposed to
 /// a failure unrelated to images. Only acted on when the request carried
 /// images, and only remembered once the same request without them succeeds.
-fn refuses_images(body: &str) -> bool {
+pub(crate) fn refuses_images(body: &str) -> bool {
     let s = body.to_ascii_lowercase();
+    // One bad, oversized or filtered image is not a model without vision
+    // (OpenAI: "You uploaded an unsupported image. Please make sure…").
+    let bad_image = ["unsupported image", "invalid image", "too large", "safety", "content policy"]
+        .iter()
+        .any(|k| s.contains(k));
+    if bad_image {
+        return false;
+    }
     let about = ["image", "vision", "multimodal", "mmproj"].iter().any(|k| s.contains(k));
     let refused = [
         "not support", "unsupported", "unknown variant", "only supported", "not a multimodal",
-        "text-only", "text only", "does not accept", "not enabled", "not allowed", "mmproj",
+        "text-only", "text only", "does not accept", "not enabled", "mmproj",
+        // OpenRouter: "No endpoints found that support image input".
+        "support image input",
     ]
     .iter()
     .any(|k| s.contains(k));
@@ -726,6 +736,7 @@ mod agent_tests {
             r#"{"error":{"message":"Invalid content type. image_url is only supported by certain models."}}"#,
             r#"{"object":"error","message":"Qwen3-8B is not a multimodal model"}"#,
             r#"{"error":{"message":"messages.1.content must be a string"}}"#,
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
         ] {
             assert!(refuses_images(body), "{body}");
         }
@@ -733,6 +744,9 @@ mod agent_tests {
             r#"{"error":{"message":"Rate limit reached"}}"#,
             r#"{"error":{"message":"Invalid image: could not decode"}}"#,
             r#"{"error":{"message":"tool_choice is not supported"}}"#,
+            r#"{"error":{"message":"You uploaded an unsupported image. Please make sure your image is below 20 MB in size and is of one the following formats: ['png', 'jpeg', 'gif', 'webp'].","code":"invalid_image_format"}}"#,
+            r#"{"error":{"message":"Image too large: not supported above 20 MB"}}"#,
+            r#"{"error":{"message":"Your request was rejected by our safety system: this image is not supported"}}"#,
         ] {
             assert!(!refuses_images(body), "{body}");
         }
@@ -825,6 +839,22 @@ mod agent_tests {
         p.complete_stream(image_req(), &quiet, &quiet_server, &quiet).await.unwrap();
         p.clone().complete(image_req()).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_learns_the_refusal_too() {
+        let (base, hits, seen) = endpoint("unknown variant `image_url`, expected `text`", true).await;
+        let p = provider(base, "deepseek-chat");
+        let quiet = |_: &str| {};
+        let quiet_server = |_: &str, _: &Value| {};
+        let r = p.complete_stream(image_req(), &quiet, &quiet_server, &quiet).await.unwrap();
+        assert_eq!(r.text, "no pixels here");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refused once, then resent without the image");
+        assert!(!p.sees_images("deepseek-chat"));
+        let resent = seen.lock().unwrap()[1].clone();
+        assert_eq!(resent["stream"], true);
+        let text = resent["messages"][0]["content"].as_str().unwrap();
+        assert!(text.contains("[image omitted: deepseek-chat cannot view images]"), "{text}");
     }
 
     #[tokio::test]
