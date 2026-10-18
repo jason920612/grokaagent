@@ -439,6 +439,10 @@ pub(crate) fn spawn_title(sink: &Arc<FanoutSink>, session_id: &str, cfg: Provide
     let session_id = session_id.to_string();
     let model = model.to_string();
     let prompt = prompt.to_string();
+    // Tests build apps without a runtime, as for spawn_run.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
     tokio::spawn(async move {
         let Ok(provider) = AnyProvider::connect(&cfg, Some(model)) else {
             return;

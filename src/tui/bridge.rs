@@ -10,10 +10,10 @@ use crate::provider::ReasoningEffort;
 use crate::session;
 use crate::task;
 
-use super::app::{App, SendMode, TaskUi};
+use super::app::{task_actions, task_hold, App, SendMode, TaskAction, TaskUi};
 use super::edit::Edit;
 use super::input;
-use super::model::rows::Row;
+use super::model::rows::{proxy_label, Row};
 use super::settings::{CatalogStatus, LoginUi};
 use crate::config::ProviderKind;
 
@@ -41,6 +41,7 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         web_search: app.opts.web_search,
         dispatcher: app.opts.dispatcher,
         child_model: app.opts.child_model.clone(),
+        task_model: st.task_model.clone(),
         custom_models: !st.custom_catalog.models.is_empty(),
         import_claude,
         import_codex,
@@ -60,17 +61,25 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
             .collect(),
     };
     let task_snap = s.task.snapshot();
-    let ui_task = |mode: &str, draft: String| hub::UiTask {
+    let ui_task = |mode: &str, draft: String, criteria_draft: String| hub::UiTask {
         note: task_snap.review_note.clone(),
         mode: mode.into(),
         goal: task_snap.goal.clone(),
         draft,
-        phase: if task_snap.skip_steer { "已暫停".into() } else { task_snap.phase.label().into() },
+        criteria_draft,
+        phase: task_snap.phase.label().into(),
         checklist: task_snap
             .checklist
             .iter()
             .map(|i| hub::UiTaskItem { text: i.text.clone(), done: i.done })
             .collect(),
+        criteria: task_snap.criteria.clone(),
+        paused: task_snap.paused,
+        stopped: task_hold(&task_snap).is_some() && !task_snap.paused,
+        rounds: task_snap.rounds,
+        last_proxy: task_snap.last_proxy.clone(),
+        live: task_snap.phase.is_live(),
+        actions: task_actions(&task_snap).into_iter().filter_map(TaskAction::web_id).map(String::from).collect(),
     };
     UiSnapshot {
         session_id: app.current.clone(),
@@ -140,6 +149,7 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
                     value: a.values.get(i).cloned().unwrap_or_default(),
                 })
                 .collect(),
+            from_proxy: a.from_proxy,
         }),
         picker: app.ui.workspace_pick.as_ref().map(|p| hub::UiPicker {
             path: p.edit.text.clone(),
@@ -162,10 +172,10 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         }),
         rename: None,
         task: app.ui.task_ui.as_ref().map(|ui| match ui {
-            TaskUi::Form(edit) => ui_task("form", edit.text.clone()),
-            TaskUi::Status => ui_task("status", String::new()),
+            TaskUi::Form(f) => ui_task(if f.editing { "edit" } else { "form" }, f.goal.text.clone(), f.criteria.text.clone()),
+            TaskUi::Status(_) => ui_task("status", String::new(), String::new()),
         }),
-        task_summary: ui_task("status", String::new()),
+        task_summary: ui_task("status", String::new(), String::new()),
         receipts: app.web.receipts.clone(),
         // Without the one-time code: every browser gets the snapshot.
         web_url: app.web.url.as_deref().map(|u| u.split('?').next().unwrap_or(u).to_string()).unwrap_or_default(),
@@ -272,6 +282,7 @@ fn blank(kind: &str) -> hub::UiRow {
         path: None,
         label: None,
         source: None,
+        intent: None,
     }
 }
 
@@ -334,6 +345,13 @@ pub(crate) fn ui_row(row: &Row) -> hub::UiRow {
             source: Some(source.clone()).filter(|s| !s.is_empty()),
             ..blank("picture")
         },
+        Row::Proxy { intent, text } => hub::UiRow {
+            html: hub::text_html(text),
+            text: text.clone(),
+            label: Some(proxy_label(intent).to_string()),
+            intent: Some(intent.clone()),
+            ..blank("proxy")
+        },
     }
 }
 
@@ -357,6 +375,7 @@ pub(crate) fn row_hash(row: &Row) -> u64 {
         Row::Meta(s) => (4u8, s).hash(&mut h),
         Row::Err(s) => (5u8, s).hash(&mut h),
         Row::Picture { path, label, source } => (6u8, path, label, source).hash(&mut h),
+        Row::Proxy { intent, text } => (7u8, intent, text).hash(&mut h),
     }
     h.finish()
 }
@@ -412,6 +431,12 @@ fn receipt(app: &mut App, id: String, result: &str) {
     }
 }
 
+/// A task command from a page that showed `session_id` (empty: an older
+/// page) still means the session on screen now.
+fn shows_current(app: &App, session_id: &str) -> bool {
+    session_id.is_empty() || session_id == app.current
+}
+
 /// Apply one command from the browser.
 pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
     match cmd {
@@ -427,11 +452,41 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
                 app.rename_manual(&id, &name);
             }
         }
-        UiCommand::StartTask { session_id, goal } => {
+        UiCommand::StartTask { session_id, goal, criteria } => {
+            if session_id == app.current && !goal.trim().is_empty() {
+                // A form left open while a task started elsewhere must not
+                // replace it; the TUI offers a new task only with none set.
+                if app.cur().task.snapshot().phase != task::TaskPhase::Inactive {
+                    app.flash("已有任務，請先結束目前的任務");
+                    return;
+                }
+                let goal: String = goal.chars().take(task::MAX_GOAL).collect();
+                let criteria: String = criteria.chars().take(task::MAX_CRITERIA).collect();
+                app.start_task(&goal, &criteria);
+                app.ui.task_ui = None;
+            }
+        }
+        UiCommand::EditTask { session_id, goal, criteria } => {
             if session_id == app.current && !goal.trim().is_empty() {
                 let goal: String = goal.chars().take(task::MAX_GOAL).collect();
-                app.submit_task_goal(&goal);
+                let criteria: String = criteria.chars().take(task::MAX_CRITERIA).collect();
+                app.edit_task(&goal, &criteria);
                 app.ui.task_ui = None;
+            }
+        }
+        UiCommand::SetTaskPaused { session_id, paused } => {
+            if shows_current(app, &session_id) {
+                app.task_action(if paused { TaskAction::Pause } else { TaskAction::Resume });
+            }
+        }
+        UiCommand::ReviewTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.task_action(TaskAction::Review);
+            }
+        }
+        UiCommand::AcceptTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.task_action(TaskAction::Accept);
             }
         }
         UiCommand::UpdateQueue { session_id, request_id, index, expected, text } => {
@@ -534,17 +589,17 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
         UiCommand::OpenTask => app.open_task(),
         UiCommand::CloseTask => app.close_task(),
         UiCommand::SetTaskDraft { text } => {
-            if let Some(TaskUi::Form(edit)) = app.ui.task_ui.as_mut() {
-                *edit = Edit::at_end(text.chars().take(task::MAX_GOAL).collect::<String>());
+            if let Some(TaskUi::Form(form)) = app.ui.task_ui.as_mut() {
+                form.goal = Edit::at_end(text.chars().take(task::MAX_GOAL).collect::<String>());
             }
         }
-        UiCommand::SubmitTask => {
-            if let Some(TaskUi::Form(edit)) = &app.ui.task_ui {
-                let goal = edit.text.clone();
-                app.submit_task_goal(&goal);
+        UiCommand::SubmitTask => app.submit_task_form(),
+        // The page asked for the second press itself.
+        UiCommand::EndTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.end_task();
             }
         }
-        UiCommand::EndTask => app.end_task(),
         UiCommand::Login => app.activate_account(),
         UiCommand::Logout => app.logout(),
         UiCommand::SetProviderKind { kind } => {
@@ -571,6 +626,7 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
             app.select_model(id);
         }
         UiCommand::SetChildModel { id } => app.select_child_model(id),
+        UiCommand::SetTaskModel { id } => app.select_task_model(id),
         UiCommand::SetEffort { id } => {
             if let Some(e) = ReasoningEffort::parse(&id) {
                 app.select_effort(e);

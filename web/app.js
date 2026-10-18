@@ -47,7 +47,9 @@
   let overlayKey = "";
   let overlayComposing = false;
   let localView = {};
-  let taskDraft = "";
+  let taskDraft = { goal: "", criteria: "" };
+  let taskFormNote = "";
+  let taskEndArm = null;    // {at, sid}: 結束任務 pressed once in that session; a second press soon after ends it
   let apiKeyDraft = null;   // typed in this tab; the server never sends the key
   let overlayTop = null;
   let overlayShownAt = 0;
@@ -130,12 +132,31 @@
       localView = { settings: true }; renderOverlay();
       return send({ type: "refresh_settings" });
     }
-    if (obj.type === "open_task") { taskDraft = ""; localView = { task: true }; renderOverlay(); return true; }
-    if (obj.type === "set_task_draft") { taskDraft = obj.text; return true; }
+    if (obj.type === "open_task") {
+      taskDraft = { goal: "", criteria: "" };
+      taskFormNote = "";
+      localView = { task: { mode: snap.task_summary?.goal ? "status" : "form" } };
+      renderOverlay(); return true;
+    }
+    // 修改: the same form, prefilled from the task.
+    if (obj.type === "edit_task_form") {
+      const t = snap.task_summary || {};
+      taskDraft = { goal: t.goal || "", criteria: t.criteria || "" };
+      taskFormNote = "";
+      // The goal it was opened for: a task ended or replaced meanwhile
+      // takes the form back to the status view.
+      localView = { task: { mode: "edit", base: t.goal || "" } };
+      renderOverlay(); return true;
+    }
+    if (obj.type === "task_status") { localView = { task: { mode: "status" } }; renderOverlay(); return true; }
+    if (obj.type === "set_task_draft") { taskDraft.goal = obj.text; return true; }
     if (obj.type === "submit_task") {
-      if (!taskDraft.trim()) return false;
-      const ok = send({ type: "start_task", session_id: snap.session_id, goal: taskDraft });
-      if (ok) { localView = {}; renderOverlay(); }
+      if (!taskDraft.goal.trim()) { taskFormNote = "請填寫任務目標"; renderOverlay(); return false; }
+      taskFormNote = "";
+      const editing = localView.task?.mode === "edit";
+      const ok = send({ type: editing ? "edit_task" : "start_task", session_id: snap.session_id,
+        goal: taskDraft.goal, criteria: taskDraft.criteria });
+      if (ok) { localView = { task: { mode: "status" } }; renderOverlay(); }
       return ok;
     }
     if (obj.type === "begin_rename") {
@@ -226,11 +247,20 @@
       draftSession = s.session_id;
       composer.value = drafts.get(draftSession) || "";
       localView = {};
+      taskEndArm = null;
       // Agent tabs belong to a session.
       openTabs.length = 0;
       activeTab = "";
     }
     snap = s;
+    // A form this tab left open does not outlive the task it was for: a
+    // task started elsewhere turns the new-task form into its status, and
+    // an edit form whose task was ended or replaced goes back to status.
+    const tv = localView.task;
+    const goal = s.task_summary?.goal || "";
+    if (tv && ((tv.mode === "form" && goal) || (tv.mode === "edit" && goal !== tv.base))) {
+      localView = { task: { mode: "status" } };
+    }
     if (awaitingReceipt) {
       const receipt = (s.receipts || []).find(([id]) => id === awaitingReceipt.request_id);
       if (receipt) {
@@ -334,7 +364,7 @@
       sideView === "agents" ? logs.agents : null,
       sideView === "changes" ? logs.changes : null,
       sideView === "background" ? [logs.rail.monitors, logs.rail.backgrounds.map((b) => [b.name, b.status, b.alive, b.command]), outputPick] : null,
-      sideView === "task" ? snap.task_summary : null]);
+      sideView === "task" ? [snap.task_summary, taskEndArmed()] : null]);
     if (key === sideKey) return;
     sideKey = key;
     const title = $("side-title");
@@ -427,21 +457,96 @@
     } else if (sideView === "task") {
       const task = snap.task_summary || {};
       if (!task.goal) {
-        body.append(el("div", "side-note", "尚未設定任務目標。任務模式會用監督者檢查表，讓主代理一直做到目標完成。"));
+        body.append(el("div", "side-note", "尚未設定任務目標。任務模式讓用戶代理替你督促主代理，一直做到目標完成。"));
       } else {
-        body.append(el("div", "side-note", `目標  ${task.goal}`));
+        body.append(el("div", "side-section", "目標"), el("div", "side-note task-text", task.goal));
+        if (task.criteria) body.append(el("div", "side-section", "驗收條件／偏好"), el("div", "side-note task-text", task.criteria));
         const done = (task.checklist || []).filter((i) => i.done).length;
-        body.append(el("div", "side-section", `${task.phase} · ${done}/${(task.checklist || []).length}`));
+        body.append(el("div", "side-section", `${taskState(task)} · ${done}/${(task.checklist || []).length}`));
+        if (task.last_proxy) {
+          body.append(el("div", "side-section proxy-head", "用戶代理最新訊息"), el("div", "side-note task-text proxy-note", task.last_proxy));
+        }
+        if ((task.checklist || []).length) body.append(el("div", "side-section", "進度筆記"));
         (task.checklist || []).forEach((i) => {
           body.append(el("div", "side-item check" + (i.done ? " done" : ""), `${i.done ? "✓" : "□"} ${i.text}`));
         });
         if (task.note) body.append(el("div", "side-note", task.note));
+        const acts = el("div", "side-acts");
+        (task.actions || []).forEach((name) => {
+          const b = el("button", name === "end" ? "danger" : "", taskActionLabel(name));
+          b.type = "button";
+          b.title = `${TASK_ACTIONS[name][0]} (${TASK_ACTIONS[name][1]})`;
+          b.addEventListener("click", () => taskAction(name));
+          acts.append(b);
+        });
+        body.append(acts);
       }
       const btn = el("button", "side-btn", task.goal ? "開啟任務面板" : "設定任務目標");
       btn.type = "button";
+      btn.title = "Alt+T";
       btn.addEventListener("click", () => send({ type: "open_task" }));
       body.append(btn);
     }
+  }
+
+  // —— Task mode ——
+  // Label and the key that runs it in the status dialog.
+  const TASK_ACTIONS = {
+    pause: ["暫停", "P"], resume: ["繼續", "P"], review: ["立即審查", "R"],
+    accept: ["判定完成", "D"], edit: ["修改", "E"], end: ["結束任務", "X"],
+  };
+
+  function taskState(t) {
+    const hold = t.paused ? " · 已暫停" : t.stopped ? " · 已停止" : "";
+    return `${t.phase || ""}${hold} · 回合 ${t.rounds || 0}`;
+  }
+
+  const TASK_END_CONFIRM_MS = 4000;
+  function taskEndArmed() {
+    return !!taskEndArm && !!snap && taskEndArm.sid === snap.session_id
+      && performance.now() - taskEndArm.at < TASK_END_CONFIRM_MS;
+  }
+
+  function taskActionLabel(name) {
+    return name === "end" && taskEndArmed() ? "再按一次確認結束" : TASK_ACTIONS[name][0];
+  }
+
+  // Commands carry the session this page shows, so a click that races a
+  // session switch in the terminal does nothing.
+  function taskAction(name) {
+    const sid = snap.session_id;
+    const armed = taskEndArmed();
+    taskEndArm = null;
+    if (name === "pause" || name === "resume") return send({ type: "set_task_paused", session_id: sid, paused: name === "pause" });
+    if (name === "review") return send({ type: "review_task", session_id: sid });
+    if (name === "accept") return send({ type: "accept_task", session_id: sid });
+    if (name === "edit") return send({ type: "edit_task_form" });
+    if (name === "end" && !armed) {
+      // Ending wipes the goal, the progress notes and the proxy's memory:
+      // one stray key or click must not do that.
+      taskEndArm = { at: performance.now(), sid };
+      $("delivery").textContent = "再按一次「結束任務」確認：目標、進度筆記和用戶代理的記憶都會清除";
+      renderAll();
+      setTimeout(() => { if (!taskEndArmed()) renderAll(); }, TASK_END_CONFIRM_MS + 50);
+      return true;
+    }
+    if (name === "end") {
+      const ok = send({ type: "end_task", session_id: sid });
+      if (ok && localView.task) { localView = {}; renderOverlay(); }
+      return ok;
+    }
+    return false;
+  }
+
+  // A letter in the status dialog: the action it names, if the task allows it.
+  function taskKey(key) {
+    const t = snap.task_summary || {};
+    const acts = t.actions || [];
+    const name = { p: acts.includes("resume") ? "resume" : "pause", r: "review", d: "accept", e: "edit", x: "end" }[key.toLowerCase()];
+    if (!name) return false;
+    if (acts.includes(name)) taskAction(name);
+    else if (name === "review" && t.paused) $("delivery").textContent = "用戶代理已暫停，請先按繼續";
+    return true;
   }
 
   // —— Editor tabs ——
@@ -506,7 +611,7 @@
   function rowSig(row) {
     return JSON.stringify({
       kind: row.kind, html: row.html, text: row.text, expanded: row.expanded, done: row.done,
-      images: row.images, calls: row.calls, path: row.path, label: row.label,
+      images: row.images, calls: row.calls, path: row.path, label: row.label, intent: row.intent,
       work: row.kind === "agent" ? row.elapsed_ms : undefined,
     }) + "\0" + agentLabel();
   }
@@ -528,6 +633,7 @@
       row.kind === "think" ? "思考" :
       row.kind === "tools" ? "工具" :
       row.kind === "picture" ? "圖片" :
+      row.kind === "proxy" ? `用戶代理 · ${row.label || ""}` :
       row.kind === "err" ? "錯誤" : "系統"));
 
     if (row.kind === "think" || row.kind === "tools") {
@@ -563,7 +669,8 @@
       });
       node.append(d);
     } else {
-      const body = el("div", row.kind === "user" ? "bubble" : row.kind === "agent" ? "body" : "");
+      const body = el("div", row.kind === "user" ? "bubble" : row.kind === "agent" ? "body" :
+        row.kind === "proxy" ? `bubble proxy-bubble intent-${row.intent || ""}` : "");
       body.innerHTML = row.html;
       node.append(body);
       if (row.kind === "agent" && row.elapsed_ms) {
@@ -857,6 +964,7 @@
     right.append(el("span", "sb wide", h.logged_in ? "已登入" : "未登入"));
     const task = el("button", "sb", h.task_live ? "任務 ●" : "任務");
     task.type = "button";
+    task.title = "任務面板 (Alt+T)";
     task.addEventListener("click", () => send({ type: "open_task" }));
     const model = el("button", "sb", `${isCustom() ? "自訂 API" : "Grok"} · ${h.model}${h.effort ? " · " + h.effort : ""}`);
     model.type = "button";
@@ -887,8 +995,14 @@
     return { ...snap, settings: null, task: null, rename: null, inspector: null, image_view: null,
       tool_panel: null, ...localView,
       settings: localView.settings ? snap.settings_data : null,
-      task: localView.task ? { ...snap.task_summary, draft: taskDraft,
-        mode: snap.task_summary?.goal ? "status" : "form" } : null };
+      task: localView.task ? taskView(localView.task.mode) : null };
+  }
+
+  // The form keeps its drafts in this tab; only the status view follows the task.
+  function taskView(mode) {
+    const t = snap.task_summary || {};
+    if (mode === "status") return t.goal ? { ...t, mode: "status", end_armed: taskEndArmed() } : { mode: "form", note: taskFormNote };
+    return { mode, note: taskFormNote };
   }
 
   // Server-driven prompts come first: an agent's question must not hide
@@ -910,7 +1024,7 @@
     if (!o || overlayComposing) return;
     const key = JSON.stringify([o.session_id, o.settings,
       o.rename && o.rename.id,
-      o.task && { ...o.task, draft: undefined },
+      o.task,
       o.ask && { ...o.ask, options: o.ask.options.map(x => ({ ...x, value: undefined })) },
       o.picker, o.inspector && [o.inspector, logs.rail.monitors], o.image_view, o.image_source,
       o.skill_view, o.queue_editor && { ...o.queue_editor, text: undefined },
@@ -940,21 +1054,51 @@
     overlay.replaceChildren();
     const modal = el("div", "modal");
     if (top === "ask") {
+      if (o.ask.from_proxy) modal.append(el("p", "ask-from", "任務代理想確認最終效果"));
       modal.append(h2(o.ask.prompt));
+      // A stray Enter meant for the composer must not answer as the dialog appears.
+      const settled = () => performance.now() - overlayShownAt > 400;
       o.ask.options.forEach((opt, i) => {
         const row = el("div", "opt" + (opt.chosen ? " on" : ""));
+        row.tabIndex = 0;
+        row.setAttribute("role", o.ask.allow_multiple ? "checkbox" : "radio");
+        row.setAttribute("aria-checked", String(!!opt.chosen));
+        row.dataset.field = "ask-opt-" + i;
         row.append(el("span", "", opt.chosen ? (o.ask.allow_multiple ? "☑" : "●") : (o.ask.allow_multiple ? "☐" : "○")), el("span", "", opt.label));
         row.addEventListener("click", () => send({ type: "ask_toggle", index: i }));
+        row.addEventListener("keydown", (e) => {
+          if (e.target !== row || e.isComposing) return;
+          if (e.key === " ") { e.preventDefault(); send({ type: "ask_toggle", index: i }); }
+          if (e.key === "Enter" && settled()) {
+            e.preventDefault();
+            // As in the terminal: Enter opens a field, answers a multiple
+            // choice as ticked, and picks a single choice and answers.
+            if (opt.input) { row.querySelector("input")?.focus(); send({ type: "ask_toggle", index: i }); return; }
+            if (!o.ask.allow_multiple) send({ type: "ask_toggle", index: i });
+            send({ type: "ask_confirm" });
+          }
+        });
         if (opt.input) {
           const inp = el("input");
           inp.type = "text";
           inp.value = opt.value;
+          inp.dataset.field = "ask-fill-" + i;
           inp.addEventListener("click", (e) => e.stopPropagation());
           inp.addEventListener("input", () => send({ type: "ask_fill", index: i, text: inp.value }));
+          inp.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.isComposing && settled()) {
+              e.preventDefault();
+              send({ type: "ask_fill", index: i, text: inp.value });
+              send({ type: "ask_confirm" });
+            }
+          });
           row.append(inp);
         }
         modal.append(row);
       });
+      modal.append(el("p", "hint", o.ask.allow_multiple
+        ? "Tab 移動 · 空白鍵勾選 · 點選或填寫後按確定"
+        : "Tab 移動 · Enter 選擇 · 可填寫項輸入後按 Enter"));
       addBtns(modal, [["取消", () => send({ type: "ask_cancel" })], ["確定", () => send({ type: "ask_confirm" })]]);
     } else if (top === "picker") {
       modal.append(h2("選擇工作目錄"));
@@ -1053,21 +1197,59 @@
       modal.append(inp);
       addBtns(modal, [["取消", () => send({ type: "cancel_rename" })], ["確定", () => send({ type: "commit_rename", text: inp.value })]]);
     } else if (top === "task") {
-      if (o.task.mode === "form") {
-        modal.append(h2("任務目標"));
-        const ta = el("textarea");
-        ta.rows = 6;
-        ta.value = o.task.draft || "";
-        ta.placeholder = "這則對話要達成什麼？";
-        ta.addEventListener("input", () => send({ type: "set_task_draft", text: ta.value }));
-        modal.append(ta);
-        addBtns(modal, [["取消", () => send({ type: "close_task" })], ["確定", () => send({ type: "submit_task" })]]);
+      const t = o.task;
+      if (t.mode === "form" || t.mode === "edit") {
+        modal.append(h2(t.mode === "edit" ? "修改任務" : "任務目標"));
+        modal.append(el("p", "hint", "Ctrl+Enter 確定 · Esc 取消"));
+        const area = (title, key, rows, placeholder) => {
+          const wrap = el("div", "field");
+          wrap.append(label(title));
+          const ta = el("textarea");
+          ta.rows = rows;
+          ta.value = taskDraft[key];
+          ta.placeholder = placeholder;
+          ta.dataset.field = "task-" + key;
+          ta.addEventListener("input", () => { taskDraft[key] = ta.value; });
+          ta.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send({ type: "submit_task" }); }
+          });
+          wrap.append(ta);
+          return wrap;
+        };
+        modal.append(area("目標（必填）", "goal", 5, "這則對話要達成什麼？"));
+        modal.append(area("驗收條件／偏好（選填）", "criteria", 4, "怎樣才算完成、你的偏好或限制"));
+        if (t.note) modal.append(el("p", "hint warn", t.note));
+        addBtns(modal, [["取消", () => send(t.mode === "edit" ? { type: "task_status" } : { type: "close_task" })],
+          ["確定", () => send({ type: "submit_task" })]]);
       } else {
-        modal.append(h2("任務模式  ·  " + (o.task.phase || "")));
-        modal.append(el("p", "", "目標  " + (o.task.goal || "")));
-        modal.append(el("pre", "", (o.task.checklist || []).map((i) => (i.done ? "[x] " : "[ ] ") + i.text).join("\n") || "（尚無檢查表）"));
-        if (o.task.note) modal.append(el("p", "hint", o.task.note));
-        addBtns(modal, [["關閉", () => send({ type: "close_task" })], ["結束任務", () => send({ type: "end_task" })]]);
+        modal.append(h2("任務模式  ·  " + taskState(t)));
+        const section = (title, text, cls) => {
+          modal.append(el("h3", cls || "", title));
+          modal.append(el("div", "task-text " + (cls || ""), text));
+        };
+        section("目標", t.goal || "");
+        if (t.criteria) section("驗收條件／偏好", t.criteria);
+        if (t.last_proxy) section("用戶代理最新訊息", t.last_proxy, "proxy-msg");
+        const done = (t.checklist || []).filter((i) => i.done).length;
+        section(`進度筆記  ${done}/${(t.checklist || []).length}`,
+          (t.checklist || []).map((i) => (i.done ? "✓ " : "□ ") + i.text).join("\n") || "（用戶代理尚未寫下進度）");
+        if (t.note) modal.append(el("p", "hint", t.note));
+        modal.append(el("p", "hint", "按鈕上的字母鍵可直接執行 · Esc 關閉"));
+        const row = el("div", "row-btns task-acts");
+        (t.actions || []).forEach((name) => {
+          const b = el("button", name === "end" ? "danger" : "", `${taskActionLabel(name)} (${TASK_ACTIONS[name][1]})`);
+          b.type = "button";
+          // Pause and resume are one button: focus stays on it as it flips.
+          b.dataset.field = "task-act-" + (name === "resume" ? "pause" : name);
+          b.addEventListener("click", () => taskAction(name));
+          row.append(b);
+        });
+        const close = el("button", "", "關閉");
+        close.type = "button";
+        close.dataset.field = "task-act-close";
+        close.addEventListener("click", () => send({ type: "close_task" }));
+        row.append(close);
+        modal.append(row);
       }
     } else if (top === "skill_view") {
       modal.append(h2(o.skill_view.title + "  ·  " + o.skill_view.origin));
@@ -1123,6 +1305,9 @@
       // Not a button: Enter meant for the composer must not answer or cancel it.
       modal.tabIndex = -1;
       (modal.querySelector("input") || modal).focus();
+    } else if (top === "task" && o.task.mode === "status") {
+      // As in the terminal, Enter closes until the user picks an action.
+      modal.querySelector('[data-field="task-act-close"]')?.focus();
     } else {
       modal.querySelector("input, textarea, button")?.focus();
     }
@@ -1142,7 +1327,7 @@
       queue_editor: { type: "close_queue_editor" },
       image_view: { type: "close_image" },
       rename: { type: "cancel_rename" },
-      task: { type: "close_task" },
+      task: o.task?.mode === "edit" ? { type: "task_status" } : { type: "close_task" },
       skill_view: { type: "close_skill" },
       inspector: { type: "close_inspector" },
       agent_info: { type: "close_agent_info" },
@@ -1173,9 +1358,11 @@
       if (st.custom_models) {
         modal.append(selectField("模型（端點＋Grok）", "model", st.models, snap.header.model, (id) => send({ type: "set_model", id })));
         modal.append(selectField("子代理模型", "child_model", [["", "跟隨主模型"], ...(st.models || [])], st.child_model || "", (id) => send({ type: "set_child_model", id })));
+        modal.append(taskModelField(st));
       } else {
         modal.append(textField("模型名", "model", snap.header.model, (v) => send({ type: "set_model", id: v })));
         modal.append(textField("子代理模型（留空＝同主模型）", "child_model", st.child_model || "", (v) => send({ type: "set_child_model", id: v })));
+        modal.append(textField("任務代理模型（留空＝同主模型）", "task_model", st.task_model || "", (v) => send({ type: "set_task_model", id: v })));
       }
       modal.append(apiKeyField(st.has_api_key));
       modal.append(textField("上下文", "context", st.context || "", (v) => send({ type: "set_context", text: v })));
@@ -1208,6 +1395,7 @@
       modal.append(acc);
       modal.append(selectField("模型", "model", st.models, snap.header.model, (id) => send({ type: "set_model", id })));
       modal.append(selectField("子代理模型", "child_model", [["", "跟隨主模型"], ...(st.models || [])], st.child_model || "", (id) => send({ type: "set_child_model", id })));
+      modal.append(taskModelField(st));
       modal.append(selectField("思考強度", "effort", st.efforts, effortId(st), (id) => send({ type: "set_effort", id })));
       const search = el("button", "", st.web_search ? "搜尋：開" : "搜尋：關");
       search.type = "button";
@@ -1238,6 +1426,12 @@
       modal.append(row);
     });
     addClose(modal, () => send({ type: "close_settings" }));
+  }
+
+  // The model the task-mode user proxy runs on; empty follows the main model.
+  function taskModelField(st) {
+    return selectField("任務代理模型", "task_model", [["", "跟主模型相同"], ...(st.models || [])], st.task_model || "",
+      (id) => send({ type: "set_task_model", id }));
   }
 
   function effortId(st) {
@@ -1334,6 +1528,19 @@
     const mod = e.ctrlKey || e.metaKey;
     if (mod && !e.shiftKey && (e.key === "b" || e.key === "B")) { e.preventDefault(); setSide(); return; }
     if (mod && !e.shiftKey && (e.key === "j" || e.key === "J")) { e.preventDefault(); setPanel(); return; }
+    if (e.altKey && !mod && e.code === "KeyT") {
+      e.preventDefault();
+      // A toggle for the status view; an open form keeps what was typed.
+      const shown = overlaySnapshot()?.task;
+      if (!shown) send({ type: "open_task" });
+      else if (shown.mode === "status") send({ type: "close_task" });
+      return;
+    }
+    if (!mod && !e.altKey && e.key.length === 1 && overlayTop === "task" && localView.task?.mode === "status"
+        && !editable(e.target) && taskKey(e.key)) {
+      e.preventDefault();
+      return;
+    }
     if (e.altKey && /^[0-5]$/.test(e.key)) {
       e.preventDefault();
       if (e.key === "0") activate("");

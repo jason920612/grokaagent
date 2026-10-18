@@ -8,8 +8,7 @@ pub(crate) use burst::PasteBurst;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::task;
-use crate::tui::app::{App, BottomTab, Focus, SideView, Tab, TaskUi};
+use crate::tui::app::{task_actions, App, BottomTab, Focus, SideView, Tab, TaskAction, TaskStatus, TaskUi};
 use crate::tui::edit::{clipboard_set, is_paste_key};
 use crate::tui::settings::{DropKind, Field};
 use crate::config::ProviderKind;
@@ -61,9 +60,9 @@ fn paste(app: &mut App, s: &str) {
     } else if let Some(a) = app.cur_mut().ask.as_mut().filter(|a| a.filling) {
         let remain = crate::ask::MAX_INPUT.saturating_sub(a.fill.len());
         a.fill.insert_str(&s.chars().take(remain).collect::<String>());
-    } else if let Some(TaskUi::Form(edit)) = app.ui.task_ui.as_mut() {
-        let remain = task::MAX_GOAL.saturating_sub(edit.len());
-        edit.insert_str(&s.chars().take(remain).collect::<String>());
+    } else if let Some(TaskUi::Form(form)) = app.ui.task_ui.as_mut() {
+        let remain = form.limit().saturating_sub(form.field_mut().len());
+        form.field_mut().insert_str(&s.chars().take(remain).collect::<String>());
     } else if let Some((_, edit)) = app.ui.rename.as_mut() {
         edit.insert_str(&one_line());
     } else if app.ui.skill_view.is_some() {
@@ -129,6 +128,10 @@ fn key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         if code == KeyCode::Esc {
             app.ui.inspector = None;
         }
+        return false;
+    }
+    if (ctrl || mods.contains(KeyModifiers::ALT)) && matches!(code, KeyCode::Char('t' | 'T')) {
+        app.open_task();
         return false;
     }
     if code == KeyCode::F(2) || (ctrl && matches!(code, KeyCode::Char('g' | 'G'))) {
@@ -478,33 +481,92 @@ pub(crate) fn submit_ask(app: &mut App) {
 }
 
 fn task_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    match app.ui.task_ui {
+        Some(TaskUi::Form(_)) => task_form_key(app, code, mods),
+        Some(TaskUi::Status(_)) => task_status_key(app, code, mods),
+        None => {}
+    }
+}
+
+fn task_form_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     let shift = mods.contains(KeyModifiers::SHIFT);
     let ctrl = mods.contains(KeyModifiers::CONTROL);
-    match app.ui.task_ui.as_mut() {
-        Some(TaskUi::Form(edit)) => match code {
-            KeyCode::Esc => app.close_task(),
-            KeyCode::Enter if !shift => {
-                let goal = edit.text.clone();
-                app.submit_task_goal(&goal);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let widths = app.ui.task_fields.map(|r| r.width.max(1));
+    let Some(TaskUi::Form(form)) = app.ui.task_ui.as_mut() else { return };
+    match code {
+        KeyCode::Esc => cancel_task_form(app),
+        // The dialog key does not throw away what was typed; Esc does.
+        KeyCode::Char('t' | 'T') if ctrl || alt => {}
+        KeyCode::Tab | KeyCode::BackTab => form.on_criteria = !form.on_criteria,
+        KeyCode::Enter if shift => {
+            let limit = form.limit();
+            let edit = form.field_mut();
+            if edit.len() < limit {
+                edit.insert_char('\n');
             }
-            KeyCode::Char('s') if ctrl => {
-                let goal = edit.text.clone();
-                app.submit_task_goal(&goal);
+        }
+        KeyCode::Enter => {
+            // The first Enter while an IME composes confirms it; it is no submit.
+            if !crate::hostio::ime_composing() {
+                app.submit_task_form();
             }
-            KeyCode::Enter => {
-                if edit.len() < task::MAX_GOAL {
-                    edit.insert_char('\n');
-                }
-            }
-            _ => {
-                edit.apply_key(code, mods, task::MAX_GOAL);
-            }
-        },
-        Some(TaskUi::Status) => match code {
-            KeyCode::Esc | KeyCode::Enter => app.close_task(),
-            _ => {}
-        },
-        None => {}
+        }
+        KeyCode::Char('s' | 'S') if ctrl => app.submit_task_form(),
+        KeyCode::Up | KeyCode::Down => {
+            let width = widths[usize::from(form.on_criteria)];
+            form.field_mut().move_visual(width, if code == KeyCode::Up { -1 } else { 1 }, shift);
+        }
+        _ => {
+            let limit = form.limit();
+            form.field_mut().apply_key(code, mods, limit);
+        }
+    }
+}
+
+/// Esc or 取消: an edit goes back to the status dialog, a new goal closes.
+pub(crate) fn cancel_task_form(app: &mut App) {
+    if matches!(&app.ui.task_ui, Some(TaskUi::Form(f)) if f.editing) {
+        app.ui.task_ui = Some(TaskUi::Status(TaskStatus { focus: TaskAction::Edit, scroll: 0 }));
+    } else {
+        app.close_task();
+    }
+}
+
+fn task_status_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let acts = task_actions(&app.cur().task.snapshot());
+    let Some(TaskUi::Status(st)) = app.ui.task_ui.as_mut() else { return };
+    let n = acts.len();
+    let at = acts.iter().position(|a| a.same(st.focus));
+    match code {
+        KeyCode::Esc => app.close_task(),
+        KeyCode::Char('t' | 'T') if ctrl || alt => app.close_task(),
+        KeyCode::Left | KeyCode::BackTab => st.focus = acts[(at.unwrap_or(0) + n - 1) % n],
+        KeyCode::Right | KeyCode::Tab => st.focus = acts[at.map_or(0, |i| i + 1) % n],
+        KeyCode::Up => st.scroll = st.scroll.saturating_sub(1),
+        KeyCode::Down => st.scroll = st.scroll.saturating_add(1),
+        KeyCode::PageUp => st.scroll = st.scroll.saturating_sub(8),
+        KeyCode::PageDown => st.scroll = st.scroll.saturating_add(8),
+        KeyCode::Home => st.scroll = 0,
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let act = at.map_or(TaskAction::Close, |i| acts[i]);
+            app.task_action(act);
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            let act = match c.to_ascii_lowercase() {
+                'p' if acts.contains(&TaskAction::Resume) => TaskAction::Resume,
+                'p' => TaskAction::Pause,
+                'r' => TaskAction::Review,
+                'd' => TaskAction::Accept,
+                'e' => TaskAction::Edit,
+                'x' => TaskAction::End,
+                _ => return,
+            };
+            app.task_action(act);
+        }
+        _ => {}
     }
 }
 
@@ -613,6 +675,9 @@ fn settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Field::Model if app.settings.model_picker() && (activate || code == KeyCode::Down) => app.open_drop(DropKind::Model),
         Field::ChildModel if app.settings.model_picker() && (activate || code == KeyCode::Down) => {
             app.open_drop(DropKind::ChildModel)
+        }
+        Field::TaskModel if app.settings.model_picker() && (activate || code == KeyCode::Down) => {
+            app.open_drop(DropKind::TaskModel)
         }
         Field::Effort => match code {
             KeyCode::Left => app.cycle_effort(true),

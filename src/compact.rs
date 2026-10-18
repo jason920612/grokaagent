@@ -567,7 +567,8 @@ pub fn original_request(history: &[Value], goal: &str) -> String {
                 Some(clip_goal(goal.trim().trim_end_matches("Work toward it.").trim()))
             })
         })
-        .unwrap_or_else(|| clip_goal(goal))
+        // Never the task kick marker: it is no request at all.
+        .unwrap_or_else(|| if crate::task::is_kick(goal) { String::new() } else { clip_goal(goal) })
 }
 
 /// The user's own messages from `head`, verbatim, newest first within
@@ -1767,5 +1768,19 @@ Work toward it.", crate::notice::TASK_MODE)),
         assert!(f.method == "lived-chunked" || f.method == "lived-slim", "{}", f.method);
         let mem = previous_memory(&f.items).expect("a memory item");
         assert!(mem.contains("fact from chunk"), "{mem}");
+    }
+}
+
+#[cfg(test)]
+mod task_goal_tests {
+    use super::*;
+
+    #[test]
+    fn the_kick_marker_is_never_the_original_request() {
+        let proxy = json!({"role": "user", "content": format!("{} Message from the user's proxy.\n\nWrite the tests.", crate::notice::USER_PROXY)});
+        assert_eq!(original_request(&[proxy.clone()], crate::task::KICK), "");
+        // The kernel passes the task goal instead.
+        assert_eq!(original_request(&[proxy.clone()], "做登入"), "做登入");
+        assert!(keep_user_words(&[proxy], 10_000).is_empty(), "the proxy's words are not the user's");
     }
 }
