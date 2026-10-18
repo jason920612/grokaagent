@@ -31,6 +31,8 @@ const PREFIXES: &[&str] = &[
     crate::background::CLOSED_NOTICE_PREFIX,
     crate::timer::FIRED_NOTICE_PREFIX,
     crate::task::KICK,
+    crate::workflow::NOTICE_PREFIX,
+    crate::workflow::CLOSED_NOTICE_PREFIX,
 ];
 
 /// Whether `text` is a message the harness wrote in the user's place.

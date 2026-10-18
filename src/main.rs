@@ -128,6 +128,14 @@ enum Command {
         /// other backends when a Grok login exists.
         #[arg(long)]
         search: bool,
+        /// JSON file with a result schema: the child hands in its answer
+        /// through `submit_result` (a workflow agent's structured output).
+        #[arg(long)]
+        result_schema: Option<PathBuf>,
+        /// Stdin is a pipe the parent holds: exit when it closes, so a child
+        /// never outlives a parent that was killed.
+        #[arg(long)]
+        lifeline: bool,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -374,6 +382,9 @@ async fn real_main() -> grokaagent::Result<()> {
                     cancel: None,
                     skills: None,
                     task: hub.clone(),
+                    result_schema: None,
+                    workflows: true,
+                    hold_for_workflows: true,
                 },
             )
             .await;
@@ -415,8 +426,25 @@ async fn real_main() -> grokaagent::Result<()> {
             max_turns,
             reasoning,
             search,
+            result_schema,
+            lifeline,
             api,
         }) => {
+            if lifeline {
+                std::thread::spawn(|| {
+                    let mut sink = [0u8; 256];
+                    let mut stdin = io::stdin();
+                    while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+                    std::process::exit(0);
+                });
+            }
+            let result_schema = match result_schema {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)?;
+                    Some(serde_json::from_str::<serde_json::Value>(&text)?)
+                }
+                None => None,
+            };
             let (_, model) = boot_provider(api, model, false)?;
             worker::run_worker(WorkerConfig {
                 name,
@@ -434,6 +462,7 @@ async fn real_main() -> grokaagent::Result<()> {
                 max_turns,
                 reasoning_effort: reasoning,
                 search,
+                result_schema,
             })
             .await?;
         }

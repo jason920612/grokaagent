@@ -534,6 +534,7 @@ mod tests {
             finish: "stop".into(),
             input_tokens: 100,
             cached_tokens: 90,
+            output_tokens: 0,
         }
     }
 

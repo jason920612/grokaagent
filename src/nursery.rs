@@ -355,7 +355,10 @@ impl Nursery {
         if self.child_search() {
             cmd.arg("--search");
         }
-        cmd.stdin(std::process::Stdio::null())
+        // The child holds the read end of stdin: if this process dies, the
+        // pipe closes and the child exits instead of running on unseen.
+        cmd.arg("--lifeline");
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -990,7 +993,7 @@ async fn watch_child(w: Watch, path: PathBuf, mut stop: oneshot::Receiver<()>) {
     }
 }
 
-async fn read_new(path: &Path, offset: &mut u64, leftover: &mut String, mut each: impl FnMut(&str)) {
+pub(crate) async fn read_new(path: &Path, offset: &mut u64, leftover: &mut String, mut each: impl FnMut(&str)) {
     let Ok(mut f) = tokio::fs::OpenOptions::new().read(true).open(path).await else {
         return;
     };
@@ -1329,6 +1332,7 @@ mod tests {
                 finish: "stop".into(),
                 input_tokens: 0,
                 cached_tokens: 0,
+                output_tokens: 0,
             }),
             ev_line(&AgentEvent::AwaitingInput { meta: own_meta("c1", "") }),
         ];

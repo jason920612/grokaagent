@@ -63,6 +63,14 @@ pub struct KernelSpec {
     /// Shared with the TUI so Settings toggles apply on the next turn.
     pub skills: Option<std::sync::Arc<std::sync::Mutex<SkillStore>>>,
     pub task: Option<std::sync::Arc<crate::task::TaskHub>>,
+    /// A workflow agent asked for structured output: it gets
+    /// `submit_result` with these parameters, and an accepted call ends
+    /// its turn chain with the result as its answer.
+    pub result_schema: Option<serde_json::Value>,
+    /// Offer the workflow tools (the root agent only).
+    pub workflows: bool,
+    /// Keep a run without an inbox alive while a workflow runs (headless).
+    pub hold_for_workflows: bool,
 }
 
 pub async fn run_with_nursery<P: Provider + Clone + 'static>(
@@ -99,10 +107,18 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         spec.parent_run_id.clone(),
         Some(bg_tx.clone()),
     );
-    let tee: Arc<dyn EventSink> = Arc::new(MonitorSink {
+    let is_root = spec.parent_run_id.is_none();
+    let offer_workflows = spec.workflows && is_root && spec.depth == 0;
+    let budget = Arc::new(crate::workflow::TokenBudget::default());
+    let mut tee: Arc<dyn EventSink> = Arc::new(MonitorSink {
         inner: sink,
         hub: hub.clone(),
     });
+    if offer_workflows {
+        // Every model turn (the root's, children's, workflow agents') passes
+        // here on its way out: count it toward the turn's token target.
+        tee = Arc::new(crate::workflow::BudgetSink { inner: tee, budget: budget.clone() });
+    }
     let guard: Arc<dyn CommandReviewer> = Arc::new(ProviderGuard::new(
         provider.clone(),
         spec.model.clone(),
@@ -209,14 +225,46 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     } else {
         None
     };
-    let is_root = spec.parent_run_id.is_none();
+    let workflows = if offer_workflows {
+        let hub = crate::workflow::WorkflowHub::new(
+            crate::workflow::HubConfig {
+                workspace: spec.workspace.clone(),
+                worker_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grokaagent")),
+                root_name: spec.agent_name.clone(),
+                root_run: run_id.clone(),
+                model: spec.model.clone(),
+                effort: spec.reasoning_effort,
+                child_mode: spec.child_mode.clone(),
+                search: spec.search,
+                knobs: spec.knobs.clone(),
+            },
+            tee.clone(),
+            Some(bg_tx.clone()),
+            budget.clone(),
+        )?;
+        tools.push(Box::new(crate::workflow::WorkflowTool::new(hub.clone())));
+        tools.push(Box::new(crate::workflow::StopWorkflowTool::new(hub.clone())));
+        Some(hub)
+    } else {
+        None
+    };
     let persist_id = run_id.clone();
     let closed_backgrounds = if is_root {
-        crate::session::SessionStore::open()
-            .ok()
+        let store = crate::session::SessionStore::open().ok();
+        let backgrounds = store
+            .as_ref()
             .map(|s| s.take_closed_backgrounds::<crate::background::ClosedBackground>(&persist_id))
             .filter(|v| !v.is_empty())
-            .map(|items| crate::background::format_closed_notice(&items))
+            .map(|items| crate::background::format_closed_notice(&items));
+        let runs = store
+            .as_ref()
+            .map(|s| s.take_closed_workflows::<crate::workflow::ClosedRun>(&persist_id))
+            .filter(|v| !v.is_empty())
+            .map(|items| crate::workflow::format_closed_notice(&items));
+        match (backgrounds, runs) {
+            (Some(b), Some(w)) => Some(format!("{b}\n\n{w}")),
+            (b, w) => b.or(w),
+        }
     } else {
         None
     };
@@ -238,6 +286,10 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
     } else {
         None
     };
+    let terminal_tool = spec.result_schema.clone().map(|schema| {
+        tools.push(Box::new(crate::workflow::submit::SubmitResultTool::new(schema)));
+        crate::workflow::submit::NAME.to_string()
+    });
     let tools = ToolRegistry::new(tools);
     let out = agent::run(
         provider,
@@ -266,9 +318,25 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
             cancel: spec.cancel,
             skills: Some(skills),
             task: spec.task,
+            terminal_tool,
+            hold: workflows.clone().filter(|_| spec.hold_for_workflows).map(|h| {
+                Arc::new(move || h.running() > 0) as Arc<dyn Fn() -> bool + Send + Sync>
+            }),
+            on_user_turn: workflows.as_ref().map(|h| {
+                let budget = h.budget();
+                Arc::new(move |text: &str| budget.user_turn(text)) as Arc<dyn Fn(&str) + Send + Sync>
+            }),
         },
     )
     .await;
+    if let Some(w) = &workflows {
+        let closed = w.shutdown().await;
+        if is_root && !closed.is_empty() {
+            if let Ok(store) = crate::session::SessionStore::open() {
+                let _ = store.save_closed_workflows(&persist_id, &closed);
+            }
+        }
+    }
     hub.shutdown().await;
     let _ = bg.begin_shutdown();
     timers.shutdown();
@@ -498,6 +566,9 @@ mod tests {
             cancel: None,
             skills: None,
             task,
+            result_schema: None,
+            workflows: false,
+            hold_for_workflows: false,
         }
     }
 
@@ -622,7 +693,7 @@ mod tests {
             assert!(hub.take_review_request());
             driver.emit(&proxy);
         }
-        driver.emit(&AgentEvent::ModelFinished { meta: m(), text: "ok".into(), finish: "stop".into(), input_tokens: 0, cached_tokens: 0 });
+        driver.emit(&AgentEvent::ModelFinished { meta: m(), text: "ok".into(), finish: "stop".into(), input_tokens: 0, cached_tokens: 0, output_tokens: 0 });
         driver.emit(&wait_event());
         assert!(hub.take_review_request());
         assert!(!closed(&mut rx));
@@ -717,6 +788,9 @@ mod tests {
             cancel: None,
             skills: None,
             task: Some(hub.clone()),
+            terminal_tool: None,
+            hold: None,
+            on_user_turn: None,
         };
         let tools = ToolRegistry::new(vec![]);
         let out = tokio::time::timeout(std::time::Duration::from_secs(10), agent::run(provider, &tools, driver.as_ref(), cfg))

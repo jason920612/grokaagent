@@ -60,6 +60,8 @@ pub struct WorkerConfig {
     pub reasoning_effort: crate::provider::ReasoningEffort,
     /// Parent's search toggle; the tools follow this child's model route.
     pub search: bool,
+    /// A workflow agent's result schema (see [`crate::workflow::submit`]).
+    pub result_schema: Option<Value>,
 }
 
 struct Session {
@@ -101,6 +103,7 @@ struct WorkerConfigView {
     depth: u32,
     reasoning_effort: crate::provider::ReasoningEffort,
     search: bool,
+    result_schema: Option<Value>,
 }
 
 pub struct BoundWorker {
@@ -217,6 +220,7 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
             depth: cfg.depth,
             reasoning_effort: cfg.reasoning_effort,
             search: cfg.search,
+            result_schema: cfg.result_schema.clone(),
         },
         book,
         interrupting,
@@ -366,6 +370,9 @@ async fn run_session<P: Provider + Clone + 'static>(
             cancel: Some(cancel),
             skills: None,
             task: None,
+            result_schema: st.cfg.result_schema.clone(),
+            workflows: false,
+            hold_for_workflows: false,
         },
     )
     .await?;
@@ -464,8 +471,34 @@ impl Provider for EchoProvider {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
+        // A test asks for structured output with `ECHO_SUBMIT {json}` in the
+        // newest message: the model hands that JSON to `submit_result`.
+        let last_is_user = req.input.last().and_then(|v| v.get("role")).and_then(Value::as_str) == Some("user");
+        let submit = req.client_tools.iter().any(|t| t.name == crate::workflow::submit::NAME);
+        if let (true, true, Some(last)) = (last_is_user, submit, user_lines(&req.input).last()) {
+            if let Some((_, json)) = last.split_once("ECHO_SUBMIT ") {
+                let args = json.lines().next().unwrap_or("").trim().to_string();
+                let call_id = format!("call-{}", uuid::Uuid::new_v4());
+                return Ok(CompleteResponse {
+                    function_calls: vec![crate::provider::FunctionCall {
+                        call_id: call_id.clone(),
+                        name: crate::workflow::submit::NAME.into(),
+                        arguments: args.clone(),
+                    }],
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": crate::workflow::submit::NAME,
+                        "arguments": args,
+                    })],
+                    usage: crate::provider::CacheUsage { input_tokens: 0, cached_tokens: 0, output_tokens: 10 },
+                    ..CompleteResponse::new(uuid::Uuid::new_v4().to_string())
+                });
+            }
+        }
         let text = format!("echo:{}", user_lines(&req.input).join(" | "));
         Ok(CompleteResponse {
+            usage: crate::provider::CacheUsage { input_tokens: 0, cached_tokens: 0, output_tokens: 10 },
             output_items: vec![json!({
                 "type": "message",
                 "role": "assistant",
@@ -500,6 +533,7 @@ mod tests {
             max_turns: 4,
             reasoning_effort: crate::provider::ReasoningEffort::High,
             search: false,
+            result_schema: None,
         })
         .await
         .unwrap();

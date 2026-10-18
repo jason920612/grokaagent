@@ -124,6 +124,8 @@ pub struct CompactResponse {
 pub struct CacheUsage {
     pub input_tokens: u32,
     pub cached_tokens: u32,
+    /// Generated tokens, reasoning included.
+    pub output_tokens: u32,
 }
 
 /// Warn below this rate on turn 2+, when the request is large enough to have a prefix.
@@ -131,6 +133,12 @@ pub const CACHE_HIT_TARGET: f32 = 0.90;
 const CACHE_WARN_MIN_INPUT: u32 = 200;
 
 impl CacheUsage {
+    /// What a token budget counts: generated tokens plus input the cache
+    /// did not cover.
+    pub fn billed(&self) -> u64 {
+        self.output_tokens as u64 + self.input_tokens.saturating_sub(self.cached_tokens) as u64
+    }
+
     pub fn rate(&self) -> f32 {
         if self.input_tokens == 0 {
             0.0
@@ -1072,9 +1080,14 @@ pub fn parse_cache_usage(body: &Value) -> CacheUsage {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
     CacheUsage {
         input_tokens,
         cached_tokens,
+        output_tokens,
     }
 }
 
@@ -1293,7 +1306,7 @@ mod tests {
         assert!(!parsed.usage.below_target(2));
         let cold = CacheUsage {
             input_tokens: 2000,
-            cached_tokens: 0,
+            cached_tokens: 0, output_tokens: 0,
         };
         assert!(cold.below_target(2));
         assert!(!cold.below_target(1));

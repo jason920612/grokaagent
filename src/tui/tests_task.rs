@@ -452,6 +452,7 @@ fn a_proxy_message_ends_the_streamed_turn() {
         finish: "stop".into(),
         input_tokens: 0,
         cached_tokens: 0,
+        output_tokens: 0,
     };
     app.route_event(finished(&m, "done"));
     app.route_event(AgentEvent::TaskProxy { meta: m.clone(), intent: "push".into(), text: "prove it".into() });

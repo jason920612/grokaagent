@@ -167,3 +167,43 @@ async fn idle_child_reply_is_pushed_to_the_parent() {
     assert!(turn.text.contains("echo:ping"), "{}", turn.text);
     n.shutdown(sink.as_ref()).await;
 }
+
+#[test]
+fn a_lifeline_worker_exits_when_its_parent_lets_go() {
+    let bin = env!("CARGO_BIN_EXE_grokaagent");
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(bin)
+        .args([
+            "worker",
+            "--name",
+            "orphan",
+            "--mode",
+            "echo",
+            "--listen",
+            "127.0.0.1:0",
+            "--lifeline",
+            "--events",
+            dir.path().join("w.jsonl").to_str().unwrap(),
+            "--workspace",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+    assert!(Handshake::parse_line(&line).is_ok(), "{line}");
+    assert!(child.try_wait().unwrap().is_none(), "alive while the pipe is held");
+    // The parent dying closes the pipe; here we close it ourselves.
+    drop(child.stdin.take());
+    let t = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "the worker must exit once its lifeline closes");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

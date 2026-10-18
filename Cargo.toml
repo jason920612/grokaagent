@@ -26,6 +26,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 rust-embed = "8"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+rquickjs = { version = "0.14", features = ["futures"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ratatui = "0.29"
 arboard = "3"

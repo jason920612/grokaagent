@@ -17,6 +17,7 @@ pub mod hostio;
 pub mod hub;
 pub mod install;
 pub mod instructions;
+pub mod jschema;
 pub mod kit;
 pub mod md;
 pub mod memory;
@@ -42,5 +43,6 @@ pub mod update;
 pub mod vision;
 pub mod wintrack;
 pub mod worker;
+pub mod workflow;
 
 pub use error::{Error, Result};

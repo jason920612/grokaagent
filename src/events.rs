@@ -44,6 +44,9 @@ pub enum AgentEvent {
         finish: String,
         input_tokens: u32,
         cached_tokens: u32,
+        /// Generated tokens, reasoning included (0 from older binaries).
+        #[serde(default)]
+        output_tokens: u32,
     },
     ToolStarted {
         #[serde(flatten)]

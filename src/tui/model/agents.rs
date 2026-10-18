@@ -539,6 +539,7 @@ mod tests {
             finish: "stop".into(),
             input_tokens: 0,
             cached_tokens: 0,
+            output_tokens: 0,
         });
         assert!(t.apply_relayed(&AgentEvent::AwaitingInput { meta: m("coder", "c") }));
         assert_eq!(t.get("coder").unwrap().state, AgentState::Idle);
