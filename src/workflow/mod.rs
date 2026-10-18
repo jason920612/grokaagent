@@ -620,7 +620,7 @@ impl WorkflowHub {
             return Ok(json!({"run_id": id, "status": run.status().label(), "note": "already ended"}).to_string());
         }
         run.quiet.store(true, Ordering::SeqCst);
-        let _ = run.stop.send(true);
+        run.stop.send_replace(true);
         Ok(json!({
             "run_id": id,
             "status": "stopping",
@@ -638,9 +638,8 @@ impl WorkflowHub {
             Err(e) if e == "stopped" => Status::Stopped,
             Err(e) => Status::Failed(e.clone()),
         };
-        *run.status.lock().unwrap_or_else(|e| e.into_inner()) = status.clone();
         // Calls the script never awaited do not outlive it.
-        let _ = run.stop.send(true);
+        run.stop.send_replace(true);
         let ws = &self.inner.cfg.workspace;
         let result_path = run.dir.join("result.json");
         if let Ok(v) = &out {
@@ -682,6 +681,7 @@ impl WorkflowHub {
             detail: head,
         });
         if run.quiet.load(Ordering::SeqCst) || self.inner.shutting_down.load(Ordering::SeqCst) {
+            self.set_status(run, status);
             return;
         }
         let counts = format!(
@@ -719,6 +719,13 @@ impl WorkflowHub {
         if let Some(tx) = &self.inner.notify {
             let _ = tx.send(UserTurn::from(text));
         }
+        // Only now: a headless run waits while a workflow is running, and
+        // must find this notice queued once it stops waiting.
+        self.set_status(run, status);
+    }
+
+    fn set_status(&self, run: &Run, status: Status) {
+        *run.status.lock().unwrap_or_else(|e| e.into_inner()) = status;
     }
 
     /// The kernel is ending: stop every run and wait (briefly) for their
@@ -728,7 +735,7 @@ impl WorkflowHub {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         let live: Vec<Arc<Run>> = self.runs().into_iter().filter(|r| r.status() == Status::Running).collect();
         for r in &live {
-            let _ = r.stop.send(true);
+            r.stop.send_replace(true);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && live.iter().any(|r| r.status() == Status::Running) {

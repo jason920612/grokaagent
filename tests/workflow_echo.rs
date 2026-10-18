@@ -188,3 +188,23 @@ async fn a_saved_workflow_runs_by_name_and_nests() {
     let text = notice(&mut rx).await;
     assert!(text.contains("\"echo:inner y\""), "{text}");
 }
+
+#[tokio::test]
+async fn a_stop_ends_a_script_that_has_no_agent_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let (hub, _rec, _rx) = hub(&ws);
+    let started: Value = serde_json::from_str(
+        &hub.start(&json!({"script": "export const meta = { name: 'spin', description: 'busy loop' }\nwhile (true) {}"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let id = started["run_id"].as_str().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hub.stop(id).unwrap();
+    let t = std::time::Instant::now();
+    while hub.running() > 0 {
+        assert!(t.elapsed() < Duration::from_secs(10), "a stop must interrupt the script even with no agent to kill");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
