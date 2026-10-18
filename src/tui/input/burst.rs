@@ -31,6 +31,10 @@ pub(crate) struct PasteBurst {
     woke: Option<Instant>,
     /// The loop last waited for input then, after being busy this long.
     waited: Option<(Instant, Duration)>,
+    /// The last read with a key press was queued behind a busy loop.
+    last_queued: bool,
+    /// `woke` was set by a read, not by another wakeup.
+    by_read: bool,
 }
 
 /// Line breaks a paste held back at the end of a read: trailing ones are
@@ -89,7 +93,10 @@ fn text_key(ev: &Event) -> Option<TextKey> {
 impl PasteBurst {
     /// Replace paste-like runs of key presses in one read with `Event::Paste`.
     pub fn coalesce(&mut self, batch: Vec<Event>, now: Instant) -> Vec<Event> {
-        self.woke.get_or_insert(now);
+        if self.woke.is_none() {
+            self.woke = Some(now);
+            self.by_read = true;
+        }
         let queued = self
             .waited
             .is_some_and(|(at, busy)| busy >= STALL && now.saturating_duration_since(at) <= QUEUED);
@@ -102,6 +109,7 @@ impl PasteBurst {
             return out;
         }
         self.fresh = false;
+        self.last_queued = queued;
         let open = self.open.take();
         let mut cont = open.as_ref().map(|o| o.held);
         // A typed line's Enter, pressed unless this read goes on with the paste.
@@ -164,7 +172,13 @@ impl PasteBurst {
     /// take longer than the window while the rest of the paste is already
     /// queued. Only once per read, so other wakeups cannot keep it open.
     pub fn waiting(&mut self, now: Instant) {
-        let busy = self.woke.take().map_or(Duration::ZERO, |w| now.saturating_duration_since(w));
+        let mut busy = self.woke.take().map_or(Duration::ZERO, |w| now.saturating_duration_since(w));
+        if std::mem::take(&mut self.by_read) && self.last_queued {
+            // The rest of a queued backlog is still queued: a console ends a
+            // read at every Shift, Ctrl or Alt record, so a typed capital
+            // splits the line over reads.
+            busy = busy.max(STALL);
+        }
         self.waited = Some((now, busy));
         if std::mem::take(&mut self.fresh) {
             if let Some(o) = self.open.as_mut() {
@@ -393,6 +407,45 @@ mod tests {
         burst.coalesce(console_keys("first line\rsecond\r"), t1);
         burst.waiting(t1);
         assert!(burst.expired(t1 + ms(500)).is_empty());
+    }
+
+    #[test]
+    fn a_typed_line_split_at_its_capital_still_sends() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(600));
+        let out = burst.read(console_keys("O"), t0 + ms(601));
+        assert_eq!(presses(&out), 1);
+        burst.woke(t0 + ms(605));
+        burst.waiting(t0 + ms(608));
+        let out = burst.read(console_keys("k thanks\r"), t0 + ms(608));
+        assert_eq!(pastes(&out), ["k thanks"]);
+        burst.woke(t0 + ms(610));
+        burst.waiting(t0 + ms(615));
+        let late = burst.expired(t0 + ms(700));
+        assert_eq!(presses(&late), 1, "the Enter sends");
+
+        // Pasted into an idle loop, the same split keeps the draft.
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(3));
+        burst.read(console_keys("H"), t0 + ms(30));
+        burst.woke(t0 + ms(32));
+        burst.waiting(t0 + ms(35));
+        burst.read(console_keys("ello world\r"), t0 + ms(35));
+        burst.woke(t0 + ms(37));
+        burst.waiting(t0 + ms(40));
+        assert!(burst.expired(t0 + ms(200)).is_empty());
+
+        // A wakeup in between ends the backlog.
+        let mut burst = PasteBurst::default();
+        busy(&mut burst, t0, t0 + ms(600));
+        burst.read(console_keys("O"), t0 + ms(601));
+        burst.waiting(t0 + ms(608));
+        busy(&mut burst, t0 + ms(700), t0 + ms(705));
+        burst.read(console_keys("k thanks\r"), t0 + ms(705));
+        burst.waiting(t0 + ms(710));
+        assert!(burst.expired(t0 + ms(900)).is_empty());
     }
 
     #[test]

@@ -1890,10 +1890,21 @@ fn settled_title(q: &ShotQuery, meta: &crate::shot::WinMeta) -> Option<String> {
         .map(|_| meta.title.clone())
 }
 
-/// What a browser shows while the page loads: its address or a blank tab.
+/// What a browser shows while the page loads: its address, a blank tab, or
+/// (Firefox and its forks, until the page has a title) its bare brand.
 fn loading_title(title: &str) -> bool {
+    const BRAND_ONLY: &[&str] = &[
+        "mozillafirefox",
+        "mozillafirefoxprivatebrowsing",
+        "firefoxdeveloperedition",
+        "firefoxnightly",
+        "librewolf",
+        "waterfox",
+    ];
     let t = title.trim().to_lowercase();
-    wintrack::squash(title).is_empty()
+    let squashed = wintrack::squash(title);
+    squashed.is_empty()
+        || BRAND_ONLY.contains(&squashed.as_str())
         || t.contains("://")
         || crate::shot::title_looks_local(title)
         || t.starts_with("new tab")
@@ -2245,11 +2256,22 @@ mod shot_tool_tests {
         assert!(shows_other_page(&on(&bind(&vite.title)), &mail));
         assert!(!shows_other_page(&on(&bind(&vite.title)), &vite));
         // Bound while the page loaded: the first capture settles the title.
-        for loading in ["localhost:5173/ - Google Chrome", "http://127.0.0.1:8000/ - Google Chrome", "New Tab - Google Chrome", "Untitled"] {
+        for loading in [
+            "localhost:5173/ - Google Chrome",
+            "http://127.0.0.1:8000/ - Google Chrome",
+            "New Tab - Google Chrome",
+            "Untitled",
+            "Mozilla Firefox",
+            "Mozilla Firefox Private Browsing",
+        ] {
             let q = on(&bind(loading));
             assert!(!shows_other_page(&q, &vite), "{loading}");
             assert_eq!(settled_title(&q, &vite).as_deref(), Some(vite.title.as_str()), "{loading}");
         }
+        let ff = BoundWindow::from_meta("app".into(), &win(6, "Mozilla Firefox", "firefox", 70, 1920, 1080), false);
+        let next = win(6, "Create Next App — Mozilla Firefox", "firefox", 70, 1920, 1080);
+        assert!(!shows_other_page(&on(&ff), &next), "Firefox names a page without a title by its brand");
+        assert!(!loading_title("GitHub — Mozilla Firefox"));
         let mut settled = bind("localhost:5173/ - Google Chrome");
         settled.settled = true;
         assert!(shows_other_page(&on(&settled), &mail), "a page that never got a title is settled too");
