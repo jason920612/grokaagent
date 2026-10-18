@@ -1,6 +1,7 @@
 (() => {
-  const params = new URLSearchParams(location.search);
-  const token = params.get("t") || "";
+  // The server already redirected the one-time code away; an old ?t= link
+  // or anything else in the query must not stay in the address bar either.
+  if (location.search) history.replaceState(null, "", location.pathname + location.hash);
   const $ = (id) => document.getElementById(id);
   const appEl = $("app");
   const chat = $("chat");
@@ -46,6 +47,12 @@
   let overlayComposing = false;
   let localView = {};
   let taskDraft = "";
+  let apiKeyDraft = null;   // typed in this tab; the server never sends the key
+  let overlayTop = null;
+  let overlayShownAt = 0;
+  const uploads = new Set();  // upload request ids waiting for the TUI's receipt
+  let uploadChain = Promise.resolve();
+  const THUMB = 480;        // longest edge of chat and tray thumbnails
 
   const STATE_ICON = { starting: "◌", working: "◐", idle: "✓", paused: "‖", interrupted: "⊘", exited: "○" };
 
@@ -101,8 +108,13 @@
     }, 8000);
   }
 
-  function mediaUrl(path) {
-    return `/media?t=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`;
+  // Authenticated by the session cookie; `max` asks for a scaled copy.
+  function mediaUrl(path, max) {
+    return `/media?path=${encodeURIComponent(path)}${max ? `&max=${max}` : ""}`;
+  }
+
+  function baseName(path) {
+    return String(path).split(/[\\/]/).pop();
   }
 
   function wsSend(obj) {
@@ -112,6 +124,7 @@
 
   function send(obj) {
     if (obj.type === "open_settings") {
+      apiKeyDraft = null;
       localView = { settings: true }; renderOverlay();
       return send({ type: "refresh_settings" });
     }
@@ -132,6 +145,7 @@
       if (ok) { localView = {}; renderOverlay(); } return ok;
     }
     if (["close_settings", "close_task", "cancel_rename"].includes(obj.type)) {
+      apiKeyDraft = null;
       localView = {}; renderOverlay(); return true;
     }
     // Reading details is local to this browser, independent of the terminal.
@@ -140,7 +154,8 @@
       open_image: () => ({ image_view: obj.path }),
       open_monitor: () => ({ inspector: { kind: "monitor", name: obj.name } }),
       open_agent_info: () => ({ agent_info: obj.path }),
-      edit_queue: () => ({ queue_editor: { index: obj.index, original: snap.queue[obj.index].text } }),
+      edit_queue: () => ({ queue_editor: { index: obj.index, original: snap.queue[obj.index].text,
+        images: snap.queue[obj.index].paths || [] } }),
     };
     if (local[obj.type]) { localView = local[obj.type](); renderOverlay(); return true; }
     if (["close_tool", "close_image", "close_inspector", "close_queue_editor", "close_agent_info"].includes(obj.type)) {
@@ -219,9 +234,9 @@
       if (receipt) {
         const request = awaitingReceipt;
         if (receipt[1] === "已接收") {
-          if (request.type === "update_queue") {
+          if (request.type === "update_queue" || request.type === "remove_queued") {
             localView = {};
-            $("delivery").textContent = "已儲存待處理訊息";
+            $("delivery").textContent = request.type === "remove_queued" ? "已刪除待處理訊息" : "已儲存待處理訊息";
           } else {
             if (s.session_id === request.session_id && composer.value === request.text) composer.value = "";
             if (drafts.get(request.session_id) === request.text) drafts.set(request.session_id, "");
@@ -236,6 +251,13 @@
         receiptRetryReady = false;
         $("send-message").disabled = !connected;
       }
+    }
+    settleUploads();
+  }
+
+  function settleUploads() {
+    for (const [id, result] of (snap && snap.receipts) || []) {
+      if (uploads.delete(id)) $("delivery").textContent = result;
     }
   }
 
@@ -545,16 +567,45 @@
     const pics = row.path ? [row.path] : (row.images || []);
     if (pics.length) {
       const box = el("div", "pics");
-      pics.forEach((p) => {
-        const img = el("img");
-        img.src = mediaUrl(p);
-        img.alt = row.label || p;
-        img.addEventListener("click", () => send({ type: "open_image", path: p }));
-        box.append(img);
-      });
+      pics.forEach((p) => box.append(chatPic(p, row.label)));
       (node.querySelector(".bubble") || node).append(box);
     }
     return node;
+  }
+
+  // An <img> that turns into a note when the file is gone or not an image.
+  function picImg(path, onDone) {
+    const img = el("img");
+    img.alt = baseName(path);
+    img.decoding = "async";
+    img.addEventListener("load", () => onDone && onDone());
+    img.addEventListener("error", () => {
+      img.replaceWith(el("span", "pic-missing", `圖片無法顯示 · ${baseName(path)}`));
+      if (onDone) onDone();
+    });
+    return img;
+  }
+
+  // A button, so the keyboard can open the viewer too.
+  function chatPic(path, label) {
+    const b = el("button", "pic");
+    b.type = "button";
+    b.title = label || path;
+    b.setAttribute("aria-label", `開啟圖片 ${baseName(path)}`);
+    // Its height is unknown until it loads; pin the view again if it was at the bottom.
+    const img = picImg(path, () => {
+      if (!b.querySelector("img")) b.disabled = true;
+      keepStuck();
+    });
+    img.loading = "lazy";
+    img.src = mediaUrl(path, THUMB);
+    b.append(img);
+    b.addEventListener("click", () => send({ type: "open_image", path }));
+    return b;
+  }
+
+  function keepStuck() {
+    if (stick) chat.scrollTop = chat.scrollHeight;
   }
 
   let chatKey = "";
@@ -620,7 +671,7 @@
       const box = $("queue");
       box.replaceChildren();
       (snap.queue || []).forEach((q, i) => {
-        const p = el("button", "pill", q.text || `${q.images} 張圖`);
+        const p = el("button", "pill", q.images ? `[${q.images} 張圖] ${q.text}`.trim() : q.text);
         p.type = "button";
         p.title = "編輯待處理訊息";
         p.addEventListener("click", () => send({ type: "edit_queue", index: i }));
@@ -633,8 +684,16 @@
       const box = $("pending");
       box.replaceChildren();
       (snap.pending || []).forEach((p, i) => {
-        const b = el("button", "pill", p + " ✕");
+        const b = el("button", "pill pending-pic");
         b.type = "button";
+        b.title = `${p} · 點一下移除`;
+        b.setAttribute("aria-label", `移除圖片 ${baseName(p)}`);
+        const img = el("img");
+        img.alt = "";
+        img.decoding = "async";
+        img.addEventListener("error", () => img.remove());
+        img.src = mediaUrl(p, THUMB);
+        b.append(img, el("span", "", `${baseName(p)} ✕`));
         b.addEventListener("click", () => send({ type: "remove_pending", index: i }));
         box.append(b);
       });
@@ -825,8 +884,14 @@
         mode: snap.task_summary?.goal ? "status" : "form" } : null };
   }
 
-  function drawerOverlay(o) {
-    return !!(o.settings || o.task || o.inspector || o.tool_panel || o.skill_view || o.agent_info);
+  // Server-driven prompts come first: an agent's question must not hide
+  // behind an image or a form this tab happens to have open.
+  const OVERLAY_ORDER = ["ask", "picker", "queue_editor", "image_view", "rename", "task", "skill_view",
+    "inspector", "agent_info", "tool_panel", "settings"];
+  const DRAWERS = ["settings", "task", "inspector", "tool_panel", "skill_view", "agent_info"];
+
+  function topOverlay(o) {
+    return OVERLAY_ORDER.find((k) => o[k]) || null;
   }
 
   function toolCall(tp) {
@@ -841,23 +906,25 @@
       o.task && { ...o.task, draft: undefined },
       o.ask && { ...o.ask, options: o.ask.options.map(x => ({ ...x, value: undefined })) },
       o.picker, o.inspector && [o.inspector, logs.rail.monitors], o.image_view,
-      o.skill_view, o.queue_editor, o.tool_panel && [o.tool_panel, toolCall(o.tool_panel)],
+      o.skill_view, o.queue_editor && { ...o.queue_editor, text: undefined },
+      o.tool_panel && [o.tool_panel, toolCall(o.tool_panel)],
       o.agent_info && agentOf(o.agent_info)]);
     if (key === overlayKey) return;
     overlayKey = key;
     const active = overlay.contains(document.activeElement) ? document.activeElement : null;
     const activeValue = active && "value" in active ? active.value : null;
     rememberSettingsFocus();
-    const show = !!(o.settings || o.ask || o.task || o.picker || o.inspector || o.image_view || o.skill_view
-      || o.rename || o.tool_panel || o.queue_editor || o.agent_info);
-    overlay.classList.toggle("hidden", !show);
-    overlay.classList.toggle("centered", show && !drawerOverlay(o));
-    if (!show) { overlay.replaceChildren(); settingsFocus = null; return; }
+    const top = topOverlay(o);
+    // Typing and focus carry over only within the same dialog.
+    const sameTop = top === overlayTop;
+    if (!sameTop) { overlayTop = top; overlayShownAt = performance.now(); }
+    overlay.classList.toggle("hidden", !top);
+    overlay.classList.toggle("centered", !!top && !DRAWERS.includes(top));
+    if (!top) { overlay.replaceChildren(); settingsFocus = null; return; }
 
     // Keep the settings form mounted so typing does not lose focus.
     const existing = overlay.querySelector(".modal.settings");
-    if (o.settings && existing && !o.ask && !o.task && !o.picker && !o.inspector && !o.image_view
-      && !o.skill_view && !o.rename && !o.tool_panel && !o.agent_info) {
+    if (top === "settings" && existing) {
       buildSettingsModal(existing, o.settings);
       restoreSettingsFocus(existing);
       return;
@@ -865,59 +932,7 @@
 
     overlay.replaceChildren();
     const modal = el("div", "modal");
-    if (o.queue_editor) {
-      modal.append(h2("編輯待處理訊息"));
-      const input = el("textarea");
-      input.rows = 6;
-      input.value = o.queue_editor.original;
-      modal.append(input);
-      const notice = el("p", "queue-notice hint");
-      notice.setAttribute("role", "status");
-      modal.append(notice);
-      addBtns(modal, [
-        ["取消", () => send({ type: "close_queue_editor" })],
-        ["儲存", () => {
-          if (!connected) { notice.textContent = "未儲存：連線中斷，文字保留在此處"; return; }
-          if (awaitingReceipt) { send(awaitingReceipt); return; }
-          awaitingReceipt = { type: "update_queue", request_id: crypto.randomUUID(), session_id: o.session_id,
-            index: o.queue_editor.index, expected: o.queue_editor.original, text: input.value };
-          notice.textContent = "儲存中，請等待確認；未回應時可再次點選儲存確認同一筆修改";
-          send(awaitingReceipt);
-        }],
-      ]);
-    } else if (o.image_view) {
-      modal.className = "modal lightbox";
-      const img = el("img");
-      img.src = mediaUrl(o.image_view);
-      img.alt = o.image_view;
-      modal.append(img);
-      addClose(modal, () => send({ type: "close_image" }));
-    } else if (o.rename) {
-      modal.append(h2("改名"));
-      const inp = el("input");
-      inp.type = "text";
-      inp.value = o.rename.text;
-      inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) send({ type: "commit_rename", text: inp.value }); });
-      modal.append(inp);
-      addBtns(modal, [["取消", () => send({ type: "cancel_rename" })], ["確定", () => send({ type: "commit_rename", text: inp.value })]]);
-    } else if (o.task) {
-      if (o.task.mode === "form") {
-        modal.append(h2("任務目標"));
-        const ta = el("textarea");
-        ta.rows = 6;
-        ta.value = o.task.draft || "";
-        ta.placeholder = "這則對話要達成什麼？";
-        ta.addEventListener("input", () => send({ type: "set_task_draft", text: ta.value }));
-        modal.append(ta);
-        addBtns(modal, [["取消", () => send({ type: "close_task" })], ["確定", () => send({ type: "submit_task" })]]);
-      } else {
-        modal.append(h2("任務模式  ·  " + (o.task.phase || "")));
-        modal.append(el("p", "", "目標  " + (o.task.goal || "")));
-        modal.append(el("pre", "", (o.task.checklist || []).map((i) => (i.done ? "[x] " : "[ ] ") + i.text).join("\n") || "（尚無檢查表）"));
-        if (o.task.note) modal.append(el("p", "hint", o.task.note));
-        addBtns(modal, [["關閉", () => send({ type: "close_task" })], ["結束任務", () => send({ type: "end_task" })]]);
-      }
-    } else if (o.ask) {
+    if (top === "ask") {
       modal.append(h2(o.ask.prompt));
       o.ask.options.forEach((opt, i) => {
         const row = el("div", "opt" + (opt.chosen ? " on" : ""));
@@ -934,7 +949,7 @@
         modal.append(row);
       });
       addBtns(modal, [["取消", () => send({ type: "ask_cancel" })], ["確定", () => send({ type: "ask_confirm" })]]);
-    } else if (o.picker) {
+    } else if (top === "picker") {
       modal.append(h2("選擇工作目錄"));
       const inp = el("input");
       inp.type = "text";
@@ -949,16 +964,101 @@
         modal.append(row);
       });
       addBtns(modal, [["取消", () => send({ type: "ws_cancel" })], ["建立資料夾", () => send({ type: "ws_create" })], ["確定", () => send({ type: "ws_confirm" })]]);
-    } else if (o.skill_view) {
+    } else if (top === "queue_editor") {
+      modal.append(h2("編輯待處理訊息"));
+      const input = el("textarea");
+      input.rows = 6;
+      input.value = o.queue_editor.text ?? o.queue_editor.original;
+      // Kept in the view, so a question that covers the editor does not lose it.
+      input.addEventListener("input", () => { o.queue_editor.text = input.value; });
+      modal.append(input);
+      if (o.queue_editor.images.length) {
+        const box = el("div", "pics");
+        o.queue_editor.images.forEach((p) => {
+          const img = picImg(p);
+          img.src = mediaUrl(p, THUMB);
+          box.append(img);
+        });
+        modal.append(box);
+      }
+      const notice = el("p", "queue-notice hint");
+      notice.setAttribute("role", "status");
+      modal.append(notice);
+      // Saving and deleting share the receipt slot; a retry re-sends the same request.
+      const request = (fields, waiting) => {
+        if (!connected) { notice.textContent = "未送出：連線中斷，文字保留在此處"; return; }
+        if (awaitingReceipt) { send(awaitingReceipt); return; }
+        awaitingReceipt = { request_id: crypto.randomUUID(), session_id: o.session_id,
+          index: o.queue_editor.index, expected: o.queue_editor.original, ...fields };
+        notice.textContent = waiting;
+        send(awaitingReceipt);
+      };
+      addBtns(modal, [
+        ["刪除", () => request({ type: "remove_queued", images: o.queue_editor.images },
+          "刪除中，請等待確認"), "danger"],
+        ["取消", () => send({ type: "close_queue_editor" })],
+        ["儲存", () => request({ type: "update_queue", text: input.value },
+          "儲存中，請等待確認；未回應時可再次點選儲存確認同一筆修改")],
+      ]);
+    } else if (top === "image_view") {
+      modal.className = "modal lightbox";
+      const name = baseName(o.image_view);
+      const head = el("div", "lightbox-head");
+      const original = el("a", "", "開啟原圖");
+      original.href = mediaUrl(o.image_view);
+      original.target = "_blank";
+      original.rel = "noopener";
+      head.append(h2(name), original);
+      // Scrolls at actual size, so a tall page screenshot stays readable.
+      const frame = el("div", "lightbox-frame");
+      frame.tabIndex = 0;
+      const img = el("img");
+      img.alt = name;
+      img.title = "點一下切換實際大小";
+      img.addEventListener("click", () => modal.classList.toggle("actual"));
+      img.addEventListener("error", () => {
+        frame.replaceChildren(el("p", "hint", "圖片無法顯示：檔案可能已刪除，或不是支援的圖片格式"));
+      });
+      img.src = mediaUrl(o.image_view);
+      frame.append(img);
+      modal.append(head, frame);
+      addBtns(modal, [["實際大小", () => modal.classList.toggle("actual")], ["關閉", () => send({ type: "close_image" })]]);
+    } else if (top === "rename") {
+      modal.append(h2("改名"));
+      const inp = el("input");
+      inp.type = "text";
+      inp.value = o.rename.text;
+      inp.addEventListener("input", () => { o.rename.text = inp.value; });
+      inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) send({ type: "commit_rename", text: inp.value }); });
+      modal.append(inp);
+      addBtns(modal, [["取消", () => send({ type: "cancel_rename" })], ["確定", () => send({ type: "commit_rename", text: inp.value })]]);
+    } else if (top === "task") {
+      if (o.task.mode === "form") {
+        modal.append(h2("任務目標"));
+        const ta = el("textarea");
+        ta.rows = 6;
+        ta.value = o.task.draft || "";
+        ta.placeholder = "這則對話要達成什麼？";
+        ta.addEventListener("input", () => send({ type: "set_task_draft", text: ta.value }));
+        modal.append(ta);
+        addBtns(modal, [["取消", () => send({ type: "close_task" })], ["確定", () => send({ type: "submit_task" })]]);
+      } else {
+        modal.append(h2("任務模式  ·  " + (o.task.phase || "")));
+        modal.append(el("p", "", "目標  " + (o.task.goal || "")));
+        modal.append(el("pre", "", (o.task.checklist || []).map((i) => (i.done ? "[x] " : "[ ] ") + i.text).join("\n") || "（尚無檢查表）"));
+        if (o.task.note) modal.append(el("p", "hint", o.task.note));
+        addBtns(modal, [["關閉", () => send({ type: "close_task" })], ["結束任務", () => send({ type: "end_task" })]]);
+      }
+    } else if (top === "skill_view") {
       modal.append(h2(o.skill_view.title + "  ·  " + o.skill_view.origin));
       modal.append(el("pre", "", o.skill_view.body));
       addClose(modal, () => send({ type: "close_skill" }));
-    } else if (o.inspector) {
+    } else if (top === "inspector") {
       const m = logs.rail.monitors.find((x) => x.name === o.inspector.name);
       modal.append(h2("監控  " + o.inspector.name));
       modal.append(el("pre", "", m ? `pid ${m.pid}\n${m.command}\n${m.status}\n${m.detail}` : "已不存在"));
       addClose(modal, () => send({ type: "close_inspector" }));
-    } else if (o.agent_info) {
+    } else if (top === "agent_info") {
       const a = agentOf(o.agent_info);
       modal.append(h2("子代理  " + o.agent_info));
       if (a) {
@@ -969,7 +1069,7 @@
         modal.append(card, el("h2", "", "任務說明"), el("pre", "", a.prompt || "（無）"));
       }
       addClose(modal, () => send({ type: "close_agent_info" }));
-    } else if (o.tool_panel) {
+    } else if (top === "tool_panel") {
       const c = toolCall(o.tool_panel);
       modal.append(h2((o.tool_panel.view ? `[${o.tool_panel.view}] ` : "") + (c ? `${c.name} · ${c.phase}` : "工具")));
       if (c) {
@@ -984,7 +1084,7 @@
         modal.append(el("p", "hint", "這次工具呼叫已不在紀錄中"));
       }
       addClose(modal, () => send({ type: "close_tool" }));
-    } else if (o.settings) {
+    } else if (top === "settings") {
       modal.classList.add("settings");
       buildSettingsModal(modal, o.settings);
     }
@@ -993,12 +1093,43 @@
     modal.setAttribute("aria-modal", "true");
     modal.setAttribute("aria-label", modal.querySelector("h2")?.textContent || "詳情");
     modal.querySelectorAll("input, textarea, select").forEach((x, i) => { if (!x.dataset.field) x.dataset.field = "input-" + i; });
-    if (settingsFocus && activeValue !== null) {
+    if (sameTop && settingsFocus && activeValue !== null) {
       const input = modal.querySelector(`[data-field="${settingsFocus.key}"]`);
       if (input) input.value = activeValue;
     }
-    restoreSettingsFocus(modal);
-    if (!settingsFocus) modal.querySelector("input, textarea, button")?.focus();
+    if (sameTop) restoreSettingsFocus(modal);
+    if (sameTop && settingsFocus) return;
+    if (top === "ask") {
+      // Not a button: Enter meant for the composer must not answer or cancel it.
+      modal.tabIndex = -1;
+      (modal.querySelector("input") || modal).focus();
+    } else {
+      modal.querySelector("input, textarea, button")?.focus();
+    }
+  }
+
+  // Backdrop click or Escape: dismiss what is shown, in renderOverlay's order.
+  function dismissOverlay(escape) {
+    const o = overlaySnapshot();
+    const top = o && topOverlay(o);
+    if (!top) return;
+    // What just appeared is not hit by the second click of a double-click,
+    // or a repeated Escape, meant for what was there before.
+    if (performance.now() - overlayShownAt < 400) return;
+    const close = {
+      ask: escape ? { type: "ask_cancel" } : null,  // a stray click must not cancel a question
+      picker: { type: "ws_cancel" },
+      queue_editor: { type: "close_queue_editor" },
+      image_view: { type: "close_image" },
+      rename: { type: "cancel_rename" },
+      task: { type: "close_task" },
+      skill_view: { type: "close_skill" },
+      inspector: { type: "close_inspector" },
+      agent_info: { type: "close_agent_info" },
+      tool_panel: { type: "close_tool" },
+      settings: { type: "close_settings" },
+    }[top];
+    if (close) send(close);
   }
 
   function buildSettingsModal(modal, st) {
@@ -1026,7 +1157,7 @@
         modal.append(textField("模型名", "model", snap.header.model, (v) => send({ type: "set_model", id: v })));
         modal.append(textField("子代理模型（留空＝同主模型）", "child_model", st.child_model || "", (v) => send({ type: "set_child_model", id: v })));
       }
-      modal.append(textField("API 金鑰", "api_key", st.api_key || "", (v) => send({ type: "set_api_key", text: v }), true));
+      modal.append(apiKeyField(st.has_api_key));
       modal.append(textField("上下文", "context", st.context || "", (v) => send({ type: "set_context", text: v })));
     } else {
       modal.append(el("p", "hint", "使用 xAI Grok 訂閱 OAuth。若剛從自訂 API 切換，模型會回到 Grok 目錄。"));
@@ -1098,8 +1229,8 @@
   function addClose(modal, fn) { addBtns(modal, [["關閉", fn]]); }
   function addBtns(modal, items) {
     const row = el("div", "row-btns");
-    items.forEach(([t, fn]) => {
-      const b = el("button", "", t);
+    items.forEach(([t, fn, cls]) => {
+      const b = el("button", cls || "", t);
       b.type = "button";
       b.addEventListener("click", fn);
       row.append(b);
@@ -1118,6 +1249,25 @@
     wrap.append(inp);
     return wrap;
   }
+  // The browser never gets the key: typing replaces it, and what this tab
+  // typed survives the form being rebuilt by the next snapshot.
+  function apiKeyField(isSet) {
+    const wrap = textField("API 金鑰", "api_key", apiKeyDraft ?? "", (v) => {
+      apiKeyDraft = v;
+      send({ type: "set_api_key", text: v });
+    }, true);
+    const inp = wrap.querySelector("input");
+    inp.placeholder = isSet ? "已設定 · 輸入新的金鑰即取代" : "未設定";
+    inp.autocomplete = "off";
+    if (isSet && !apiKeyDraft) {
+      const clear = el("button", "", "清除金鑰");
+      clear.type = "button";
+      clear.addEventListener("click", () => { apiKeyDraft = ""; send({ type: "set_api_key", text: "" }); });
+      wrap.append(clear);
+    }
+    return wrap;
+  }
+
   function selectField(title, key, pairs, current, onChange) {
     const wrap = el("div", "field");
     wrap.append(label(title));
@@ -1153,22 +1303,7 @@
   $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
   overlay.addEventListener("compositionstart", () => { overlayComposing = true; });
   overlay.addEventListener("compositionend", () => { overlayComposing = false; });
-  overlay.addEventListener("click", (e) => {
-    if (e.target !== overlay) return;
-    const o = overlaySnapshot();
-    if (!o) return;
-    if (o.queue_editor) send({ type: "close_queue_editor" });
-    else if (o.image_view) send({ type: "close_image" });
-    else if (o.task) send({ type: "close_task" });
-    else if (o.settings) send({ type: "close_settings" });
-    else if (o.inspector) send({ type: "close_inspector" });
-    else if (o.agent_info) send({ type: "close_agent_info" });
-    else if (o.skill_view) send({ type: "close_skill" });
-    else if (o.tool_panel) send({ type: "close_tool" });
-    else if (o.ask) send({ type: "ask_cancel" });
-    else if (o.picker) send({ type: "ws_cancel" });
-    else if (o.rename) send({ type: "cancel_rename" });
-  });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) dismissOverlay(false); });
   document.addEventListener("keydown", (e) => {
     const mod = e.ctrlKey || e.metaKey;
     if (mod && !e.shiftKey && (e.key === "b" || e.key === "B")) { e.preventDefault(); setSide(); return; }
@@ -1185,14 +1320,14 @@
       return;
     }
     if (e.key === "Escape") {
-      if (!overlay.classList.contains("hidden")) { overlay.click(); e.preventDefault(); }
+      if (!overlay.classList.contains("hidden")) { dismissOverlay(true); e.preventDefault(); }
       else if (sideOpen && narrow.matches) { sideOpen = false; renderAll(); }
       else if (activeTab) activate("");
       else if (snap?.header.running || logs.agents.some((a) => a.state === "working")) send({ type: "interrupt" });
       return;
     }
     if (e.key === "Tab" && !overlay.classList.contains("hidden")) {
-      const items = [...overlay.querySelectorAll("button, input, textarea, select, [tabindex='0']")].filter(x => !x.disabled);
+      const items = [...overlay.querySelectorAll("button, input, textarea, select, a[href], [tabindex='0']")].filter(x => !x.disabled);
       const first = items[0], last = items[items.length - 1];
       if (items.length && (!overlay.contains(document.activeElement) || (e.shiftKey && document.activeElement === first) || (!e.shiftKey && document.activeElement === last))) {
         e.preventDefault(); (e.shiftKey ? last : first).focus();
@@ -1201,14 +1336,70 @@
   });
   narrow.addEventListener("change", () => { sideOpen = !narrow.matches; renderAll(); });
 
-  function connect() {
-    if (!token) {
-      $("status-left").textContent = "缺少存取 token · 請從 TUI 開啟的網址進入";
-      connectionState(false, "缺少連線資訊 · 請使用 TUI 提供的網址");
-      return;
+  // —— Images from this browser: drop anywhere, or paste ——
+  const IMAGE_NAME = /\.(png|jpe?g|jfif|gif|webp|bmp)$/i;
+
+  function imageFiles(files) {
+    return [...(files || [])].filter((f) => f && (f.type.startsWith("image/") || IMAGE_NAME.test(f.name || "")));
+  }
+
+  function attachImages(files) {
+    if (!snap || !connected) { $("delivery").textContent = "未附上：連線中斷"; return; }
+    if (activeTab) { $("delivery").textContent = "子代理分頁是唯讀的：切回主對話再加入圖片"; return; }
+    const images = imageFiles(files);
+    if (!images.length) { $("delivery").textContent = "只能加入圖片（PNG、JPEG、GIF、WebP、BMP）"; return; }
+    const sid = snap.session_id;
+    // One at a time: they attach in order and the limit applies to each.
+    images.forEach((f) => { uploadChain = uploadChain.then(() => uploadImage(f, sid)); });
+  }
+
+  async function uploadImage(file, sid) {
+    const id = crypto.randomUUID();
+    $("delivery").textContent = `上傳圖片中… ${file.name || ""}`;
+    try {
+      const r = await fetch(`/upload?session_id=${encodeURIComponent(sid)}&request_id=${id}`,
+        { method: "POST", body: file, credentials: "same-origin" });
+      if (r.ok) {
+        // The TUI's receipt may already be here.
+        uploads.add(id);
+        settleUploads();
+        return;
+      }
+      $("delivery").textContent = r.status === 401 || r.status === 403
+        ? "未附上：存取已失效，請用 TUI 狀態列的網址重新開啟"
+        : (await r.text()) || `未附上（${r.status}）`;
+    } catch {
+      $("delivery").textContent = "未附上：連線中斷";
     }
+  }
+
+  const draggingFiles = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes("Files");
+  const editable = (t) => t instanceof Element && !!t.closest("textarea, input");
+  // Unhandled, a file dropped anywhere replaces the workbench, and the
+  // draft, with the file itself. Text dropped into a field still lands there.
+  document.addEventListener("dragover", (e) => {
+    if (!draggingFiles(e) && editable(e.target)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = draggingFiles(e) ? "copy" : "none";
+  });
+  document.addEventListener("drop", (e) => {
+    if (!draggingFiles(e) && editable(e.target)) return;
+    e.preventDefault();
+    if (draggingFiles(e) && overlay.classList.contains("hidden")) attachImages(e.dataTransfer.files);
+  });
+  // Text wins, as in the terminal; a screenshot on the clipboard has none.
+  document.addEventListener("paste", (e) => {
+    const data = e.clipboardData;
+    if (!data || !overlay.classList.contains("hidden") || data.getData("text/plain")) return;
+    const images = imageFiles([...data.items].filter((i) => i.kind === "file").map((i) => i.getAsFile()));
+    if (!images.length) return;
+    e.preventDefault();
+    attachImages(images);
+  });
+
+  function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws?t=${encodeURIComponent(token)}`);
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
@@ -1222,6 +1413,13 @@
     ws.onclose = () => {
       connectionState(false, "連線中斷 · 正在重新連線，草稿已保留");
       if (awaitingReceipt) $("delivery").textContent = "送出結果尚未確認，重連後將查詢接收紀錄";
+      // A refused socket looks like any other drop; ask whether access is gone.
+      // Opening the TUI's current link in any tab sets the cookie for this one too.
+      fetch("/auth", { cache: "no-store", credentials: "same-origin" }).then((r) => {
+        if (r.status === 401 && !connected) {
+          connectionState(false, "需要重新開啟：用 TUI 狀態列顯示的網址（每個網址只能用一次），草稿已保留");
+        }
+      }).catch(() => {});
       setTimeout(connect, 1500);
     };
   }
