@@ -3,7 +3,8 @@
 //! Translates the kernel's Responses-shaped history into chat messages so a
 //! custom base URL + model name can drive the same tool loop.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -25,6 +26,8 @@ pub struct OpenAiCompatProvider {
     client: reqwest::Client,
     /// Cached `/health` probe: some vision gateways intercept tool calls.
     gateway: Arc<OnceLock<bool>>,
+    /// Models this endpoint refused image input for, learned this process.
+    no_vision: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OpenAiCompatProvider {
@@ -45,11 +48,19 @@ impl OpenAiCompatProvider {
             model,
             client,
             gateway: Arc::new(OnceLock::new()),
+            no_vision: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    fn learn_no_vision(&self, model: &str) {
+        self.no_vision
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model.to_string());
     }
 
     pub async fn list_models(&self) -> Result<crate::catalog::ModelCatalog> {
@@ -174,6 +185,9 @@ impl Provider for OpenAiCompatProvider {
             req.model.as_str()
         };
         let mut payload = chat_payload(model, &req);
+        if !self.sees_images(model) {
+            drop_images(&mut payload, model);
+        }
         if self.is_vision_gateway().await {
             payload["chat_template_kwargs"] =
                 json!({"thinking": true, "enable_thinking": true});
@@ -185,6 +199,7 @@ impl Provider for OpenAiCompatProvider {
         } else {
             Vec::new()
         };
+        let mut dropped = false;
         loop {
             let resp = self
                 .request("/chat/completions", "application/json")
@@ -205,7 +220,15 @@ impl Provider for OpenAiCompatProvider {
                         continue;
                     }
                 }
+                if !dropped && refuses_images(&text) && payload_has_images(&payload) {
+                    drop_images(&mut payload, model);
+                    dropped = true;
+                    continue;
+                }
                 return Err(http_error(status, &text));
+            }
+            if dropped {
+                self.learn_no_vision(model);
             }
             let body: Value = serde_json::from_str(&text)
                 .map_err(|_| Error::Provider("endpoint returned non-JSON body".into()))?;
@@ -231,25 +254,40 @@ impl Provider for OpenAiCompatProvider {
             req.model.as_str()
         };
         let mut payload = chat_payload(model, &req);
+        if !self.sees_images(model) {
+            drop_images(&mut payload, model);
+        }
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
-        let resp = self
-            .request("/chat/completions", "text/event-stream")
-            .timeout(Duration::from_secs(600))
-            .json(&payload)
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
+        let mut dropped = false;
+        let resp = loop {
+            let resp = self
+                .request("/chat/completions", "text/event-stream")
+                .timeout(Duration::from_secs(600))
+                .json(&payload)
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            if status == 200 {
+                break resp;
+            }
+            let text = resp.text().await?;
+            if !dropped && refuses_images(&text) && payload_has_images(&payload) {
+                drop_images(&mut payload, model);
+                dropped = true;
+                continue;
+            }
+            return Err(http_error(status, &text));
+        };
+        if dropped {
+            self.learn_no_vision(model);
+        }
         let ctype = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if status != 200 {
-            let text = resp.text().await?;
-            return Err(http_error(status, &text));
-        }
         if !ctype.contains("event-stream") {
             let text = resp.text().await?;
             let body: Value = serde_json::from_str(&text)
@@ -285,6 +323,15 @@ impl Provider for OpenAiCompatProvider {
         Err(Error::Provider(
             "this endpoint has no /responses/compact".into(),
         ))
+    }
+
+    fn sees_images(&self, model: &str) -> bool {
+        let model = if model.is_empty() { self.model.as_str() } else { model };
+        !self
+            .no_vision
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(model)
     }
 }
 
@@ -360,6 +407,10 @@ pub fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
     }
     // Reasoning of the response being rebuilt; it rides on its tool-call message.
     let mut reasoning = String::new();
+    // Tool messages carry text only. Images a tool attached (read_image,
+    // screenshot) follow the run of tool results as one user message, so
+    // strict endpoints still see every result right after its call.
+    let mut tool_images: Vec<Value> = Vec::new();
     for item in input {
         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
             reasoning = reasoning_text(item);
@@ -368,6 +419,11 @@ pub fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
         let Some(msg) = item_to_chat(item) else {
             continue;
         };
+        if msg["role"] == "tool" {
+            tool_images.extend(tool_image_parts(item));
+        } else if !tool_images.is_empty() {
+            msgs.push(json!({"role": "user", "content": std::mem::take(&mut tool_images)}));
+        }
         let is_call = msg.get("tool_calls").is_some();
         // One response = one assistant message: its text and every parallel
         // tool call together. Strict endpoints (DeepSeek) reject an assistant
@@ -394,6 +450,9 @@ pub fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
             reasoning.clear();
         }
         msgs.push(msg);
+    }
+    if !tool_images.is_empty() {
+        msgs.push(json!({"role": "user", "content": tool_images}));
     }
     // Reasoning only matters while its tool calls are in play.
     for m in msgs.iter_mut() {
@@ -531,6 +590,290 @@ fn part_to_chat(part: &Value) -> Option<Value> {
             }))
         }
         _ => None,
+    }
+}
+
+/// The images a tool result attached, as chat parts after a line naming
+/// the call. Empty when it attached none.
+fn tool_image_parts(item: &Value) -> Vec<Value> {
+    let images: Vec<Value> = item
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
+        .filter_map(part_to_chat)
+        .collect();
+    if images.is_empty() {
+        return images;
+    }
+    let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+    let mut parts = vec![json!({
+        "type": "text",
+        "text": format!("Image attached by tool call {call_id} (its result is above):"),
+    })];
+    parts.extend(images);
+    parts
+}
+
+fn payload_has_images(payload: &Value) -> bool {
+    payload["messages"].as_array().is_some_and(|msgs| {
+        msgs.iter().any(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
+        })
+    })
+}
+
+/// Put a note that `model` cannot view images in place of every image.
+/// Messages left with text only become plain strings: text-only endpoints
+/// may refuse content arrays outright.
+fn drop_images(payload: &mut Value, model: &str) {
+    let Some(msgs) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for m in msgs {
+        let Some(parts) = m.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        if !parts.iter().any(|p| p["type"] == "image_url") {
+            continue;
+        }
+        let text = parts
+            .iter()
+            .map(|p| match p["type"].as_str() {
+                Some("image_url") => format!("[image omitted: {model} cannot view images]"),
+                _ => p["text"].as_str().unwrap_or("").to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        m["content"] = json!(text);
+    }
+}
+
+/// An error body saying the model takes no image input at all (a text-only
+/// model, a llama.cpp server without its vision projector), as opposed to
+/// a failure unrelated to images. Only acted on when the request carried
+/// images, and only remembered once the same request without them succeeds.
+pub(crate) fn refuses_images(body: &str) -> bool {
+    let s = body.to_ascii_lowercase();
+    // One bad, oversized or filtered image is not a model without vision
+    // (OpenAI: "You uploaded an unsupported image. Please make sure…").
+    let bad_image = ["unsupported image", "invalid image", "too large", "safety", "content policy"]
+        .iter()
+        .any(|k| s.contains(k));
+    if bad_image {
+        return false;
+    }
+    let about = ["image", "vision", "multimodal", "mmproj"].iter().any(|k| s.contains(k));
+    let refused = [
+        "not support", "unsupported", "unknown variant", "only supported", "not a multimodal",
+        "text-only", "text only", "does not accept", "not enabled", "mmproj",
+        // OpenRouter: "No endpoints found that support image input".
+        "support image input",
+    ]
+    .iter()
+    .any(|k| s.contains(k));
+    // Endpoints that take no content arrays at all say so without naming images.
+    (about && refused) || s.contains("must be a string")
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    use crate::provider::CompleteRequest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const URI: &str = "data:image/jpeg;base64,AAAA";
+
+    fn shot_turn() -> Vec<Value> {
+        vec![
+            json!({"role": "user", "content": "check the layout"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "screenshot", "arguments": "{}"}),
+            json!({"type": "function_call", "call_id": "c2", "name": "now", "arguments": "{}"}),
+            crate::vision::function_call_output("c1", "{\"path\":\"a.jpg\",\"attach_image\":true}", Some(URI)),
+            json!({"type": "function_call_output", "call_id": "c2", "output": "noon"}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "looks fine"}]}),
+        ]
+    }
+
+    #[test]
+    fn tool_images_follow_the_tool_results_as_a_user_message() {
+        let msgs = chat_messages("", &shot_turn());
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "user", "assistant"]);
+        assert_eq!(msgs[2]["content"], "{\"path\":\"a.jpg\",\"attach_image\":true}");
+        let parts = msgs[4]["content"].as_array().unwrap();
+        assert!(parts[0]["text"].as_str().unwrap().contains("c1"), "{parts:?}");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], URI);
+        // The image is the last thing sent: it still goes out.
+        let msgs = chat_messages("", &shot_turn()[..5]);
+        assert_eq!(msgs.last().unwrap()["content"][1]["image_url"]["url"], URI);
+        // A stripped image leaves only the tool text.
+        let mut items = shot_turn();
+        crate::vision::strip_attached_images(&mut items);
+        let msgs = chat_messages("", &items);
+        assert!(!msgs.iter().any(|m| m["content"].is_array()), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_model_without_vision_gets_a_note_instead_of_pixels() {
+        let mut payload = json!({"messages": chat_messages("", &shot_turn())});
+        assert!(payload_has_images(&payload));
+        drop_images(&mut payload, "deepseek-chat");
+        assert!(!payload_has_images(&payload));
+        let text = payload["messages"][4]["content"].as_str().unwrap();
+        assert!(text.contains("c1") && text.contains("[image omitted: deepseek-chat cannot view images]"), "{text}");
+    }
+
+    #[test]
+    fn only_refusals_of_image_input_count() {
+        for body in [
+            r#"{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[1]: unknown variant `image_url`, expected `text`"}}"#,
+            r#"{"error":{"code":500,"message":"image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"}}"#,
+            r#"{"error":{"message":"Invalid content type. image_url is only supported by certain models."}}"#,
+            r#"{"object":"error","message":"Qwen3-8B is not a multimodal model"}"#,
+            r#"{"error":{"message":"messages.1.content must be a string"}}"#,
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        ] {
+            assert!(refuses_images(body), "{body}");
+        }
+        for body in [
+            r#"{"error":{"message":"Rate limit reached"}}"#,
+            r#"{"error":{"message":"Invalid image: could not decode"}}"#,
+            r#"{"error":{"message":"tool_choice is not supported"}}"#,
+            r#"{"error":{"message":"You uploaded an unsupported image. Please make sure your image is below 20 MB in size and is of one the following formats: ['png', 'jpeg', 'gif', 'webp'].","code":"invalid_image_format"}}"#,
+            r#"{"error":{"message":"Image too large: not supported above 20 MB"}}"#,
+            r#"{"error":{"message":"Your request was rejected by our safety system: this image is not supported"}}"#,
+        ] {
+            assert!(!refuses_images(body), "{body}");
+        }
+    }
+
+    /// An endpoint that answers a request carrying an image with HTTP 422
+    /// `image_reply`, and one without with 200 if `text_ok` (else 400).
+    async fn endpoint(image_reply: &'static str, text_ok: bool) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        use axum::routing::post;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (h, s) = (hits.clone(), seen.clone());
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let (h, s) = (h.clone(), s.clone());
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    let images = body.to_string().contains("image_url");
+                    s.lock().unwrap().push(body);
+                    if images {
+                        return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, image_reply.to_string());
+                    }
+                    if !text_ok {
+                        return (axum::http::StatusCode::BAD_REQUEST, "maximum context length exceeded".to_string());
+                    }
+                    let ok = json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": "no pixels here"}}]});
+                    (axum::http::StatusCode::OK, ok.to_string())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{port}/v1"), hits, seen)
+    }
+
+    fn image_req() -> CompleteRequest {
+        CompleteRequest {
+            instructions: String::new(),
+            input: vec![json!({"role": "user", "content": [
+                {"type": "input_text", "text": "what is wrong here?"},
+                {"type": "input_image", "image_url": URI},
+                {"type": "input_text", "text": "(image file: .groka/inbox/u.jpg)"}
+            ]})],
+            client_tools: vec![],
+            server_tools: vec![],
+            cache_key: "k".into(),
+            previous_response_id: None,
+            store: false,
+            reasoning_effort: crate::provider::ReasoningEffort::Low,
+            send_reasoning: false,
+            model: String::new(),
+            tool_choice: None,
+        }
+    }
+
+    fn provider(base: String, model: &str) -> OpenAiCompatProvider {
+        let cfg = crate::config::ProviderConfig {
+            kind: crate::config::ProviderKind::Openai,
+            base_url: base,
+            model: model.into(),
+            api_key: String::new(),
+            context_window: 128_000,
+        };
+        OpenAiCompatProvider::new(&cfg, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_image_is_resent_as_a_note_and_remembered() {
+        let (base, hits, seen) = endpoint("unknown variant `image_url`, expected `text`", true).await;
+        let p = provider(base, "deepseek-chat");
+        assert!(p.sees_images("deepseek-chat"));
+        let r = p.complete(image_req()).await.unwrap();
+        assert_eq!(r.text, "no pixels here");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refused once, then resent without the image");
+        assert!(!p.sees_images("deepseek-chat"));
+        assert!(!p.sees_images(""), "empty means the provider's own model");
+        assert!(p.sees_images("other-model"));
+        let resent = seen.lock().unwrap()[1]["messages"][0]["content"].as_str().unwrap().to_string();
+        assert!(resent.contains("what is wrong here?"), "{resent}");
+        assert!(resent.contains("[image omitted: deepseek-chat cannot view images]"), "{resent}");
+        assert!(resent.contains(".groka/inbox/u.jpg"), "{resent}");
+        // Known now: later images go out as the note on the first try,
+        // streamed or not.
+        let quiet = |_: &str| {};
+        let quiet_server = |_: &str, _: &Value| {};
+        p.complete_stream(image_req(), &quiet, &quiet_server, &quiet).await.unwrap();
+        p.clone().complete(image_req()).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_learns_the_refusal_too() {
+        let (base, hits, seen) = endpoint("unknown variant `image_url`, expected `text`", true).await;
+        let p = provider(base, "deepseek-chat");
+        let quiet = |_: &str| {};
+        let quiet_server = |_: &str, _: &Value| {};
+        let r = p.complete_stream(image_req(), &quiet, &quiet_server, &quiet).await.unwrap();
+        assert_eq!(r.text, "no pixels here");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refused once, then resent without the image");
+        assert!(!p.sees_images("deepseek-chat"));
+        let resent = seen.lock().unwrap()[1].clone();
+        assert_eq!(resent["stream"], true);
+        let text = resent["messages"][0]["content"].as_str().unwrap();
+        assert!(text.contains("[image omitted: deepseek-chat cannot view images]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn other_failures_are_not_learned_as_missing_vision() {
+        // One bad image is not a model without vision: no resend.
+        let (base, hits, _) = endpoint("Invalid image: could not decode", true).await;
+        let p = provider(base, "m");
+        let err = p.complete(image_req()).await.unwrap_err().to_string();
+        assert!(err.contains("422") && err.contains("Invalid image"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(p.sees_images("m"));
+        // The resend without the image fails too: the image was not the
+        // problem, and the error the caller sees is the resend's.
+        let (base, hits, _) = endpoint("image input is not supported", false).await;
+        let p = provider(base, "m");
+        let err = p.complete(image_req()).await.unwrap_err().to_string();
+        assert!(err.contains("context length"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(p.sees_images("m"));
     }
 }
 

@@ -806,7 +806,9 @@ pub fn slim_items(items: &[Value]) -> Vec<Value> {
 }
 
 /// Slim tool outputs except the newest `keep` ones. `None` when nothing
-/// would change.
+/// would change. Outputs with attached pixels are left alone: images
+/// expire on their own clock (`vision::IMAGE_KEEP_TURNS`), and one that
+/// is old by position may not have been sent even once.
 pub fn trim_old_outputs(items: &[Value], keep: usize) -> Option<Vec<Value>> {
     let outputs: Vec<usize> = items
         .iter()
@@ -818,6 +820,9 @@ pub fn trim_old_outputs(items: &[Value], keep: usize) -> Option<Vec<Value>> {
     let mut out = items.to_vec();
     let mut changed = false;
     for n in old {
+        if crate::vision::input_has_image(&items[n..=n]) {
+            continue;
+        }
         let slim = slim_items(&items[n..=n]).remove(0);
         if slim != items[n] {
             out[n] = slim;
@@ -834,6 +839,37 @@ pub fn trim_fold(history: &[Value], fixed: u32, after: u32) -> Option<Folded> {
     let trimmed = trim_old_outputs(history, KEEP_RECENT_OUTPUTS)?;
     (fixed.saturating_add(estimate_tokens("", &trimmed)) <= after)
         .then(|| Folded { kept: trimmed.len(), items: trimmed, dropped: 0, method: "trim-outputs".into() })
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn trimming_old_outputs_keeps_attached_pixels() {
+        let big = "x".repeat(20_000);
+        let mut items = vec![json!({"role": "user", "content": "check the layout"})];
+        items.push(json!({"type": "function_call", "call_id": "old", "name": "cat", "arguments": "{}"}));
+        items.push(json!({"type": "function_call_output", "call_id": "old", "output": big}));
+        // One parallel batch: the screenshot is the fifth-newest output.
+        items.push(json!({"type": "function_call", "call_id": "img", "name": "read_image", "arguments": "{}"}));
+        for id in ["a", "b", "c", "d"] {
+            items.push(json!({"type": "function_call", "call_id": id, "name": "cat", "arguments": "{}"}));
+        }
+        items.push(crate::vision::function_call_output("img", "{\"path\":\"p.jpg\",\"attach_image\":true}", Some("data:image/jpeg;base64,abc")));
+        for id in ["a", "b", "c", "d"] {
+            items.push(json!({"type": "function_call_output", "call_id": id, "output": "ok"}));
+        }
+        let trimmed = trim_old_outputs(&items, KEEP_RECENT_OUTPUTS).expect("the big old output is slimmed");
+        assert!(item_text(&trimmed[2]).len() < 6_000);
+        assert_eq!(trimmed[8], items[8], "the image output is untouched");
+        assert!(crate::vision::input_has_image(&trimmed));
+        let t = trim_fold(&items, 0, u32::MAX).unwrap();
+        assert!(crate::vision::input_has_image(&t.items));
+        // Only the image left among the old outputs: nothing to trim.
+        let only_image: Vec<Value> = items.iter().enumerate().filter(|(n, _)| *n != 2).map(|(_, i)| i.clone()).collect();
+        assert!(trim_old_outputs(&only_image, KEEP_RECENT_OUTPUTS).is_none());
+    }
 }
 
 /// About how big the history would be after a model fold made now (local

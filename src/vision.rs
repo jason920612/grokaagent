@@ -127,6 +127,15 @@ pub fn retain_recent_images(items: &mut [Value], keep: usize) {
     }
 }
 
+/// [`retain_recent_images`], but the image items in `items[seen..]` are
+/// never stripped and count against `keep` first: the model has not been
+/// sent them yet, and would read `attach_image: true` beside no pixels.
+pub fn retain_seen_images(items: &mut [Value], keep: usize, seen: usize) {
+    let seen = seen.min(items.len());
+    let unseen = image_item_count(&items[seen..]);
+    retain_recent_images(&mut items[..seen], keep.saturating_sub(unseen));
+}
+
 /// After a complete that included images, expire or cap them.
 pub fn prune_attached_images(items: &mut [Value], turns_seen: u32) {
     if turns_seen >= IMAGE_KEEP_TURNS {
@@ -152,11 +161,22 @@ fn strip_one_item_images(item: &mut Value) {
             .find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
             .and_then(|p| p.get("text").and_then(Value::as_str))
             .unwrap_or("");
-        item["output"] = Value::String(text.to_string());
+        let note = detached_note(1);
+        item["output"] = Value::String(if text.is_empty() { note } else { format!("{text}\n{note}") });
         return;
     }
     if item.get("role").and_then(Value::as_str) == Some("user") {
         strip_user_content_images(item);
+    }
+}
+
+/// Left where stripped pixels were, so the model knows it no longer has
+/// them and how to look again (tool results and user turns name the path).
+fn detached_note(n: usize) -> String {
+    if n == 1 {
+        "(image no longer attached; read_image its path to view it again)".into()
+    } else {
+        format!("({n} images no longer attached; read_image their paths to view them again)")
     }
 }
 
@@ -177,11 +197,7 @@ fn strip_user_content_images(item: &mut Value) {
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
-    let note = if n == 1 {
-        "(1 張圖片)".to_string()
-    } else {
-        format!("({n} 張圖片)")
-    };
+    let note = detached_note(n);
     if text.trim().is_empty() {
         text = note;
     } else {
@@ -190,7 +206,9 @@ fn strip_user_content_images(item: &mut Value) {
     item["content"] = Value::String(text);
 }
 
-/// User turn for the Responses API: plain string, or text + `input_image` parts.
+/// User turn for the Responses API: plain string, or text + `input_image`
+/// parts. Each image is followed by its workspace path, so the model can
+/// use the file and read it again once the pixels expire.
 pub fn user_message(text: &str, images: &[PathBuf], workspace: &Path) -> Value {
     if images.is_empty() {
         return json!({"role": "user", "content": text});
@@ -202,11 +220,17 @@ pub fn user_message(text: &str, images: &[PathBuf], workspace: &Path) -> Value {
     for p in images {
         let rel = p.to_string_lossy();
         match resolve_in_workspace(workspace, &rel).and_then(|abs| data_uri_from_file(&abs)) {
-            Ok(uri) => parts.push(json!({
-                "type": "input_image",
-                "image_url": uri,
-                "detail": "high"
-            })),
+            Ok(uri) => {
+                parts.push(json!({
+                    "type": "input_image",
+                    "image_url": uri,
+                    "detail": "high"
+                }));
+                parts.push(json!({
+                    "type": "input_text",
+                    "text": format!("(image file: {})", rel.replace('\\', "/"))
+                }));
+            }
             Err(e) => {
                 parts.push(json!({
                     "type": "input_text",
@@ -219,6 +243,59 @@ pub fn user_message(text: &str, images: &[PathBuf], workspace: &Path) -> Value {
         json!({"role": "user", "content": text})
     } else {
         json!({"role": "user", "content": parts})
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    fn shot(id: &str) -> Value {
+        function_call_output(id, &format!("{{\"path\":\"{id}.jpg\"}}"), Some("data:image/jpeg;base64,abc"))
+    }
+
+    #[test]
+    fn user_images_carry_their_path_through_the_strip() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = from_rgba(32, 32, vec![0, 0, 255, 255].repeat(32 * 32)).unwrap();
+        save_jpeg(&dir.path().join(".groka/inbox/u.jpg"), &img).unwrap();
+        let v = user_message("fix this", &[PathBuf::from(".groka/inbox/u.jpg")], dir.path());
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[2]["text"], "(image file: .groka/inbox/u.jpg)");
+        let mut items = vec![v];
+        strip_attached_images(&mut items);
+        let text = items[0]["content"].as_str().unwrap();
+        assert!(text.starts_with("fix this\n(image file: .groka/inbox/u.jpg)\n"), "{text}");
+        assert!(text.contains("no longer attached") && text.contains("read_image"), "{text}");
+    }
+
+    #[test]
+    fn a_stripped_tool_image_says_so_once() {
+        let mut items = vec![shot("c1")];
+        strip_attached_images(&mut items);
+        let once = items[0]["output"].as_str().unwrap().to_string();
+        assert_eq!(once, format!("{{\"path\":\"c1.jpg\"}}\n{}", detached_note(1)));
+        strip_attached_images(&mut items);
+        assert_eq!(items[0]["output"], once.as_str());
+    }
+
+    #[test]
+    fn images_not_sent_yet_are_never_capped_away() {
+        // Two seen, then a batch of three the model has not been sent.
+        let mut items: Vec<Value> = ["s1", "s2", "n1", "n2", "n3"].into_iter().map(shot).collect();
+        retain_seen_images(&mut items, 3, 2);
+        let kept: Vec<bool> = items.iter().map(value_has_image).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        // More unseen than the cap: all of them still go out once.
+        let mut items: Vec<Value> = ["s1", "n1", "n2"].into_iter().map(shot).collect();
+        retain_seen_images(&mut items, 1, 1);
+        assert_eq!(image_item_count(&items), 2);
+        assert!(!value_has_image(&items[0]));
+        // `seen` past the end is clamped.
+        let mut items = vec![shot("s1"), shot("s2")];
+        retain_seen_images(&mut items, 1, 9);
+        assert!(!value_has_image(&items[0]) && value_has_image(&items[1]));
     }
 }
 
@@ -994,7 +1071,9 @@ mod tests {
         assert!(input_has_image(&items));
         strip_attached_images(&mut items);
         assert!(!input_has_image(&items));
-        assert_eq!(items[0]["output"], "{\"path\":\"a.jpg\"}");
+        let text = items[0]["output"].as_str().unwrap();
+        assert!(text.starts_with("{\"path\":\"a.jpg\"}\n"), "{text}");
+        assert!(text.contains("read_image"), "{text}");
     }
 
     #[test]
@@ -1011,7 +1090,7 @@ mod tests {
         retain_recent_images(&mut items, KEEP_RECENT_IMAGES);
         assert_eq!(image_item_count(&items), KEEP_RECENT_IMAGES);
         assert!(!value_has_image(&items[0]));
-        assert_eq!(items[0]["output"], "img-1");
+        assert!(items[0]["output"].as_str().unwrap().starts_with("img-1\n"));
         for item in &items[1..] {
             assert!(value_has_image(item));
         }
@@ -1028,7 +1107,7 @@ mod tests {
         assert!(input_has_image(&items));
         prune_attached_images(&mut items, IMAGE_KEEP_TURNS);
         assert!(!input_has_image(&items));
-        assert_eq!(items[0]["output"], "shot");
+        assert!(items[0]["output"].as_str().unwrap().starts_with("shot\n"));
     }
 
     #[test]
@@ -1055,7 +1134,7 @@ mod tests {
         strip_attached_images(&mut items);
         assert!(!input_has_image(&items));
         assert!(items[0]["content"].as_str().unwrap().contains("look"));
-        assert!(items[0]["content"].as_str().unwrap().contains("圖片"));
+        assert!(items[0]["content"].as_str().unwrap().contains("read_image"));
     }
 
     #[test]
