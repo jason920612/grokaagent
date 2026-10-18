@@ -30,6 +30,8 @@ pub const MAX_CRITERIA: usize = 2000;
 pub const MAX_ITEMS: usize = 20;
 /// Tool calls the proxy may make in one review before it must answer.
 pub const MAX_PROXY_TOOL_CALLS: usize = 8;
+/// Extra tries after a proxy reply that is not usable JSON.
+const MAX_FORMAT_RETRIES: usize = 3;
 /// Entries of the proxy's memory that are kept, and the characters of it
 /// that go into one request.
 const MAX_LOG: usize = 40;
@@ -849,7 +851,7 @@ fn extract_json(raw: &str) -> Result<Value> {
         return Err(Error::Provider("the user's proxy did not return JSON".into()));
     }
     serde_json::from_str(&t[start..=end])
-        .map_err(|_| Error::Provider("the user's proxy returned invalid JSON".into()))
+        .map_err(|e| Error::Provider(format!("the user's proxy returned invalid JSON: {e}")))
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -1349,9 +1351,12 @@ async fn ask_proxy<P: Provider>(
     Err(Error::Provider("the user's proxy did not answer".into()))
 }
 
-/// A proxy request and its parse, tried twice (about 3s apart). A model
-/// that rejects the reasoning effort is retried without it.
-async fn ask_twice<P: Provider, T>(
+/// A proxy request and its parse. A failed request is tried twice (about
+/// 3s apart); a model that rejects the reasoning effort is retried without
+/// it. A reply that does not parse (bad JSON, a missing field) is asked
+/// again at once, up to [`MAX_FORMAT_RETRIES`] times, with the error and
+/// the bad reply shown so the model can fix it.
+async fn ask_with_retries<P: Provider, T>(
     call: &ProxyCall<'_, P>,
     instructions: &str,
     prompt: &str,
@@ -1359,23 +1364,42 @@ async fn ask_twice<P: Provider, T>(
     parse: impl Fn(&str) -> Result<T>,
 ) -> Result<T> {
     let mut send = call.send_reasoning;
-    let mut last = None;
-    for attempt in 0..2 {
-        if attempt > 0 {
-            tokio::time::sleep(retry_delay()).await;
-        }
-        match ask_proxy(call, instructions, prompt, tools, send).await.and_then(|t| parse(&t)) {
-            Ok(v) => return Ok(v),
+    let mut failed = 0usize;
+    let mut malformed = 0usize;
+    let mut asked = prompt.to_string();
+    loop {
+        match ask_proxy(call, instructions, &asked, tools, send).await {
+            Ok(text) => match parse(&text) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    malformed += 1;
+                    if malformed > MAX_FORMAT_RETRIES {
+                        return Err(e);
+                    }
+                    asked = format!("{prompt}\n\n{}", format_retry_note(&text, &e));
+                }
+            },
             Err(e) => {
+                failed += 1;
+                if failed >= 2 {
+                    return Err(e);
+                }
                 let text = e.to_string().to_ascii_lowercase();
                 if send && (text.contains("reasoning") || text.contains("effort")) {
                     send = false;
                 }
-                last = Some(e);
+                tokio::time::sleep(retry_delay()).await;
             }
         }
     }
-    Err(last.unwrap_or_else(|| Error::Provider("the user's proxy did not answer".into())))
+}
+
+/// Appended to the prompt after a reply that did not parse.
+fn format_retry_note(reply: &str, e: &Error) -> String {
+    format!(
+        "Your previous reply could not be used ({e}). It was:\n{}\n\nReply again with ONE valid JSON object in the format asked for, and nothing else: no prose, no code fence, double-quoted keys and strings, newlines inside strings escaped as \\n, no trailing commas.",
+        head_tail(reply, 1_000, 1_000),
+    )
 }
 
 fn meta(run_id: &str) -> EventMeta {
@@ -1733,7 +1757,7 @@ async fn intake<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], epoch: 
         return;
     };
     let prompt = intake_prompt(&snap, history);
-    let questions = match ask_twice(call, PROXY_INTAKE_INSTRUCTIONS, &prompt, false, parse_intake).await {
+    let questions = match ask_with_retries(call, PROXY_INTAKE_INSTRUCTIONS, &prompt, false, parse_intake).await {
         Ok(q) => q,
         Err(e) => {
             // Intake is optional: plan with what is known.
@@ -1833,7 +1857,7 @@ async fn review<P: Provider>(
     // Taken after intake, so the plan sees the criteria the user added.
     let snap = hub.snapshot();
     let prompt = review_prompt(&snap, kind, why, &history_excerpt(history), last_text);
-    let verdict = match ask_twice(call, PROXY_INSTRUCTIONS, &prompt, true, parse_verdict).await {
+    let verdict = match ask_with_retries(call, PROXY_INSTRUCTIONS, &prompt, true, parse_verdict).await {
         Ok(v) => v,
         Err(e) => {
             proxy_failed(call, epoch, &e);
@@ -2124,7 +2148,7 @@ pub async fn answer_question<P: Provider>(call: &ProxyCall<'_, P>, q: &Question)
     let snap = hub.snapshot();
     let epoch = hub.epoch();
     let prompt = ask_prompt(&snap, q, &hub.ask_context());
-    let decision = match ask_twice(call, PROXY_ASK_INSTRUCTIONS, &prompt, false, |raw| parse_decision(raw, q)).await {
+    let decision = match ask_with_retries(call, PROXY_ASK_INSTRUCTIONS, &prompt, false, |raw| parse_decision(raw, q)).await {
         Ok(d) => d,
         Err(e) => {
             proxy_failed(call, epoch, &e);
@@ -2700,8 +2724,8 @@ mod proxy_tests {
         let out = prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await;
         assert!(out.unwrap().contains("開始吧"));
         assert!(!hub.snapshot().paused);
-        // Two failures: paused with a note; no more calls while paused.
-        let provider = Proxy::new(vec![Err(Error::Provider("HTTP 500".into())), says(json!({"oops": 1}))]);
+        // Two failed requests: paused with a note; no more calls while paused.
+        let provider = Proxy::new(vec![Err(Error::Provider("HTTP 500".into())), Err(Error::Provider("HTTP 502".into()))]);
         let call = proxy_call(&hub, &provider, dir.path(), &rec);
         assert!(after_natural_stop(&call, &[], "我做完了").await.is_none());
         assert_eq!(provider.n(), 2);
@@ -2720,6 +2744,41 @@ mod proxy_tests {
         let out = after_wait(&call, &[], "", &[]).await.unwrap();
         assert!(out.contains("繼續做表單"));
         assert!(provider.calls.lock().unwrap()[0].input[0]["content"].as_str().unwrap().contains("the user resumed you"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reply_is_asked_again_with_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        let rec = Rec(Mutex::new(Vec::new()));
+        let text = |t: &str| Ok(CompleteResponse { text: t.into(), ..CompleteResponse::new("p") });
+        let provider = Proxy::new(vec![
+            text(r#"{"status": "continue", "message": "第一行
+第二行",}"#),
+            text("好的，我們開始吧"),
+            says(json!({"oops": 1})),
+            says(json!({"status": "continue", "message": "開始吧"})),
+        ]);
+        let out = prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[], true).await;
+        assert!(out.unwrap().contains("開始吧"));
+        assert!(!hub.snapshot().paused);
+        let reqs = provider.calls.lock().unwrap();
+        assert_eq!(reqs.len(), 4);
+        let first = reqs[0].input[0]["content"].as_str().unwrap();
+        assert!(!first.contains("could not be used"));
+        let second = reqs[1].input[0]["content"].as_str().unwrap();
+        assert!(second.starts_with(first), "the original prompt is kept");
+        assert!(second.contains("invalid JSON") && second.contains("第二行"), "{second}");
+        let last = reqs[3].input[0]["content"].as_str().unwrap();
+        assert!(last.contains("no status") && !last.contains("第二行"), "only the latest bad reply: {last}");
+        drop(reqs);
+        // Malformed every time: paused after the extra tries.
+        let provider = Proxy::new((0..=MAX_FORMAT_RETRIES).map(|_| text("not json")).collect());
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        assert!(after_natural_stop(&call, &[], "我做完了").await.is_none());
+        assert_eq!(provider.n(), MAX_FORMAT_RETRIES + 1);
+        assert!(hub.snapshot().paused);
     }
 
     #[tokio::test]
