@@ -26,7 +26,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, freeze_composer: bool) -> Posit
     app.ui.hits.clear();
     app.ui.chat_glyphs.clear();
     app.ui.side_items.clear();
-    app.images.blits.clear();
+    app.images.begin_frame();
     app.ui.area = f.area();
     app.refresh_list(false);
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(TEXT)), f.area());
@@ -123,7 +123,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, freeze_composer: bool) -> Posit
     if let Some(pos) = overlays::draw(f, app) {
         cursor = pos;
     }
-    crate::preview::reveal_obscured_graphics(f.buffer_mut(), &mut app.images.blits);
+    app.images.finish_frame(f.buffer_mut());
     cursor
 }
 

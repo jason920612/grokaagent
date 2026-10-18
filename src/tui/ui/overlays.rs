@@ -7,10 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::chat::{blit, cached_proto, wrap};
+use super::chat::{blit, wrap};
 use super::{centered, chip, draw_edit, line, panel};
 use crate::folderpick;
-use crate::tui::app::{App, Hit, TaskUi};
+use crate::tui::app::{App, Hit, ImageKey, TaskUi};
 use crate::tui::edit::{caret_row_col, wrap_lines};
 use crate::tui::theme::*;
 
@@ -259,23 +259,28 @@ fn image(f: &mut Frame, app: &mut App, area: Rect) {
     if inner.area() == 0 {
         return;
     }
-    let ws = app.workspace();
-    let abs = ws.join(&rel);
-    match app.images.picker.clone().filter(crate::preview::uses_graphics) {
-        Some(picker) => {
-            let (w, h) = crate::preview::cell_size_fit(&picker, &abs, inner.width, inner.height);
-            match cached_proto(&mut app.images, &ws, &rel, w, h) {
-                Some(proto) => {
-                    let pa = proto.area();
-                    let draw = Rect::new(inner.x, inner.y, pa.width.min(inner.width), pa.height.min(inner.height));
-                    if draw.area() > 0 {
-                        blit(f, &mut app.images, &proto, draw);
-                    }
-                }
-                None => line(f, inner, "[無法預覽]", Style::default().fg(DIM)),
+    let key = ImageKey::of(app.workspace().join(&rel));
+    let (w, h) = app.images.cells(&key, inner.width, inner.height, false);
+    if app.images.defer(&key, w, h) {
+        line(f, inner, "…", Style::default().fg(DIM));
+        return;
+    }
+    if !app.images.uses_graphics() {
+        let buf = f.buffer_mut();
+        for (i, l) in app.images.halfblock(&key, w, h).iter().take(inner.height as usize).enumerate() {
+            buf.set_line(inner.x, inner.y + i as u16, l, inner.width);
+        }
+        return;
+    }
+    match app.images.graphic(&key, w, h) {
+        Some(g) => {
+            let pa = g.area();
+            let draw = Rect::new(inner.x, inner.y, pa.width.min(inner.width), pa.height.min(inner.height));
+            if draw.area() > 0 {
+                blit(f, &mut app.images, &g, draw);
             }
         }
-        None => f.render_widget(Paragraph::new(crate::preview::from_path(&abs, inner.width, inner.height)), inner),
+        None => line(f, inner, "[無法預覽]", Style::default().fg(DIM)),
     }
 }
 

@@ -62,7 +62,9 @@ pub(crate) fn handle(app: &mut App, kind: MouseEventKind, col: u16, row: u16, mo
 }
 
 fn modal_click(app: &mut App, hit: Option<Hit>, col: u16, row: u16, shift: bool) {
-    let inside = hit.is_some_and(|h| h != Hit::Chat && !matches!(h, Hit::SideScroll));
+    // The hits drawn under the modal stay in the list; only its panel is inside.
+    let p = Position::new(col, row);
+    let inside = app.ui.hits.iter().any(|(r, h)| *h == Hit::Overlay && r.contains(p));
     match hit {
         Some(Hit::OverlayClose) => close_modal(app),
         Some(Hit::AskOption(i)) => activate_ask_option(app, i as usize, true),

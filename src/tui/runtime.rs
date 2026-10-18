@@ -78,6 +78,7 @@ fn boot_app(terminal: &Term, mut opts: TuiOptions, rt: Rt) -> Result<App> {
     })));
     let picker = Some(crate::preview::detect_picker());
     let mut app = App::new(opts, store, boot, settings, skills, rt, picker);
+    app.images.cell_px = crate::preview::winsize_cell();
     app.ui.side_open = terminal.size().map(|s| s.width >= SIDEBAR_MIN_TERM).unwrap_or(true);
     app.settings.catalog.ensure_current(&app.opts.model, app.opts.reasoning_effort);
     app.rebuild_catalog();
@@ -170,6 +171,9 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
         if size != last_size {
             last_size = size;
             paint.all();
+        }
+        if app.images.redraw_due() {
+            paint.content = true;
         }
         paint.frame(terminal, &mut app)?;
 
@@ -316,7 +320,12 @@ impl Painter {
     }
 
     fn full(&mut self, terminal: &mut Term, app: &mut App, freeze: bool) -> Result<()> {
+        let before = terminal.get_frame().area();
         terminal.autoresize().map_err(Error::Io)?;
+        if terminal.get_frame().area() != before {
+            // ratatui cleared the screen, Sixel / iTerm2 pictures included.
+            app.images.resized(crate::preview::winsize_cell());
+        }
         let caret = {
             let mut frame = terminal.get_frame();
             ui::draw(&mut frame, app, freeze)

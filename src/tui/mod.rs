@@ -22,6 +22,8 @@ mod ui;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_tui;
 
 use std::path::PathBuf;
 

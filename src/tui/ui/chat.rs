@@ -8,11 +8,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use ratatui_image::Image;
 use serde_json::Value;
 
 use crate::md;
-use crate::tui::app::{App, GlyphLine, Hit, Images};
+use crate::preview::{Graphic, GraphicBlit, Placement};
+use crate::tui::app::{App, GlyphLine, Hit, ImageKey, Images};
 use crate::tui::edit::{ch_width, display_cols};
 use crate::tui::model::rows::{AgentMsg, Row, Think, ToolCall, ToolGroup};
 use crate::tui::model::session::{ChatSel, ChatView};
@@ -24,8 +24,8 @@ struct Item {
     line: Line<'static>,
     hit: Option<Hit>,
     wrap: bool,
-    /// Painted as a graphic of (path, width, height) cells.
-    graphic: Option<(String, u16, u16)>,
+    /// Painted as a picture of (file, width, height) cells.
+    graphic: Option<(ImageKey, u16, u16)>,
     /// Selectable: transcript row + char offset of this line.
     select: Option<(usize, usize)>,
     /// Live think header whose clock ticks.
@@ -509,48 +509,30 @@ fn image_block(
     rel: &str,
     caption: String,
     cols: u16,
+    view_h: u16,
     selected: bool,
 ) {
     let hit = Some(Hit::ChatImage(image_hits.len() as u16));
     image_hits.push(rel.to_string());
+    let mut caption_rows = 0;
     if !caption.is_empty() {
         let style = if selected {
             Style::default().fg(Color::Black).bg(ACCENT)
         } else {
             Style::default().fg(DIM)
         };
-        out.push(Item::new(Line::from(Span::styled(format!("      {caption}"), style)), hit));
+        let line = Line::from(Span::styled(format!("      {caption}"), style));
+        caption_rows = wrap(line.clone(), cols).len() as u16;
+        out.push(Item::new(line, hit));
     }
-    let max_cols = cols.saturating_sub(crate::preview::INDENT);
-    let max_rows = crate::preview::MAX_ROWS;
-    if let Some(picker) = images.picker.as_ref().filter(|p| crate::preview::uses_graphics(p)) {
-        let key = (rel.to_string(), max_cols, max_rows);
-        let (w, h) = match images.cells.get(&key) {
-            Some(&sz) => sz,
-            None => {
-                let sz = crate::preview::cell_size_for(picker, &workspace.join(rel), max_cols, max_rows);
-                images.cells.insert(key, sz);
-                sz
-            }
-        };
-        out.push(Item {
-            graphic: Some((rel.to_string(), w.max(1), h.max(1))),
-            ..Item::raw(Line::from(""), hit)
-        });
-        return;
-    }
-    let cols = max_cols.min(crate::preview::MAX_COLS).max(4);
-    let key = (rel.to_string(), cols);
-    let lines = images
-        .halfblocks
-        .entry(key)
-        .or_insert_with(|| crate::preview::from_path(&workspace.join(rel), cols, crate::preview::MAX_ROWS))
-        .clone();
-    for line in lines {
-        let mut padded = vec![Span::raw("      ")];
-        padded.extend(line.spans);
-        out.push(Item::raw(Line::from(padded), hit));
-    }
+    // Graphics are painted only when they fit, so never be taller than the chat.
+    let max_rows = crate::preview::MAX_ROWS.min(view_h.saturating_sub(caption_rows)).max(1);
+    let key = ImageKey::of(workspace.join(rel));
+    let (w, h) = images.cells(&key, cols.saturating_sub(crate::preview::INDENT), max_rows, true);
+    out.push(Item {
+        graphic: Some((key, w.max(1), h.max(1))),
+        ..Item::raw(Line::from(""), hit)
+    });
 }
 
 fn items(
@@ -562,6 +544,7 @@ fn items(
     workspace: &Path,
     image_hits: &mut Vec<String>,
     cols: u16,
+    view_h: u16,
 ) -> Vec<Item> {
     let mut out = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
@@ -603,7 +586,7 @@ fn items(
                 };
                 for (p, caption) in pics {
                     let sel = matches!(&view.sel, ChatSel::Image(x) if *x == p);
-                    image_block(images, workspace, image_hits, &mut out, &p, caption, cols, sel);
+                    image_block(images, workspace, image_hits, &mut out, &p, caption, cols, view_h, sel);
                 }
             }
         }
@@ -628,8 +611,8 @@ enum Paint {
         glyph: Option<(usize, usize, Vec<char>)>,
         clock: bool,
     },
-    Graphic {
-        rel: String,
+    Picture {
+        key: ImageKey,
         width: u16,
         height: u16,
         hit: Option<Hit>,
@@ -688,9 +671,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = &s.view_transcript().rows;
     let mut paints = Vec::new();
-    for item in items(rows, &view, child, &label, images, &workspace, &mut ui.image_hits, inner.width) {
-        if let Some((rel, width, height)) = item.graphic {
-            paints.push(Paint::Graphic { rel, width, height, hit: item.hit });
+    for item in items(rows, &view, child, &label, images, &workspace, &mut ui.image_hits, inner.width, inner.height) {
+        if let Some((key, width, height)) = item.graphic {
+            paints.push(Paint::Picture { key, width, height, hit: item.hit });
             continue;
         }
         match item.select {
@@ -720,7 +703,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let height_of = |p: &Paint| match p {
         Paint::Line { .. } => 1,
-        Paint::Graphic { height, .. } => *height,
+        Paint::Picture { height, .. } => *height,
     };
     let total: u16 = paints.iter().map(height_of).sum();
     let max_off = total.saturating_sub(inner.height);
@@ -729,6 +712,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     view.scroll = view.scroll.min(max_off);
     let top = if view.stick_bottom { max_off } else { max_off - view.scroll };
     let vis_end = top + inner.height;
+    let jump = !view.stick_bottom && ui.image_view.is_none();
+    let label = jump_rect(area).filter(|_| jump);
     let mut y = 0u16;
     for paint in paints {
         let h = height_of(&paint);
@@ -767,11 +752,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
             }
-            Paint::Graphic { rel, width, height, hit } => {
+            Paint::Picture { key, width, height, hit } => {
                 let vis_h = end.min(vis_end) - start.max(top);
-                if start >= top && end <= vis_end {
-                    paint_graphic(f, images, &workspace, &rel, width, height, Rect::new(inner.x, sy, inner.width, height));
-                }
+                let slot = Rect::new(inner.x, sy, inner.width, vis_h);
+                let pic = Rect::new(inner.x + crate::preview::INDENT, sy, width, vis_h);
+                let covered = label.is_some_and(|r| r.intersects(pic));
+                paint_picture(f, images, &key, (width, height), slot, top.saturating_sub(start), covered);
                 if let Some(kind) = hit {
                     ui.hits.push((Rect::new(inner.x, sy, inner.width, vis_h.max(1)), kind));
                 }
@@ -779,7 +765,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     draw_scrollbar(f, ui, &view, max_off, inner.height);
-    if !view.stick_bottom && ui.image_view.is_none() {
+    if jump {
         draw_jump_bottom(f, ui, area);
     }
     let tool = view.open_tool.and_then(|(r, c)| s.view_transcript().call(r, c).cloned());
@@ -790,57 +776,65 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     s.views.insert(key, view);
 }
 
-fn paint_graphic(f: &mut Frame, images: &mut Images, workspace: &Path, rel: &str, w: u16, h: u16, slot: Rect) {
-    let Some(proto) = cached_proto(images, workspace, rel, w, h) else {
-        f.render_widget(
-            Paragraph::new(Span::styled("      [無法預覽]", Style::default().fg(DIM))),
-            Rect::new(slot.x, slot.y, slot.width, 1),
-        );
+/// Paint the rows of a picture that are on screen: `slot` holds what fits
+/// below the `skip` rows scrolled off the top. `covered`: the jump-to-latest
+/// label sits on it.
+fn paint_picture(
+    f: &mut Frame,
+    images: &mut Images,
+    key: &ImageKey,
+    (w, h): (u16, u16),
+    slot: Rect,
+    skip: u16,
+    covered: bool,
+) {
+    let x = slot.x + crate::preview::INDENT;
+    let width = slot.width.saturating_sub(crate::preview::INDENT);
+    if !images.uses_graphics() {
+        // Decoded only once on screen, then cached.
+        let lines = images.halfblock(key, w, h);
+        for (i, line) in lines.iter().skip(skip as usize).take(slot.height as usize).enumerate() {
+            f.buffer_mut().set_line(x, slot.y + i as u16, line, width);
+        }
+        return;
+    }
+    if skip > 0 || slot.height < h || covered {
+        // Graphics cannot be clipped; say what the gap is.
+        dim_note(f, slot, "[圖片 · 捲動以顯示]");
+        return;
+    }
+    let Some(g) = images.graphic(key, w, h) else {
+        dim_note(f, slot, "[無法預覽]");
         return;
     };
-    let pa = proto.area();
-    let draw = Rect::new(
-        slot.x + crate::preview::INDENT,
-        slot.y,
-        pa.width.min(slot.width.saturating_sub(crate::preview::INDENT)),
-        pa.height.min(h),
-    );
+    let pa = g.area();
+    let draw = Rect::new(x, slot.y, pa.width.min(width), pa.height.min(h));
     if draw.width > 0 && draw.height > 0 {
-        blit(f, images, &proto, draw);
+        blit(f, images, &g, draw);
     }
 }
 
-pub(crate) fn cached_proto(
-    images: &mut Images,
-    workspace: &Path,
-    rel: &str,
-    w: u16,
-    h: u16,
-) -> Option<ratatui_image::protocol::Protocol> {
-    let key = (rel.to_string(), w, h);
-    if let Some(p) = images.protos.get(&key) {
-        return Some(p.clone());
-    }
-    let picker = images.picker.clone()?;
-    let proto = crate::preview::protocol_for(&picker, &workspace.join(rel), w, h)?;
-    images.protos.insert(key, proto.clone());
-    Some(proto)
+fn dim_note(f: &mut Frame, slot: Rect, text: &str) {
+    f.render_widget(
+        Paragraph::new(Span::styled(format!("      {text}"), Style::default().fg(DIM))),
+        Rect::new(slot.x, slot.y, slot.width, 1.min(slot.height)),
+    );
 }
 
-/// Sixel / iTerm2 payloads go out after the frame; others render in place.
-pub(crate) fn blit(f: &mut Frame, images: &mut Images, proto: &ratatui_image::protocol::Protocol, draw: Rect) {
-    if let Some(data) = crate::preview::immediate_payload(proto) {
-        crate::preview::reserve_graphic_cells(f.buffer_mut(), draw);
-        images.blits.push(crate::preview::GraphicBlit {
+/// Reserve `draw` for a graphic. Sixel / iTerm2 payloads go out after the
+/// frame; Kitty is rendered once the overlays are drawn.
+pub(crate) fn blit(f: &mut Frame, images: &mut Images, g: &Graphic, draw: Rect) {
+    crate::preview::reserve_graphic_cells(f.buffer_mut(), draw);
+    match g {
+        Graphic::Immediate { data, .. } => images.blits.push(GraphicBlit {
             x: draw.x,
             y: draw.y,
             width: draw.width,
             height: draw.height,
-            data: data.to_string(),
-        });
-        return;
+            data: data.clone(),
+        }),
+        Graphic::Placed(proto) => images.placements.push(Placement { area: draw, proto: proto.clone() }),
     }
-    f.render_widget(Image::new(proto), draw);
 }
 
 pub(crate) fn thumb_h(total: u16, view_h: u16, track_h: u16) -> u16 {
@@ -893,17 +887,19 @@ fn draw_scrollbar(f: &mut Frame, ui: &mut crate::tui::app::Ui, view: &ChatView, 
     ui.hits.push((thumb, Hit::ScrollThumb));
 }
 
+const JUMP_LABEL: &str = " ▼ 最新 ";
+
+fn jump_rect(chat: Rect) -> Option<Rect> {
+    let w = display_cols(JUMP_LABEL);
+    (chat.width >= w + 2 && chat.height >= 2).then(|| Rect::new(chat.x + (chat.width - w) / 2, chat.bottom() - 1, w, 1))
+}
+
 fn draw_jump_bottom(f: &mut Frame, ui: &mut crate::tui::app::Ui, chat: Rect) {
-    let label = " ▼ 最新 ";
-    let w = display_cols(label);
-    if chat.width < w + 2 || chat.height < 2 {
-        return;
-    }
-    let r = Rect::new(chat.x + (chat.width - w) / 2, chat.bottom() - 1, w, 1);
+    let Some(r) = jump_rect(chat) else { return };
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(Span::styled(
-            label,
+            JUMP_LABEL,
             Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         r,
