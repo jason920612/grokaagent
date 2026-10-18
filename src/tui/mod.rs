@@ -26,6 +26,8 @@ mod tests;
 mod tests_input;
 #[cfg(test)]
 mod tests_tui;
+#[cfg(test)]
+mod tests_web;
 
 use std::path::PathBuf;
 

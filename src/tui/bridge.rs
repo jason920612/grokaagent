@@ -46,7 +46,7 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         import_codex,
         kind: st.conn.kind.as_str().to_string(),
         base_url: st.endpoint.text.clone(),
-        api_key: st.api_key.text.clone(),
+        has_api_key: !st.api_key.text.trim().is_empty(),
         context: st.context.text.clone(),
         skills: st
             .skill_list
@@ -112,7 +112,11 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
                 current: m.id == app.current,
             })
             .collect(),
-        queue: s.queue.iter().map(|q| hub::UiQueued { text: q.text.clone(), images: q.images.len() }).collect(),
+        queue: s
+            .queue
+            .iter()
+            .map(|q| hub::UiQueued { text: q.text.clone(), images: q.images.len(), paths: q.images.clone() })
+            .collect(),
         pending: s.pending.clone(),
         send_mode: match app.ui.send_mode {
             SendMode::Queue => "queue".into(),
@@ -163,7 +167,10 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         }),
         task_summary: ui_task("status", String::new()),
         receipts: app.web.receipts.clone(),
-        web_url: app.web.url.clone().unwrap_or_default(),
+        // Without the one-time code: every browser gets the snapshot.
+        web_url: app.web.url.as_deref().map(|u| u.split('?').next().unwrap_or(u).to_string()).unwrap_or_default(),
+        pending_max: crate::vision::MAX_USER_IMAGES,
+        upload_max: hub::UPLOAD_MAX,
     }
 }
 
@@ -445,6 +452,21 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
             };
             receipt(app, request_id, result);
         }
+        UiCommand::RemoveQueued { session_id, request_id, index, expected, images } => {
+            if app.web.receipts.iter().any(|(id, _)| *id == request_id) {
+                return;
+            }
+            let ok = session_id == app.current
+                && app.cur().queue_edit.is_none()
+                && app.cur().queue.get(index).is_some_and(|q| q.text == expected && q.images == images);
+            let result = if ok {
+                app.cur_mut().queue.remove(index);
+                "已接收"
+            } else {
+                "未刪除：佇列已變動，請重新開啟編輯"
+            };
+            receipt(app, request_id, result);
+        }
         UiCommand::SubmitText { session_id, request_id, text, insert } => {
             if app.web.receipts.iter().any(|(id, _)| *id == request_id) {
                 return;
@@ -610,6 +632,21 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
         UiCommand::CancelQueueEdit => app.cur_mut().cancel_queue_edit(),
         UiCommand::CommitQueueEdit => {
             app.cur_mut().commit_queue_edit();
+        }
+        UiCommand::WebUrl { url } => app.web.url = Some(url),
+        UiCommand::AttachUpload { session_id, request_id, workspace, path } => {
+            if app.web.receipts.iter().any(|(id, _)| *id == request_id) {
+                return;
+            }
+            // Saved under the workspace the hub had; the path means nothing elsewhere.
+            let result = if session_id != app.current || workspace != app.workspace() {
+                "未附上：工作已切換，請切回原工作再加入圖片".to_string()
+            } else if app.attach_pending(path) {
+                "已附上圖片".to_string()
+            } else {
+                format!("未附上：最多 {} 張圖片", crate::vision::MAX_USER_IMAGES)
+            };
+            receipt(app, request_id, &result);
         }
     }
 }

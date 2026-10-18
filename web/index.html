@@ -5,16 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>grokaagent</title>
   <link rel="stylesheet" href="style.css">
-  <script>
-    // Pick the theme before the first paint: saved choice, else the system.
-    (function () {
-      var pref = "auto";
-      try { pref = localStorage.getItem("groka.theme") || "auto"; } catch (e) {}
-      var light = pref === "light" || (pref === "auto" && matchMedia("(prefers-color-scheme: light)").matches);
-      document.documentElement.dataset.themePref = pref;
-      document.documentElement.dataset.theme = light ? "light" : "dark";
-    })();
-  </script>
+  <!-- Blocking on purpose: the theme is set before the first paint. -->
+  <script src="theme.js"></script>
 </head>
 <body>
   <div id="app" class="side-open">
@@ -50,7 +42,7 @@
           <div id="composer-bar">
             <button type="button" id="mode-queue" class="chip on" title="目前回覆完成後處理">接著做</button>
             <button type="button" id="mode-insert" class="chip" title="下一輪採用，不會撤回已執行的操作">調整目前工作</button>
-            <button type="button" id="paste-image" class="chip">貼上圖片</button>
+            <button type="button" id="paste-image" class="chip" title="讀取執行 grokaagent 那台電腦的剪貼簿；也可以把圖片拖進來，或在輸入框直接貼上">貼上圖片</button>
             <button type="button" id="interrupt" class="chip warn hidden">停止目前工作</button>
           </div>
           <textarea id="composer" rows="2" placeholder="輸入訊息… Enter 送出，Shift+Enter 換行"></textarea>

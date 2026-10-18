@@ -117,7 +117,12 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
     };
     if let Some(h) = &hub {
         app.web.url = Some(h.url.clone());
-        app.cur_mut().chat.push(Row::meta(format!("網頁界面  {}", h.url)));
+        // The transcript is saved: the one-time code stays in the status bar
+        // and the settings tab.
+        app.cur_mut().chat.push(Row::meta(format!(
+            "網頁界面  {} · 用狀態列或設定分頁的網址開啟，每個網址只能用一次",
+            h.origin
+        )));
     }
 
     let (cat_tx, mut cat_rx) = mpsc::unbounded_channel();

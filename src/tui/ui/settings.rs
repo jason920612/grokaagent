@@ -7,6 +7,7 @@ use ratatui::Frame;
 
 use super::{boxed_edit, line};
 use crate::tui::app::{App, Focus, Hit};
+use crate::tui::edit::display_cols;
 use crate::tui::settings::{CatalogStatus, DropKind, Field, LoginUi};
 use crate::tui::theme::*;
 
@@ -238,6 +239,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         y += 1;
         let list = Rect::new(x, y, w, bottom.saturating_sub(y + 1));
         skills(f, app, list, foc);
+        y = bottom.saturating_sub(1);
+    }
+    if y < bottom {
+        web_link(f, app, Rect::new(x, bottom - 1, w, 1));
     }
 
     if let (Some(kind), Some(anchor)) = (app.settings.drop, drop_anchor) {
@@ -247,6 +252,20 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         return None;
     }
     caret
+}
+
+/// The web workbench's current link, for terminals too narrow for the status
+/// bar to show it. Never clipped: a cut one-time code opens nothing.
+fn web_link(f: &mut Frame, app: &App, r: Rect) {
+    let Some(url) = &app.web.url else {
+        return;
+    };
+    let full = format!("網頁界面  {url}  · 每個網址只能用一次");
+    let text = [full.as_str(), url.as_str()]
+        .into_iter()
+        .find(|t| display_cols(t) <= r.width)
+        .unwrap_or("網頁界面  視窗太窄，放寬後顯示網址");
+    line(f, r, text, Style::default().fg(DIM));
 }
 
 /// How search reaches the current model: Grok's own tools, or `grok_search`.
