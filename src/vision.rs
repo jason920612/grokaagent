@@ -295,13 +295,14 @@ pub fn parse_image_drop(text: &str) -> Vec<PathBuf> {
 }
 
 /// Image formats people drop or copy that the enabled decoders cannot read.
+/// SVG is not one: it is source text, and a pasted path to it stays text.
 pub(crate) fn is_unsupported_image_ext(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase())
             .as_deref(),
-        Some("heic" | "heif" | "avif" | "tif" | "tiff" | "svg" | "ico" | "jxl" | "psd")
+        Some("heic" | "heif" | "avif" | "tif" | "tiff" | "ico" | "jxl" | "psd")
     )
 }
 
@@ -328,10 +329,12 @@ fn dropped_file(s: &str) -> Option<PathBuf> {
 }
 
 /// Split a line the way a POSIX shell would: blanks separate words, quotes
-/// group, and with `escapes` a backslash keeps the next char literal (macOS
-/// terminals drop `Screenshot\ 1.png`). Windows paths use `\` as the
-/// separator, so it stays literal there. `None` on an unclosed quote.
-fn shell_words(line: &str, escapes: bool) -> Option<Vec<String>> {
+/// group, and a backslash keeps the next char literal (macOS terminals drop
+/// `Screenshot\ 1.png`). Without `posix` (Windows) only double quotes group,
+/// as Windows terminals quote drops, and `\` and `'` are literal: `\` is the
+/// path separator and `Bob's.png` needs no quoting. `None` on an unclosed
+/// quote.
+fn shell_words(line: &str, posix: bool) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word: Option<String> = None;
     let mut chars = line.chars();
@@ -339,7 +342,7 @@ fn shell_words(line: &str, escapes: bool) -> Option<Vec<String>> {
         match c {
             // Only the shell's blanks: macOS names hold U+202F, which is whitespace too.
             ' ' | '\t' => words.extend(word.take()),
-            '\'' => {
+            '\'' if posix => {
                 let w = word.get_or_insert_with(String::new);
                 loop {
                     match chars.next()? {
@@ -353,7 +356,7 @@ fn shell_words(line: &str, escapes: bool) -> Option<Vec<String>> {
                 loop {
                     match chars.next()? {
                         '"' => break,
-                        '\\' if escapes => match chars.next()? {
+                        '\\' if posix => match chars.next()? {
                             c @ ('"' | '\\' | '$' | '`') => w.push(c),
                             c => {
                                 w.push('\\');
@@ -364,7 +367,7 @@ fn shell_words(line: &str, escapes: bool) -> Option<Vec<String>> {
                     }
                 }
             }
-            '\\' if escapes => word.get_or_insert_with(String::new).push(chars.next()?),
+            '\\' if posix => word.get_or_insert_with(String::new).push(chars.next()?),
             c => word.get_or_insert_with(String::new).push(c),
         }
     }
@@ -428,6 +431,7 @@ mod drop_tests {
         let b = png(&dir.path().join("b.png"));
         let (sa, sb) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
         let both = vec![a.clone(), b.clone()];
+        #[cfg(not(windows))]
         assert_eq!(parse_image_drop(&format!("'{sa}' '{sb}'")), both, "GNOME single quotes");
         assert_eq!(parse_image_drop(&format!("\"{sa}\" {sb}")), both, "mixed quoting");
         assert_eq!(parse_image_drop(&format!("{sb} {sb}")), vec![b.clone(), b.clone()], "plain words");
@@ -473,6 +477,9 @@ mod drop_tests {
         assert_eq!(parse_image_drop(&heic.to_string_lossy()), vec![heic.clone()]);
         assert!(is_unsupported_image_ext(&heic));
         assert!(!is_image_ext(&heic));
+        let svg = dir.path().join("logo.svg");
+        std::fs::write(&svg, "<svg/>").unwrap();
+        assert!(parse_image_drop(&svg.to_string_lossy()).is_empty(), "an SVG path is source text");
     }
 
     #[test]
@@ -483,6 +490,8 @@ mod drop_tests {
             shell_words(r#""C:\My Pics\a.png" C:\b.png"#, false).unwrap(),
             [r"C:\My Pics\a.png", r"C:\b.png"]
         );
+        assert_eq!(shell_words(r"C:\x\Bob's.png C:\y.png", false).unwrap(), [r"C:\x\Bob's.png", r"C:\y.png"]);
+        assert!(shell_words(r"/x/Bob's.png /y.png", true).is_none(), "POSIX shells quote such names");
         assert_eq!(shell_words("at 10.00\u{202f}AM.png", true).unwrap(), ["at", "10.00\u{202f}AM.png"]);
         assert_eq!(shell_words("'' x", true).unwrap(), ["", "x"]);
         assert!(shell_words("\"open", true).is_none());

@@ -487,6 +487,43 @@ impl Attached {
     }
 }
 
+/// What a paste takes from the clipboard.
+#[derive(Debug, PartialEq, Eq)]
+enum ClipPick {
+    Files,
+    Text,
+    /// The bitmap, if there is one: it is read only when picked.
+    Bitmap,
+}
+
+/// Copied image files come first: a file copied in Finder also puts its icon
+/// on the pasteboard as a picture. Then non-blank `text`, which only Ctrl+V
+/// passes (the 貼上圖片 button is for images): spreadsheets and office apps
+/// copy a picture of the cells next to the text.
+fn clip_pick(has_files: bool, text: Option<&str>) -> ClipPick {
+    if has_files {
+        ClipPick::Files
+    } else if text.is_some_and(|t| !t.trim().is_empty()) {
+        ClipPick::Text
+    } else {
+        ClipPick::Bitmap
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn copied_files_beat_text_and_text_beats_a_bitmap() {
+        assert_eq!(clip_pick(true, Some("/Users/me/design.png")), ClipPick::Files, "not the Finder icon");
+        assert_eq!(clip_pick(true, None), ClipPick::Files);
+        assert_eq!(clip_pick(false, Some("1\t2\n3\t4")), ClipPick::Text, "not a picture of the cells");
+        assert_eq!(clip_pick(false, Some(" \n")), ClipPick::Bitmap, "blank text falls through");
+        assert_eq!(clip_pick(false, None), ClipPick::Bitmap, "the button reads no text");
+    }
+}
+
 pub(crate) struct App {
     pub opts: TuiOptions,
     pub knobs: Arc<Mutex<SessionKnobs>>,
@@ -1038,13 +1075,6 @@ impl App {
         }
     }
 
-    /// Image files copied in a file manager. `false` = none on the clipboard.
-    fn ingest_copied_files(&mut self, got: &mut Attached) -> bool {
-        let files = crate::clipimg::read_image_files();
-        self.ingest_paths(&files, got);
-        !files.is_empty()
-    }
-
     /// Flash what happened. `false` = nothing did.
     fn report(&mut self, got: &Attached) -> bool {
         let Some(msg) = got.message() else {
@@ -1054,21 +1084,33 @@ impl App {
         true
     }
 
-    /// "貼上圖片" button: copied image files, else the clipboard bitmap. Files
-    /// come first: a file copied in Finder also puts its icon on the
-    /// pasteboard as a picture.
-    pub fn paste_image(&mut self) {
+    /// Paste what `clip_pick` chooses; `text` is the clipboard text when the
+    /// paste may take text. `false` = nothing to paste.
+    fn paste_clip(&mut self, text: Option<String>) -> bool {
+        let files = crate::clipimg::read_image_files();
         let mut got = Attached::default();
-        if !self.ingest_copied_files(&mut got) {
-            self.ingest_clipboard_bitmap(&mut got);
+        match clip_pick(!files.is_empty(), text.as_deref()) {
+            ClipPick::Files => self.ingest_paths(&files, &mut got),
+            ClipPick::Text => {
+                self.paste_text(text.as_deref().unwrap_or_default());
+                return true;
+            }
+            ClipPick::Bitmap => self.ingest_clipboard_bitmap(&mut got),
         }
-        if !self.report(&got) {
+        self.report(&got)
+    }
+
+    /// "貼上圖片" button: copied image files, else the clipboard bitmap.
+    pub fn paste_image(&mut self) {
+        if !self.paste_clip(None) {
             self.flash("剪貼簿沒有圖片 — 先複製截圖或圖片檔，再點「貼上圖片」");
         }
     }
 
-    /// Text pasted into the composer; dropped image files become attachments
-    /// and their paths are not inserted.
+    /// Text pasted into the composer. Dropped image files become attachments
+    /// and their paths are not inserted, unless every one is in a format the
+    /// decoders cannot read: the notice says so, and a path to a favicon or a
+    /// TIFF may be meant as text.
     pub fn paste_text(&mut self, s: &str) {
         let dropped = crate::vision::parse_image_drop(s);
         if dropped.is_empty() {
@@ -1078,6 +1120,9 @@ impl App {
         let mut got = Attached::default();
         self.ingest_paths(&dropped, &mut got);
         self.report(&got);
+        if got.added + got.over_cap == 0 && got.errors.is_empty() {
+            self.cur_mut().draft.insert_str(s);
+        }
     }
 
     /// Bracketed paste. A blank payload (Ctrl+V of a bitmap) reads the clipboard.
@@ -1089,19 +1134,10 @@ impl App {
         }
     }
 
-    /// Ctrl+V: copied image files, else text, else a bitmap. Text wins over a
-    /// bitmap because spreadsheets and office apps copy both; the button is
-    /// there for images. `false` = nothing to paste.
+    /// Ctrl+V: copied image files, else text, else a bitmap. `false` =
+    /// nothing to paste.
     pub fn paste_clipboard(&mut self) -> bool {
-        let mut got = Attached::default();
-        if !self.ingest_copied_files(&mut got) {
-            if let Some(s) = clipboard_get().filter(|s| !s.trim().is_empty()) {
-                self.paste_text(&s);
-                return true;
-            }
-            self.ingest_clipboard_bitmap(&mut got);
-        }
-        self.report(&got)
+        self.paste_clip(clipboard_get())
     }
 
     /// Ctrl+C: copy the selection. `false` = nothing selected.

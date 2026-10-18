@@ -174,6 +174,9 @@ async fn tui_loop(terminal: &mut Term, opts: TuiOptions) -> Result<()> {
             paint.all();
         }
         paint.frame(terminal, &mut app)?;
+        if cfg!(windows) {
+            burst.waiting(Instant::now());
+        }
 
         tokio::select! {
             maybe = keys.next() => {

@@ -94,6 +94,8 @@ fn a_drop_typed_in_by_a_windows_console_attaches() {
 
     console_read(app, &mut burst, console_keys("first line\rsecond line"));
     assert_eq!(app.cur().draft.text, "first line\nsecond line");
+    console_read(app, &mut input::PasteBurst::default(), console_keys("\rthird line"));
+    assert_eq!(app.cur().draft.text, "first line\nsecond line\nthird line", "a leading line break does not send");
     assert!(app.cur().queue.is_empty() && !app.cur().chat.rows.iter().any(|r| matches!(r, super::model::rows::Row::User(_))));
 }
 
@@ -112,21 +114,38 @@ fn drops_past_the_cap_are_counted_and_never_saved() {
 }
 
 #[test]
-fn unreadable_drops_say_why_instead_of_pasting_the_path() {
+fn unreadable_drops_say_why() {
     let mut fx = fixture();
+    let shot = picture(&fx, "shot.png");
     let dir = fx.dir.path().join("Pictures");
-    std::fs::create_dir_all(&dir).unwrap();
     let heic = dir.join("IMG_0001.heic");
     let broken = dir.join("broken.png");
+    let svg = dir.join("logo.svg");
     std::fs::write(&heic, "x").unwrap();
     std::fs::write(&broken, "not a png").unwrap();
+    std::fs::write(&svg, "<svg/>").unwrap();
     let app = &mut fx.app;
-    app.paste_text(&heic.display().to_string());
-    assert!(app.cur().chat.status.contains("不支援的圖片格式：IMG_0001.heic"), "{}", app.cur().chat.status);
     app.paste_text(&broken.display().to_string());
     assert!(app.cur().chat.status.starts_with("無法加入圖片"), "{}", app.cur().chat.status);
+    assert!(app.cur().draft.is_empty(), "a failed attachment does not paste its path");
+
+    app.paste_text(&format!("{}\n{}", shot.display(), heic.display()));
+    assert_eq!(
+        app.cur().chat.status,
+        "已附上 1 張圖片 · 不支援的圖片格式：IMG_0001.heic（可用 PNG、JPEG、GIF、WebP、BMP）"
+    );
     assert!(app.cur().draft.is_empty());
-    assert!(app.cur().pending.is_empty());
+
+    app.paste_text(&heic.display().to_string());
+    assert!(app.cur().chat.status.starts_with("不支援的圖片格式：IMG_0001.heic"), "{}", app.cur().chat.status);
+    assert_eq!(app.cur().draft.text, heic.display().to_string(), "a path it cannot attach may be meant as text");
+
+    app.cur_mut().draft = super::edit::Edit::default();
+    app.flash("");
+    app.paste_text(&svg.display().to_string());
+    assert_eq!(app.cur().draft.text, svg.display().to_string(), "an SVG path is source text");
+    assert_eq!(app.cur().chat.status, "");
+    assert_eq!(app.cur().pending.len(), 1);
 }
 
 #[test]

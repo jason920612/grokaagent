@@ -12,7 +12,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 /// text anyway.
 const MIN_KEYS: usize = 6;
 /// A console may deliver a long paste over several reads: a text run that
-/// opens a read this soon after a paste continues it.
+/// opens a read this soon after the loop waits again continues the paste.
 const CONTINUE: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
@@ -21,6 +21,8 @@ pub(crate) struct PasteBurst {
     /// back: trailing ones are dropped (an IME's confirming Enter), unless
     /// the paste goes on in the next read.
     open: Option<(Instant, usize)>,
+    /// `open` was set by the last read and `waiting` has not restarted it yet.
+    fresh: bool,
 }
 
 #[derive(Default)]
@@ -67,6 +69,7 @@ fn text_key(ev: &Event) -> Option<TextKey> {
 impl PasteBurst {
     /// Replace paste-like runs of key presses in one read with `Event::Paste`.
     pub fn coalesce(&mut self, batch: Vec<Event>, now: Instant) -> Vec<Event> {
+        self.fresh = false;
         let mut cont = self
             .open
             .take()
@@ -95,19 +98,26 @@ impl PasteBurst {
                 continue;
             };
             if run.raw.is_empty() {
-                // A run starts with a character, unless it goes on with a paste.
-                if !(cont.is_some() && lead) && !matches!(key, TextKey::Char(_)) {
-                    cont = None;
-                    lead = false;
-                    out.push(ev);
-                    continue;
-                }
+                // Line breaks may open a run too (pasted code often starts
+                // with one); a lone Enter is too short to count as a paste.
                 run.first = lead;
             }
             run.push(ev, key);
         }
         self.finish(run, &mut cont, &mut out, Some(now));
         out
+    }
+
+    /// The loop is about to wait for input again. A paste the last read left
+    /// open gets its window from now: handling that read and painting can
+    /// take longer than the window while the rest of the paste is already
+    /// queued. Only once per read, so other wakeups cannot keep it open.
+    pub fn waiting(&mut self, now: Instant) {
+        if std::mem::take(&mut self.fresh) {
+            if let Some((at, _)) = self.open.as_mut() {
+                *at = now;
+            }
+        }
     }
 
     /// Emit a run as a paste or as its own keys. `end` = the run ends the read.
@@ -128,6 +138,7 @@ impl PasteBurst {
         text.truncate(body);
         if let Some(at) = end {
             self.open = Some((at, trailing));
+            self.fresh = true;
         }
         if !text.is_empty() {
             out.push(Event::Paste(text));
@@ -169,6 +180,7 @@ mod tests {
         for c in s.chars() {
             let (code, mods) = match c {
                 '\r' | '\n' => (KeyCode::Enter, KeyModifiers::NONE),
+                '\t' => (KeyCode::Tab, KeyModifiers::NONE),
                 c if c.is_ascii_uppercase() || c == ':' => (KeyCode::Char(c), KeyModifiers::SHIFT),
                 c => (KeyCode::Char(c), KeyModifiers::NONE),
             };
@@ -210,18 +222,17 @@ mod tests {
         keys.extend(console_keys("two"));
         let out = PasteBurst::default().coalesce(keys, Instant::now());
         assert_eq!(pastes(&out), ["one\ntwo"], "CR LF is one line break");
+        let out = PasteBurst::default().coalesce(console_keys("\r\tfn main() {}"), Instant::now());
+        assert_eq!(pastes(&out), ["\n\tfn main() {}"], "a leading line break is text too");
+        assert_eq!(presses(&out), 0);
     }
 
     #[test]
     fn typing_and_shortcuts_stay_keys() {
-        let mut keys = console_keys("ok\r");
-        let out = PasteBurst::default().coalesce(keys.clone(), Instant::now());
-        assert_eq!(out, keys, "a short run sends with its Enter");
-        keys = vec![press(KeyCode::Enter, KeyModifiers::NONE)];
-        keys.extend(console_keys("next message"));
-        let out = PasteBurst::default().coalesce(keys, Instant::now());
-        assert!(matches!(&out[0], Event::Key(k) if k.code == KeyCode::Enter), "a leading Enter still sends");
-        assert_eq!(pastes(&out), ["next message"]);
+        for typed in ["ok\r", "\r", "\rok", "\tab"] {
+            let keys = console_keys(typed);
+            assert_eq!(PasteBurst::default().coalesce(keys.clone(), Instant::now()), keys, "{typed:?}");
+        }
         let spaces = console_keys("        ");
         assert_eq!(PasteBurst::default().coalesce(spaces.clone(), Instant::now()), spaces);
     }
@@ -277,6 +288,26 @@ mod tests {
 
         burst.coalesce(console_keys("line one\r"), t0);
         let later = burst.coalesce(console_keys("ab"), t0 + Duration::from_millis(500));
+        assert_eq!(presses(&later), 2, "typing later is typing");
+    }
+
+    #[test]
+    fn the_window_opens_when_the_loop_waits_again() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut burst = PasteBurst::default();
+        burst.coalesce(console_keys("line one\r"), t0);
+        // Handling the read and painting a big console took 80 ms.
+        burst.waiting(t0 + ms(80));
+        let rest = burst.coalesce(console_keys("ok\r"), t0 + ms(90));
+        assert_eq!(pastes(&rest), ["\nok"], "the line break survives a slow frame");
+        assert_eq!(presses(&rest), 0, "the short tail's Enter does not send");
+
+        burst.coalesce(console_keys("line one\r"), t0);
+        burst.waiting(t0 + ms(10));
+        // Later wakeups (streaming output, the frame timer) do not extend it.
+        burst.waiting(t0 + ms(55));
+        let later = burst.coalesce(console_keys("ab"), t0 + ms(100));
         assert_eq!(presses(&later), 2, "typing later is typing");
     }
 }
