@@ -59,6 +59,9 @@ pub enum TaskPhase {
     ExplainingFail,
     Done,
     Failed,
+    /// The proxy decided pushing further would not help and handed the
+    /// task back to the user.
+    HandedBack,
 }
 
 impl Default for TaskPhase {
@@ -83,6 +86,7 @@ impl TaskPhase {
             Self::ExplainingFail => "無法完成",
             Self::Done => "已完成",
             Self::Failed => "已豁免",
+            Self::HandedBack => "已交還",
         }
     }
 }
