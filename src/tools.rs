@@ -1416,7 +1416,9 @@ impl ScreenshotTool {
                     .to_string_lossy()
                     .replace('\\', "/")
             });
-        let (rel, path_note) = jpeg_rel_path(&requested);
+        let (rel, path_note) = jpeg_rel_path(&requested, |rel| {
+            resolve_target_in_workspace(&self.workspace, rel).is_ok_and(|p| p.exists())
+        })?;
         let dest = resolve_target_in_workspace(&self.workspace, &rel)?;
         ensure_groka_parent(&self.workspace, &dest)?;
         let mut extra = json!({});
@@ -1439,19 +1441,24 @@ impl ScreenshotTool {
 }
 
 /// Screenshots are always JPEG bytes and every decoder goes by extension, so
-/// any other extension (or none) becomes .jpg; the note tells the model.
-fn jpeg_rel_path(requested: &str) -> (String, Option<String>) {
+/// any other extension (or none) becomes .jpg; the note tells the model. The
+/// changed name never replaces a file the model did not name (`taken`).
+fn jpeg_rel_path(requested: &str, taken: impl Fn(&str) -> bool) -> Result<(String, Option<String>)> {
     let path = Path::new(requested);
     let is_jpeg = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
     if is_jpeg {
-        return (requested.to_string(), None);
+        return Ok((requested.to_string(), None));
     }
-    let fixed = path.with_extension("jpg").to_string_lossy().replace('\\', "/");
+    let stem = path.with_extension("").to_string_lossy().replace('\\', "/");
+    let fixed = (1..100)
+        .map(|n| if n == 1 { format!("{stem}.jpg") } else { format!("{stem}-{n}.jpg") })
+        .find(|p| !taken(p))
+        .ok_or_else(|| Error::Tool(format!("{stem}.jpg already exists; pass a new .jpg path")))?;
     let note = format!("screenshots are saved as JPEG, so the path is {fixed} instead of {requested}");
-    (fixed, Some(note))
+    Ok((fixed, Some(note)))
 }
 
 /// A shot under .groka/ goes through vision::groka_dir so the folder carries
@@ -1514,7 +1521,10 @@ struct ShotContext {
     me: u32,
     /// grokaagent's ancestors: the terminal or IDE it runs in.
     host: Vec<u32>,
+    /// Windows of own-process bindings that are still open.
     bound_ids: Vec<u32>,
+    /// The query's spawned pids, less those of bound apps that have exited.
+    spawned: Vec<u32>,
 }
 
 impl ShotContext {
@@ -1523,12 +1533,30 @@ impl ShotContext {
         let mut seeds: Vec<u32> = metas.iter().map(|m| m.pid).collect();
         seeds.push(me);
         let parents = crate::shot::parent_map(&seeds);
-        let host = crate::shot::ancestors(me, &parents);
+        Self::from_parts(metas, q, me, parents)
+    }
+
+    fn from_parts(metas: &[crate::shot::WinMeta], q: &ShotQuery, me: u32, parents: HashMap<u32, u32>) -> Self {
+        // Only a launch's own process makes its windows the agent's without
+        // asking; a browser window or a retitled one may show the user's page.
+        let own: Vec<&wintrack::BoundWindow> = q.known.iter().filter(|b| b.own_process).collect();
+        let bound_ids = own
+            .iter()
+            .filter(|b| metas.iter().any(|m| b.is_window(m)))
+            .map(|b| b.id)
+            .collect();
+        // A bound app that exited leaves its pid to whatever the OS starts next.
+        let gone: Vec<u32> = own
+            .iter()
+            .filter(|b| !metas.iter().any(|m| m.pid == b.pid && crate::shot::same_app(&b.app, &m.app)))
+            .map(|b| b.pid)
+            .collect();
         Self {
-            bound_ids: q.known.iter().map(|b| b.id).filter(|id| *id != 0).collect(),
+            host: crate::shot::ancestors(me, &parents),
+            bound_ids,
+            spawned: q.spawned.iter().copied().filter(|p| !gone.contains(p)).collect(),
             parents,
             me,
-            host,
         }
     }
 }
@@ -1548,7 +1576,8 @@ impl ShotQuery {
             window_id: bound.map(|b| b.id).filter(|id| *id != 0),
             strict_window: bound.is_some_and(|b| !b.own_process),
             bound_title: bound.map(|b| b.title.as_str()),
-            spawned: &self.spawned,
+            bound_app: bound.map(|b| b.app.as_str()),
+            spawned: &ctx.spawned,
             bound_ids: &ctx.bound_ids,
             self_pids: std::slice::from_ref(&ctx.me),
             host_pids: &ctx.host,
@@ -1655,12 +1684,23 @@ fn bound_drift(b: &wintrack::BoundWindow, meta: &crate::shot::WinMeta) -> Option
     None
 }
 
-fn no_capture_reason(q: &ShotQuery, matched: bool, failed: Option<&str>) -> String {
+fn no_capture_reason(
+    q: &ShotQuery,
+    metas: &[crate::shot::WinMeta],
+    matched: bool,
+    failed: Option<&str>,
+) -> String {
     if matched {
         let why = failed.map(|e| format!(" ({e})")).unwrap_or_default();
         return format!("could not capture the matching window{why}; nothing was captured. Pick another window below by pid/title/app.");
     }
     if let Some(b) = &q.bound {
+        if metas.iter().any(|m| b.is_window(m) && crate::shot::is_workbench(&m.title)) {
+            return format!(
+                "window {} now shows the grokaagent workbench tab, which is never captured (its address bar holds the session token); nothing was captured. Ask the user to switch that window back to your page, or open the page in a window of its own and launch it with window={}.",
+                b.name, b.name
+            );
+        }
         return format!(
             "window {} (pid {}, \"{}\") is no longer open or visible; nothing was captured. Relaunch it with window={}, or pick one below by pid/title/app.",
             b.name, b.pid, b.title, b.name
@@ -1669,7 +1709,7 @@ fn no_capture_reason(q: &ShotQuery, matched: bool, failed: Option<&str>) -> Stri
     if q.explicit() {
         return "no window matches the given pid/title/app; nothing was captured. Pick one below.".into();
     }
-    "no window of an app you started was found, so nothing was captured (other windows may be the user's). Pass name (set window= when launching), pid, title or app to pick one below.".into()
+    "no window of an app you started was found, so nothing was captured (other windows may be the user's). Pass name (the window= label; bound windows below show it), pid, title or app to pick one below.".into()
 }
 
 fn no_capture_json(
@@ -1682,7 +1722,7 @@ fn no_capture_json(
     let ranked = crate::shot::ranked_indices(metas, &q.filter(ctx, false));
     let mut out = json!({
         "attach_image": false,
-        "error": no_capture_reason(q, matched, failed),
+        "error": no_capture_reason(q, metas, matched, failed),
         "windows": window_rows(q, metas, &ranked, 8)
     });
     if let Some(b) = &q.bound {
@@ -1754,18 +1794,104 @@ mod shot_tool_tests {
             me: 99,
             host: Vec::new(),
             bound_ids: Vec::new(),
+            spawned: Vec::new(),
         }
+    }
+
+    fn jpeg(requested: &str) -> (String, Option<String>) {
+        jpeg_rel_path(requested, |_| false).unwrap()
     }
 
     #[test]
     fn shot_paths_always_end_in_jpg() {
-        assert_eq!(jpeg_rel_path("a/b.jpg"), ("a/b.jpg".to_string(), None));
-        assert_eq!(jpeg_rel_path("b.JPEG"), ("b.JPEG".to_string(), None));
-        let (rel, note) = jpeg_rel_path("shots/home.png");
+        assert_eq!(jpeg("a/b.jpg"), ("a/b.jpg".to_string(), None));
+        assert_eq!(jpeg("b.JPEG"), ("b.JPEG".to_string(), None));
+        let (rel, note) = jpeg("shots/home.png");
         assert_eq!(rel, "shots/home.jpg");
         assert!(note.unwrap().contains("shots/home.png"));
-        assert_eq!(jpeg_rel_path("shot").0, "shot.jpg");
-        assert_eq!(jpeg_rel_path("docs/screenshot.webp").0, "docs/screenshot.jpg");
+        assert_eq!(jpeg("shot").0, "shot.jpg");
+        assert_eq!(jpeg("docs/screenshot.webp").0, "docs/screenshot.jpg");
+    }
+
+    #[test]
+    fn a_changed_shot_path_never_lands_on_an_existing_file() {
+        let existing = ["assets/logo.jpg", "assets/logo-2.jpg"];
+        let (rel, note) = jpeg_rel_path("assets/logo.png", |p| existing.contains(&p)).unwrap();
+        assert_eq!(rel, "assets/logo-3.jpg");
+        assert!(note.unwrap().contains("assets/logo-3.jpg"));
+        // A .jpg the model named is its call to overwrite.
+        assert_eq!(jpeg_rel_path("assets/logo.jpg", |_| true).unwrap().0, "assets/logo.jpg");
+        let err = jpeg_rel_path("x.png", |_| true).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn default_mode_trusts_only_bindings_of_a_launched_process() {
+        // `web` got a new tab in the user's browser window, which now shows mail.
+        let web = BoundWindow::from_meta("web".into(), &win(1, "Vite App - Google Chrome", "Google-chrome", 50, 1920, 1080), false);
+        let app = BoundWindow::from_meta("app".into(), &win(4, "My App", "electron", 77, 800, 600), true);
+        let metas = vec![
+            win(1, "Inbox (4) - Gmail - Google Chrome", "Google-chrome", 50, 1920, 1080),
+            win(4, "My App", "electron", 77, 800, 600),
+        ];
+        let q = ShotQuery {
+            known: vec![web.clone()],
+            ..query()
+        };
+        let ctx = ShotContext::from_parts(&metas, &q, 99, HashMap::new());
+        assert!(ctx.bound_ids.is_empty());
+        assert!(crate::shot::capture_candidates(&metas, &q.filter(&ctx, true)).is_empty());
+        let rows = window_rows(&q, &metas, &crate::shot::ranked_indices(&metas, &q.filter(&ctx, false)), 8);
+        assert!(rows.iter().any(|r| r["name"] == "web"), "the list still offers name=web");
+
+        let q = ShotQuery {
+            known: vec![web, app],
+            ..query()
+        };
+        let ctx = ShotContext::from_parts(&metas, &q, 99, HashMap::new());
+        assert_eq!(ctx.bound_ids, vec![4]);
+        let order = crate::shot::capture_candidates(&metas, &q.filter(&ctx, true));
+        assert_eq!(order, vec![1]);
+    }
+
+    #[test]
+    fn an_exited_bound_app_leaves_its_pid_behind() {
+        let app = BoundWindow::from_meta("app".into(), &win(4, "My App", "electron", 77, 800, 600), true);
+        // pid 77 now belongs to Notepad; 300 is a live background shell.
+        let metas = vec![win(9, "Untitled - Notepad", "Notepad", 77, 1280, 800)];
+        let q = ShotQuery {
+            known: vec![app.clone()],
+            spawned: vec![77, 300],
+            ..query()
+        };
+        let ctx = ShotContext::from_parts(&metas, &q, 99, HashMap::new());
+        assert_eq!(ctx.spawned, vec![300]);
+        assert!(crate::shot::capture_candidates(&metas, &q.filter(&ctx, true)).is_empty());
+        let named = ShotQuery {
+            pid: Some(77),
+            bound: Some(app.clone()),
+            ..q
+        };
+        assert!(crate::shot::capture_candidates(&metas, &named.filter(&ctx, true)).is_empty());
+        let out: Value = serde_json::from_str(&no_capture_json(&named, &metas, &ctx, false, None)).unwrap();
+        assert!(out["error"].as_str().unwrap().contains("no longer open"), "{out}");
+    }
+
+    #[test]
+    fn a_binding_now_showing_the_workbench_is_refused_with_its_reason() {
+        let web = BoundWindow::from_meta("web".into(), &win(1, "Vite App - Google Chrome", "Google-chrome", 50, 1920, 1080), false);
+        let metas = vec![win(1, "grokaagent - Google Chrome", "Google-chrome", 50, 1920, 1080)];
+        let q = ShotQuery {
+            pid: Some(50),
+            bound: Some(web.clone()),
+            known: vec![web],
+            ..query()
+        };
+        let ctx = ctx();
+        assert!(crate::shot::capture_candidates(&metas, &q.filter(&ctx, true)).is_empty());
+        let out: Value = serde_json::from_str(&no_capture_json(&q, &metas, &ctx, false, None)).unwrap();
+        assert!(out["error"].as_str().unwrap().contains("workbench"), "{out}");
+        assert!(out["windows"].as_array().unwrap().is_empty(), "{out}");
     }
 
     #[test]
@@ -1808,14 +1934,14 @@ mod shot_tool_tests {
 
     #[test]
     fn no_capture_reasons_say_what_to_pass() {
-        let default = no_capture_reason(&query(), false, None);
+        let default = no_capture_reason(&query(), &[], false, None);
         assert!(default.contains("app you started"), "{default}");
         let titled = ShotQuery {
             title: Some("Vite".into()),
             ..query()
         };
-        assert!(no_capture_reason(&titled, false, None).contains("no window matches"));
-        let failed = no_capture_reason(&titled, true, Some("permission denied"));
+        assert!(no_capture_reason(&titled, &[], false, None).contains("no window matches"));
+        let failed = no_capture_reason(&titled, &[], true, Some("permission denied"));
         assert!(failed.contains("permission denied") && failed.contains("nothing was captured"), "{failed}");
     }
 
@@ -1865,6 +1991,22 @@ mod shot_tool_tests {
     }
 
     #[tokio::test]
+    async fn screenshot_png_path_keeps_an_existing_jpg() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("assets/logo.jpg"), b"keep").unwrap();
+        let tool = ScreenshotTool::new(dir.path().to_path_buf());
+        let raw = tool
+            .run(&json!({"path": "assets/logo.png", "target": "monitor"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(out["path"], "assets/logo-2.jpg", "{out}");
+        assert_eq!(fs::read(dir.path().join("assets/logo.jpg")).unwrap(), b"keep");
+        assert!(dir.path().join("assets/logo-2.jpg").exists());
+    }
+
+    #[tokio::test]
     async fn screenshot_default_path_is_git_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ScreenshotTool::new(dir.path().to_path_buf());
@@ -1879,7 +2021,7 @@ impl ClientTool for ScreenshotTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "screenshot".into(),
-            description: "Capture the GUI window you opened to a JPEG and attach the pixels on the next turn. Prefer name from the window= label you set when launching, or pid from that result. Does not capture the IDE, the grokaagent terminal or its web workbench unless you ask for it. Without name/pid/title/app it captures only a window of an app you started (run_background, window=) or a localhost page; otherwise, or when the named window is gone, nothing is captured and the result lists windows to pick from. Optional title/app substring; target=monitor for the whole primary display; list=true returns windows (with bound names) without capturing. Always saved as JPEG (another extension is changed to .jpg); default path is .groka/shots/<timestamp>.jpg.".into(),
+            description: "Capture the GUI window you opened to a JPEG and attach the pixels on the next turn. Prefer name from the window= label you set when launching, or pid from that result. Does not capture the IDE or the grokaagent terminal unless you ask for them, and its web workbench only with title=grokaagent. Without name/pid/title/app it captures only a window of an app you started (run_background, window=) or a browser page on localhost; otherwise, or when the named window is gone, nothing is captured and the result lists windows to pick from (a browser window you bound with window= needs name=). Optional title/app substring; target=monitor for the whole primary display; list=true returns windows (with bound names) without capturing. Always saved as JPEG (another extension is changed to .jpg); default path is .groka/shots/<timestamp>.jpg.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

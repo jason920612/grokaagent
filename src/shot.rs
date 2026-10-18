@@ -28,9 +28,13 @@ pub struct ShotFilter<'a> {
     pub strict_window: bool,
     /// Title at bind time; breaks ties among windows of the bound process.
     pub bound_title: Option<&'a str>,
+    /// App of the bound window: a window id or pid the OS handed to another
+    /// app after the bound one closed must not match.
+    pub bound_app: Option<&'a str>,
     /// Processes the agent started; their descendants count too.
     pub spawned: &'a [u32],
-    /// Windows bound to a name by `window=`.
+    /// Windows a launch opened in its own process (`window=`). Windows bound
+    /// in a browser, or by a title change, also show the user's pages.
     pub bound_ids: &'a [u32],
     pub self_pids: &'a [u32],
     /// Processes hosting grokaagent (its terminal or IDE): skipped unless asked for.
@@ -64,6 +68,11 @@ fn norm_app(s: &str) -> String {
         .replace([' ', '_', '-'], "")
         .trim_end_matches(".exe")
         .to_string()
+}
+
+/// `w` is a window of the app recorded as `bound` (unknown counts as same).
+pub fn same_app(bound: &str, w: &str) -> bool {
+    bound.trim().is_empty() || norm_app(bound) == norm_app(w)
 }
 
 /// Editors, IDEs, terminals and OS shell surfaces, by app name as xcap reports
@@ -160,6 +169,11 @@ pub fn is_host_ui(app: &str, title: &str) -> bool {
         || is_workbench_title(&t)
 }
 
+/// A browser window showing grokaagent's web workbench.
+pub fn is_workbench(title: &str) -> bool {
+    is_workbench_title(&title.to_lowercase())
+}
+
 /// The web workbench grokaagent opens in the user's browser (page title
 /// "grokaagent"): its address bar carries the hub token.
 fn is_workbench_title(lower: &str) -> bool {
@@ -170,23 +184,63 @@ fn is_workbench_title(lower: &str) -> bool {
     let Some(rest) = t.strip_prefix("grokaagent") else {
         return false;
     };
-    let Some(rest) = rest
-        .strip_prefix(" - ")
-        .or_else(|| rest.strip_prefix(" — "))
-        .or_else(|| rest.strip_prefix(" – "))
-    else {
-        return false;
+    // Edge with several tabs: "grokaagent and 2 more pages - Profile 1 - Microsoft Edge".
+    let rest = match rest.strip_prefix(" and ") {
+        Some(more) if more.contains(" more page") => more.split_once(" - ").map_or("", |(_, r)| r),
+        _ => rest
+            .strip_prefix(" - ")
+            .or_else(|| rest.strip_prefix(" — "))
+            .or_else(|| rest.strip_prefix(" – "))
+            .unwrap_or(""),
     };
     ["chrome", "chromium", "firefox", "edge", "brave", "opera", "vivaldi", "safari", "browser"]
         .iter()
         .any(|b| rest.contains(b))
 }
 
-fn looks_browser(app: &str) -> bool {
-    matches!(
-        norm_app(app).as_str(),
-        "chrome" | "msedge" | "firefox" | "brave" | "opera" | "vivaldi" | "chromium" | "iexplore"
-    )
+/// Browsers by app name as xcap reports it (Windows FileDescription, macOS
+/// owner name, X11 WM_CLASS), normalized.
+const BROWSER_APPS: &[&str] = &[
+    "chrome",
+    "googlechrome",
+    "googlechromebeta",
+    "googlechromedev",
+    "googlechromeunstable",
+    "googlechromecanary",
+    "googlechromefortesting",
+    "chromium",
+    "chromiumbrowser",
+    "msedge",
+    "microsoftedge",
+    "microsoftedgebeta",
+    "microsoftedgedev",
+    "firefox",
+    "firefoxesr",
+    "firefoxdeveloperedition",
+    "librewolf",
+    "waterfox",
+    "brave",
+    "bravebrowser",
+    "opera",
+    "operainternetbrowser",
+    "vivaldi",
+    "vivaldistable",
+    "safari",
+    "safaritechnologypreview",
+    "arc",
+    "zen",
+    "zenbrowser",
+    "epiphany",
+    "falkon",
+    "qutebrowser",
+    "iexplore",
+    "internetexplorer",
+];
+
+pub fn looks_browser(app: &str) -> bool {
+    let a = norm_app(app);
+    let short = a.rsplit('.').next().unwrap_or(&a);
+    BROWSER_APPS.contains(&a.as_str()) || BROWSER_APPS.contains(&short)
 }
 
 fn title_looks_local(title: &str) -> bool {
@@ -204,9 +258,12 @@ fn bound_window(w: &WinMeta, f: &ShotFilter<'_>) -> bool {
 
 /// Evidence the window belongs to something the agent started, enough to
 /// capture it unasked: its process (or an ancestor) was started by the agent,
-/// it is bound by `window=`, or it shows a local dev URL.
+/// it is bound by `window=`, or it is a browser showing a local dev URL
+/// (other apps titled "localhost" are VNC viewers, SFTP and DB clients).
 pub fn is_agent_window(w: &WinMeta, f: &ShotFilter<'_>) -> bool {
-    bound_window(w, f) || spawned_by_agent(w, f) || title_looks_local(&w.title)
+    bound_window(w, f)
+        || spawned_by_agent(w, f)
+        || (looks_browser(&w.app) && title_looks_local(&w.title))
 }
 
 pub fn score_window(w: &WinMeta, f: &ShotFilter<'_>) -> Option<i64> {
@@ -214,6 +271,15 @@ pub fn score_window(w: &WinMeta, f: &ShotFilter<'_>) -> Option<i64> {
         return None;
     }
     if f.self_pids.contains(&w.pid) {
+        return None;
+    }
+    let title_f = f.title.map(str::trim).filter(|s| !s.is_empty());
+    // The workbench's address bar holds the hub token: a binding, pid or app
+    // that reaches its browser window is not enough, only a title naming it.
+    if is_workbench(&w.title) && !title_f.is_some_and(|t| contains_ci(t, "grokaagent")) {
+        return None;
+    }
+    if f.bound_app.is_some_and(|a| !same_app(a, &w.app)) {
         return None;
     }
     let exact_window = f.window_id.is_some_and(|id| id != 0 && id == w.id);
@@ -229,7 +295,6 @@ pub fn score_window(w: &WinMeta, f: &ShotFilter<'_>) -> Option<i64> {
     if f.pid.is_none() && w.title.trim().is_empty() {
         return None;
     }
-    let title_f = f.title.map(str::trim).filter(|s| !s.is_empty());
     let app_f = f.app.map(str::trim).filter(|s| !s.is_empty());
     let asked_for_this = exact_window
         || f.pid.is_some_and(|p| p == w.pid)
@@ -476,6 +541,47 @@ fn parent_of(pid: u32) -> Option<u32> {
     (got == size).then_some(info.pbi_ppid)
 }
 
+/// Keeps only links whose parent started no later than the child. Windows
+/// does not reparent orphans: a dead parent's pid stays in the child's record
+/// and is soon reused by an unrelated process. Links whose start times cannot
+/// be read are dropped too.
+#[cfg(any(windows, test))]
+fn keep_older_parents(links: Vec<(u32, u32)>, started: impl Fn(u32) -> Option<u64>) -> HashMap<u32, u32> {
+    let mut seen: HashMap<u32, Option<u64>> = HashMap::new();
+    let mut start = |pid: u32| *seen.entry(pid).or_insert_with(|| started(pid));
+    links
+        .into_iter()
+        .filter(|&(pid, parent)| match (start(pid), start(parent)) {
+            (Some(child), Some(parent)) => parent <= child,
+            _ => false,
+        })
+        .collect()
+}
+
+/// Process creation time in FILETIME units, when the process can be opened.
+#[cfg(windows)]
+fn win_started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        (ok != 0).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
 #[cfg(windows)]
 fn win_parents() -> HashMap<u32, u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
@@ -502,24 +608,24 @@ fn win_parents() -> HashMap<u32, u32> {
         fn Process32NextW(hsnapshot: HANDLE, lppe: *mut ProcessEntry32W) -> BOOL;
     }
 
-    let mut map = HashMap::new();
+    let mut links = Vec::new();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            return map;
+            return HashMap::new();
         }
         let mut entry: ProcessEntry32W = std::mem::zeroed();
         entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
         let mut ok = Process32FirstW(snap, &mut entry);
         while ok != 0 {
             if entry.th32_process_id != 0 {
-                map.insert(entry.th32_process_id, entry.th32_parent_process_id);
+                links.push((entry.th32_process_id, entry.th32_parent_process_id));
             }
             ok = Process32NextW(snap, &mut entry);
         }
         CloseHandle(snap);
     }
-    map
+    keep_older_parents(links, win_started)
 }
 
 #[cfg(test)]
@@ -780,6 +886,109 @@ mod shot_tests {
     fn capture_is_not_blocked_off_macos() {
         assert!(!capture_blocked());
         assert!(SCREEN_RECORDING_NOTE.contains("Screen Recording"));
+    }
+
+    fn workbench_and_app() -> Vec<WinMeta> {
+        vec![
+            win(1, "grokaagent - Google Chrome", "Google-chrome", 50, 1920, 1080),
+            win(2, "Vite App - Google Chrome", "Google-chrome", 50, 1280, 800),
+        ]
+    }
+
+    #[test]
+    fn the_workbench_needs_a_title_that_names_it() {
+        let windows = workbench_and_app();
+        let by_app = ShotFilter { app: Some("chrome"), self_pids: &[99], ..Default::default() };
+        assert_eq!(titles(&windows, &capture_candidates(&windows, &by_app)), ["Vite App - Google Chrome"]);
+        let by_pid = ShotFilter { pid: Some(50), self_pids: &[99], ..Default::default() };
+        assert_eq!(titles(&windows, &capture_candidates(&windows, &by_pid)), ["Vite App - Google Chrome"]);
+        // xdg-open put the tab into the workbench window, then the user switched back.
+        let bound = ShotFilter {
+            pid: Some(50),
+            window_id: Some(1),
+            strict_window: true,
+            bound_title: Some("Vite App - Google Chrome"),
+            bound_app: Some("Google-chrome"),
+            self_pids: &[99],
+            ..Default::default()
+        };
+        assert!(capture_candidates(&windows, &bound).is_empty());
+        let named = ShotFilter { title: Some("grokaagent"), self_pids: &[99], ..Default::default() };
+        assert_eq!(titles(&windows, &capture_candidates(&windows, &named)), ["grokaagent - Google Chrome"]);
+    }
+
+    #[test]
+    fn workbench_titles_across_browsers() {
+        for title in [
+            "grokaagent",
+            "grokaagent - Google Chrome",
+            "grokaagent — Mozilla Firefox",
+            "grokaagent - Personal - Microsoft\u{200b} Edge",
+            "grokaagent and 2 more pages - Profile 1 - Microsoft\u{200b} Edge",
+        ] {
+            assert!(is_workbench(title), "{title}");
+        }
+        for title in ["grokaagent — localhost:3000", "grokaagent and friends - notes", "Vite App - Google Chrome"] {
+            assert!(!is_workbench(title), "{title}");
+        }
+    }
+
+    #[test]
+    fn localhost_titles_count_only_in_browsers() {
+        let windows = vec![
+            win(1, "localhost:1 (user) - TigerVNC", "Vncviewer", 10, 1920, 1080),
+            win(2, "sftp://user@localhost - FileZilla", "FileZilla", 11, 1280, 800),
+            win(3, "localhost:5173/ - Google Chrome", "Google Chrome", 12, 1280, 800),
+        ];
+        let f = ShotFilter { self_pids: &[99], ..Default::default() };
+        assert_eq!(titles(&windows, &capture_candidates(&windows, &f)), ["localhost:5173/ - Google Chrome"]);
+        for app in ["Google Chrome", "Google-chrome", "Microsoft Edge", "msedge.exe", "firefox-esr", "Brave-browser", "Safari", "org.gnome.Epiphany"] {
+            assert!(looks_browser(app), "{app}");
+        }
+        for app in ["Vncviewer", "electron", "Code"] {
+            assert!(!looks_browser(app), "{app}");
+        }
+    }
+
+    #[test]
+    fn a_reused_pid_or_window_id_of_another_app_does_not_match() {
+        let windows = vec![
+            win(7, "Untitled - Notepad", "Notepad", 70, 1600, 1000),
+            win(8, "Document1 - Word", "WINWORD", 71, 1600, 1000),
+        ];
+        let by_pid = ShotFilter {
+            pid: Some(70),
+            window_id: Some(4),
+            bound_title: Some("My App"),
+            bound_app: Some("electron"),
+            self_pids: &[99],
+            ..Default::default()
+        };
+        assert!(capture_candidates(&windows, &by_pid).is_empty());
+        let by_id = ShotFilter {
+            window_id: Some(8),
+            strict_window: true,
+            bound_app: Some("Google-chrome"),
+            self_pids: &[99],
+            ..Default::default()
+        };
+        assert!(capture_candidates(&windows, &by_id).is_empty());
+        assert!(same_app("Google-chrome", "google chrome"));
+        assert!(same_app("", "anything"));
+        assert!(!same_app("electron", "Notepad"));
+    }
+
+    #[test]
+    fn parents_that_started_after_the_child_are_dropped() {
+        // 30's parent 20 is genuine (20 and 10 started in the same tick);
+        // 31's recorded parent died and its pid went to 21, which started
+        // later; 40's parent cannot be read.
+        let started = HashMap::from([(30, 200), (20, 100), (10, 100), (31, 150), (21, 300), (40, 50)]);
+        let links = vec![(30, 20), (20, 10), (31, 21), (40, 41)];
+        let kept = keep_older_parents(links, |pid| started.get(&pid).copied());
+        assert_eq!(kept, HashMap::from([(30, 20), (20, 10)]));
+        assert!(!descends_from(31, &[21], Some(&kept)));
+        assert!(descends_from(30, &[20], Some(&kept)));
     }
 }
 

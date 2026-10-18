@@ -32,6 +32,9 @@ pub struct BoundWindow {
     /// is the launched app's. False for a browser that was handed a URL: only
     /// the bound window is, its siblings are the user's.
     pub own_process: bool,
+    /// Bound because an existing window changed its title, not because one
+    /// opened: it may be the user's own window.
+    pub retitled: bool,
 }
 
 impl BoundWindow {
@@ -45,6 +48,7 @@ impl BoundWindow {
             width: w.width,
             height: w.height,
             own_process,
+            retitled: false,
         }
     }
 
@@ -59,13 +63,15 @@ impl BoundWindow {
         })
     }
 
+    /// `w` is the very window bound (an id the OS reused for another app is not).
+    pub fn is_window(&self, w: &WinMeta) -> bool {
+        self.id != 0 && self.id == w.id && shot::same_app(&self.app, &w.app)
+    }
+
     /// This record names `w`: the very window, or any window of a process the
     /// launch started.
     pub fn names(&self, w: &WinMeta) -> bool {
-        if self.id != 0 && self.id == w.id {
-            return true;
-        }
-        self.own_process && self.pid == w.pid
+        self.is_window(w) || (self.own_process && self.pid == w.pid && shot::same_app(&self.app, &w.app))
     }
 }
 
@@ -75,7 +81,7 @@ pub fn name_for<'a>(bound: &'a [BoundWindow], w: &WinMeta) -> Option<&'a str> {
     let shortest = |exact: bool| {
         bound
             .iter()
-            .filter(|b| if exact { b.id != 0 && b.id == w.id } else { b.names(w) })
+            .filter(|b| if exact { b.is_window(w) } else { b.names(w) })
             .min_by(|a, b| a.name.len().cmp(&b.name.len()).then_with(|| a.name.cmp(&b.name)))
             .map(|b| b.name.as_str())
     };
@@ -173,8 +179,19 @@ pub struct Before {
     /// apart from what was already open.
     taken: bool,
     pids: HashSet<u32>,
+    /// Titles are kept squashed (see `squash`).
     titles: HashMap<u32, String>,
     seen: HashSet<(u32, String)>,
+}
+
+/// A title without digits, spaces and counter punctuation: "(3) Inbox" turning
+/// into "(4) Inbox", or a clock ticking, is not something the launch opened.
+fn squash(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"()[]*•·●:".contains(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl Before {
@@ -184,7 +201,7 @@ impl Before {
             ..Self::default()
         };
         for w in windows {
-            let title = w.title.to_lowercase();
+            let title = squash(&w.title);
             out.pids.insert(w.pid);
             if w.id != 0 {
                 out.titles.insert(w.id, title.clone());
@@ -195,7 +212,7 @@ impl Before {
     }
 
     fn origin(&self, w: &WinMeta) -> Option<Origin> {
-        let title = w.title.to_lowercase();
+        let title = squash(&w.title);
         if !self.pids.contains(&w.pid) {
             return Some(Origin::NewProcess);
         }
@@ -283,7 +300,6 @@ pub fn appeared(
 }
 
 pub fn label_appeared(name: &str, found: &Appeared) -> Vec<BoundWindow> {
-    let own_process = found.origin == Origin::NewProcess;
     found
         .windows
         .iter()
@@ -295,7 +311,12 @@ pub fn label_appeared(name: &str, found: &Appeared) -> Vec<BoundWindow> {
             } else {
                 format!("{}-{}", name, i + 1)
             };
-            BoundWindow::from_meta(label, w, own_process)
+            // A browser the launch started (none was running) still becomes
+            // the user's browser: only the bound window is the agent's.
+            let own_process = found.origin == Origin::NewProcess && !shot::looks_browser(&w.app);
+            let mut rec = BoundWindow::from_meta(label, w, own_process);
+            rec.retitled = found.origin == Origin::Retitled;
+            rec
         })
         .collect()
 }
@@ -322,6 +343,11 @@ pub fn attach_to(out: &mut Value, bound: &[BoundWindow]) {
         obj.insert(
             "window_note".into(),
             json!("no new GUI window detected within 2.5s. Call screenshot with list=true, or pass title/app/pid."),
+        );
+    } else if bound.iter().any(|b| b.retitled) {
+        obj.insert(
+            "window_note".into(),
+            json!("no new window opened; the name is bound to an existing window whose title changed (e.g. a new browser tab), which may be the user's own window. Check it with screenshot list=true before relying on it."),
         );
     }
 }
@@ -529,6 +555,54 @@ mod wintrack_tests {
         assert_eq!(name_for(&bound, &win(5, "Tools", "electron", 77, 400, 300)), Some("app-2"));
         // A new window of the app's own process takes the shortest name.
         assert_eq!(name_for(&bound, &win(6, "Prefs", "electron", 77, 400, 300)), Some("app"));
+        // The app exited and the OS gave its pid, or a window id, to another app.
+        assert_eq!(name_for(&bound, &win(7, "Untitled - Notepad", "Notepad", 77, 800, 600)), None);
+        assert_eq!(name_for(&bound, &win(3, "Untitled - Notepad", "Notepad", 60, 800, 600)), None);
+    }
+
+    #[test]
+    fn a_ticking_counter_or_clock_binds_nothing() {
+        let clock = win(2, "Clock 12:01", "gnome-clocks", 60, 400, 300);
+        let before = Before::of(&[mail(), clock]);
+        let after = vec![retitled_mail(), win(2, "Clock 12:02", "gnome-clocks", 60, 400, 300)];
+        assert!(appeared(&before, &after, 5, &[], &none()).windows.is_empty());
+        let cleared = win(1, "Inbox - you@gmail.com - Gmail - Google Chrome", "Google-chrome", 50, 1920, 1080);
+        assert!(appeared(&before, &[cleared], 5, &[], &none()).windows.is_empty());
+        // A real navigation still counts.
+        let tab = win(1, "Vite App - Google Chrome", "Google-chrome", 50, 1920, 1080);
+        assert_eq!(appeared(&before, &[tab], 5, &[], &none()).origin, Origin::Retitled);
+    }
+
+    #[test]
+    fn a_retitled_binding_says_it_may_be_the_users_window() {
+        let tab = win(1, "New Tab - Google Chrome", "Google-chrome", 50, 1280, 800);
+        let before = Before::of(&[tab]);
+        let after = vec![win(1, "Vite App - Google Chrome", "Google-chrome", 50, 1280, 800)];
+        let bound = label_appeared("web", &appeared(&before, &after, 5, &[], &none()));
+        assert!(bound[0].retitled && !bound[0].own_process);
+        let mut out = json!({});
+        attach_to(&mut out, &bound);
+        assert!(out["window_note"].as_str().unwrap().contains("title changed"), "{out}");
+        let fresh = label_appeared("app", &Appeared {
+            origin: Origin::NewProcess,
+            windows: vec![win(4, "My App", "electron", 77, 800, 600)],
+        });
+        let mut out = json!({});
+        attach_to(&mut out, &fresh);
+        assert!(out.get("window_note").is_none(), "{out}");
+    }
+
+    #[test]
+    fn a_browser_the_launch_started_is_still_the_users() {
+        let found = Appeared {
+            origin: Origin::NewProcess,
+            windows: vec![win(3, "Vite App - Google Chrome", "Google Chrome", 50, 1280, 800)],
+        };
+        let bound = label_appeared("web", &found);
+        assert!(!bound[0].own_process);
+        let hub = WindowHub::new();
+        bind_appeared(&hub, "web", &found);
+        assert!(hub.pids().is_empty());
     }
 }
 
