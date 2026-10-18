@@ -722,10 +722,10 @@ mod agent_tests {
     fn a_model_without_vision_gets_a_note_instead_of_pixels() {
         let mut payload = json!({"messages": chat_messages("", &shot_turn())});
         assert!(payload_has_images(&payload));
-        drop_images(&mut payload, "deepseek-chat");
+        drop_images(&mut payload, "text-only-model");
         assert!(!payload_has_images(&payload));
         let text = payload["messages"][4]["content"].as_str().unwrap();
-        assert!(text.contains("c1") && text.contains("[image omitted: deepseek-chat cannot view images]"), "{text}");
+        assert!(text.contains("c1") && text.contains("[image omitted: text-only-model cannot view images]"), "{text}");
     }
 
     #[test]
@@ -820,17 +820,17 @@ mod agent_tests {
     #[tokio::test]
     async fn a_refused_image_is_resent_as_a_note_and_remembered() {
         let (base, hits, seen) = endpoint("unknown variant `image_url`, expected `text`", true).await;
-        let p = provider(base, "deepseek-chat");
-        assert!(p.sees_images("deepseek-chat"));
+        let p = provider(base, "text-only-model");
+        assert!(p.sees_images("text-only-model"));
         let r = p.complete(image_req()).await.unwrap();
         assert_eq!(r.text, "no pixels here");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "refused once, then resent without the image");
-        assert!(!p.sees_images("deepseek-chat"));
+        assert!(!p.sees_images("text-only-model"));
         assert!(!p.sees_images(""), "empty means the provider's own model");
         assert!(p.sees_images("other-model"));
         let resent = seen.lock().unwrap()[1]["messages"][0]["content"].as_str().unwrap().to_string();
         assert!(resent.contains("what is wrong here?"), "{resent}");
-        assert!(resent.contains("[image omitted: deepseek-chat cannot view images]"), "{resent}");
+        assert!(resent.contains("[image omitted: text-only-model cannot view images]"), "{resent}");
         assert!(resent.contains(".groka/inbox/u.jpg"), "{resent}");
         // Known now: later images go out as the note on the first try,
         // streamed or not.
@@ -844,17 +844,17 @@ mod agent_tests {
     #[tokio::test]
     async fn a_streamed_request_learns_the_refusal_too() {
         let (base, hits, seen) = endpoint("unknown variant `image_url`, expected `text`", true).await;
-        let p = provider(base, "deepseek-chat");
+        let p = provider(base, "text-only-model");
         let quiet = |_: &str| {};
         let quiet_server = |_: &str, _: &Value| {};
         let r = p.complete_stream(image_req(), &quiet, &quiet_server, &quiet).await.unwrap();
         assert_eq!(r.text, "no pixels here");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "refused once, then resent without the image");
-        assert!(!p.sees_images("deepseek-chat"));
+        assert!(!p.sees_images("text-only-model"));
         let resent = seen.lock().unwrap()[1].clone();
         assert_eq!(resent["stream"], true);
         let text = resent["messages"][0]["content"].as_str().unwrap();
-        assert!(text.contains("[image omitted: deepseek-chat cannot view images]"), "{text}");
+        assert!(text.contains("[image omitted: text-only-model cannot view images]"), "{text}");
     }
 
     #[tokio::test]

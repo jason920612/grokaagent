@@ -1436,6 +1436,18 @@ impl App {
         got.added += 1;
     }
 
+    /// An image the web page already saved into the inbox. `false` = no slot left.
+    pub fn attach_pending(&mut self, rel: String) -> bool {
+        if self.cur().pending.contains(&rel) {
+            return true;
+        }
+        if self.room() == 0 {
+            return false;
+        }
+        self.cur_mut().pending.push(rel);
+        true
+    }
+
     /// Copy image files into the inbox. Slots are checked before decoding,
     /// so nothing past the cap is read or saved.
     fn ingest_paths(&mut self, paths: &[PathBuf], got: &mut Attached) {

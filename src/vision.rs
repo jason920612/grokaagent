@@ -372,12 +372,46 @@ pub fn flatten_alpha(img: &DynamicImage, bg: [u8; 3]) -> DynamicImage {
 pub fn groka_dir(workspace: &Path, sub: &str) -> Result<PathBuf> {
     let root = workspace.join(".groka");
     let dir = root.join(sub);
+    // A `.groka` (or a folder in it) committed as a symlink would carry
+    // screenshots, pastes and logs out of the workspace.
+    let mut at = workspace.to_path_buf();
+    for c in Path::new(".groka").join(sub).components() {
+        at.push(c);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Error::Tool(format!("{} is a symlink; not writing through it", at.display())));
+        }
+    }
     std::fs::create_dir_all(&dir)?;
     let ignore = root.join(".gitignore");
-    if !ignore.exists() {
+    if std::fs::symlink_metadata(&ignore).is_err() {
         let _ = std::fs::write(&ignore, "*\n");
     }
     Ok(dir)
+}
+
+#[cfg(all(test, unix))]
+mod groka_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_committed_groka_symlink_is_not_written_through() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join(".groka")).unwrap();
+        assert!(groka_dir(ws.path(), "inbox").is_err());
+        assert!(!outside.path().join("inbox").exists());
+        assert!(!outside.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn a_symlinked_subfolder_is_refused_too() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join(".groka")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join(".groka/shots")).unwrap();
+        assert!(groka_dir(ws.path(), "shots").is_err());
+        assert!(groka_dir(ws.path(), "inbox").is_ok());
+    }
 }
 
 /// Image files a terminal pasted for a file drop: one path per line, or

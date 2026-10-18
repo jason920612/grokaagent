@@ -1498,11 +1498,13 @@ impl ScreenshotTool {
                 .map_err(|e| Error::Tool(format!("screenshot join: {e}")))?;
         }
 
-        let requested = args
+        let named = args
             .get("path")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty());
+        let reused_path = named.is_some();
+        let requested = named
             .map(|s| s.replace('\\', "/"))
             .unwrap_or_else(|| {
                 crate::vision::rel_shot_path()
@@ -1521,15 +1523,37 @@ impl ScreenshotTool {
         let want_monitor = target.eq_ignore_ascii_case("monitor")
             || target.eq_ignore_ascii_case("screen")
             || target.eq_ignore_ascii_case("desktop");
+        let workspace = self.workspace.clone();
         tokio::task::spawn_blocking(move || {
-            if want_monitor {
+            let out = if want_monitor {
                 capture_monitor_to(&dest, &rel, extra)
             } else {
                 capture_window_to(&dest, &rel, &query, extra)
-            }
+            }?;
+            // Default names are unique; a path the model names may be shot
+            // again, so its picture row points at an immutable copy.
+            Ok(if reused_path { with_seen_view(&workspace, &dest, out) } else { out })
         })
         .await
         .map_err(|e| Error::Tool(format!("screenshot join: {e}")))?
+    }
+}
+
+/// Add `"view"`: a `.groka/seen` copy of the shot just written. Best effort;
+/// without it the row and the attach use `path`.
+fn with_seen_view(workspace: &Path, target: &Path, out: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(&out) else {
+        return out;
+    };
+    if v.get("attach_image").and_then(Value::as_bool) != Some(true) {
+        return out;
+    }
+    match fs::read(target).ok().and_then(|b| crate::vision::save_seen(workspace, &b).ok()) {
+        Some(view) => {
+            v["view"] = json!(view);
+            v.to_string()
+        }
+        None => out,
     }
 }
 
@@ -3152,6 +3176,23 @@ mod tests {
         assert_eq!(out["attach_image"], true);
         assert!(target.exists());
         assert!(out["diff"].as_str().unwrap().contains("2x2"), "{out}");
+    }
+
+    #[test]
+    fn a_named_shot_path_keeps_an_immutable_copy_for_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ui.jpg");
+        let blue = crate::vision::from_rgba(32, 32, vec![0, 0, 255, 255].repeat(32 * 32)).unwrap();
+        let first = with_seen_view(dir.path(), &target, shot_json(&target, "ui.jpg", &blue, json!({})).unwrap());
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let view = first["view"].as_str().unwrap().to_string();
+        assert!(view.starts_with(".groka/seen/"), "{first}");
+        let seen = fs::read(dir.path().join(&view)).unwrap();
+        let red = crate::vision::from_rgba(32, 32, vec![255, 0, 0, 255].repeat(32 * 32)).unwrap();
+        shot_json(&target, "ui.jpg", &red, json!({})).unwrap();
+        assert_eq!(fs::read(dir.path().join(&view)).unwrap(), seen, "the first row still shows the first shot");
+        let none = json!({"attach_image": false}).to_string();
+        assert_eq!(with_seen_view(dir.path(), &target, none.clone()), none);
     }
 
     #[tokio::test]
