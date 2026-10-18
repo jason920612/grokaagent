@@ -711,6 +711,12 @@ async fn wait_for_work<P: Provider>(
         if woke || cfg.cancel.as_ref().is_some_and(CancelFlag::is_set) {
             return true;
         }
+        // Only a kick, and the proxy had nothing to say (it failed and
+        // paused, or the task is over): still idle. Say so again, so
+        // whoever drives the session (the TUI, a headless driver) sees it.
+        sink.emit(&AgentEvent::AwaitingInput {
+            meta: meta(&cfg.agent_name, run_id, cfg.parent_run_id.as_deref()),
+        });
     }
 }
 
@@ -5819,6 +5825,35 @@ mod task_proxy_tests {
         assert_eq!(closer.intents(), ["plan", "hand_back"]);
         let worker = provider.worker_calls.lock().unwrap();
         assert!(last_user_text(&worker[1]).contains("tests first"));
+    }
+
+    #[tokio::test]
+    async fn intake_asks_the_user_before_the_plan() {
+        let hub = TaskHub::new("");
+        hub.start_goal("make a landing page");
+        let ask = crate::ask::AskUserHub::new();
+        hub.set_ask_hub(Some(ask.clone()));
+        // The user's pick, waiting for the questionnaire.
+        ask.answer(crate::ask::encode_answer(&[crate::ask::Picked { id: "opt0".into(), label: "one HTML file".into(), value: None }]));
+        let provider = Duo::new(
+            vec![
+                says(json!({"ask": true, "questions": [{"question": "What do you want at the end?", "options": ["one HTML file", "a React app"]}]})),
+                says(json!({"status": "hand_back", "reason": "r"})),
+            ],
+            vec![text("summary")],
+        );
+        let (c, closer, tx) = task_run(&hub, |_| true);
+        drop(tx);
+        go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
+        assert_eq!(hub.snapshot().criteria, "用戶補充：What do you want at the end? → one HTML file");
+        assert!(provider.proxy_prompt(1).contains("用戶補充：What do you want at the end? → one HTML file"));
+        let events = closer.events.lock().unwrap();
+        let asked = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::AskUser { meta, .. } if meta.agent_name == crate::task::AGENT_NAME && meta.run_id == "run-1"))
+            .expect("the proxy asked");
+        let first = events.iter().position(|e| matches!(e, AgentEvent::TaskProxy { .. })).unwrap();
+        assert!(asked < first, "intake comes before the opening message");
     }
 
     #[test]

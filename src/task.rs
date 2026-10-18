@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::agent::SessionKnobs;
-use crate::ask::{answer_from_picks, AskDelegate, Delegated, Question};
+use crate::ask::{answer_from_picks, cancelled_json, AskDelegate, AskUserHub, Choice, Delegated, Question};
 use crate::error::{Error, Result};
 use crate::events::{AgentEvent, EventMeta, EventSink};
 use crate::notice::USER_PROXY;
@@ -47,6 +47,16 @@ const ITEM_CHARS: usize = 200;
 const TOOL_OUTPUT_CHARS: usize = 20_000;
 const FOOTER_GOAL: usize = 600;
 const FOOTER_CRITERIA: usize = 600;
+/// Intake: questions the proxy may ask the user before it plans, the
+/// suggested answers each, and the characters kept of a typed answer.
+pub const MAX_INTAKE_QUESTIONS: usize = 3;
+pub const MAX_INTAKE_OPTIONS: usize = 4;
+const INTAKE_ANSWER_CHARS: usize = 300;
+/// The intake questionnaire's own choices, after the proxy's suggestions.
+pub const INTAKE_OTHER: &str = "other";
+pub const INTAKE_OTHER_LABEL: &str = "其他（自己填寫）";
+pub const INTAKE_SKIP: &str = "skip";
+pub const INTAKE_SKIP_LABEL: &str = "略過，直接開始";
 
 pub fn is_kick(s: &str) -> bool {
     s.trim() == KICK
@@ -78,6 +88,18 @@ Reply with ONE JSON object and nothing else:
 - message: what you say to the worker, in the user's language. Required on continue, except at a mid-run checkpoint, where an empty message lets the worker carry on.
 - note: one short line for the user's screen about what you decided and why (Traditional Chinese is fine).
 - reason: required for satisfied, hand_back and impossible.
+"#;
+
+const PROXY_INTAKE_INSTRUCTIONS: &str = r#"You are the user's proxy in grokaagent task mode: a separate model the user set up to act for them while a worker agent does the work. The user just started a task. Before you brief the worker, you may ask the user what final result they want to see.
+
+Ask only when the goal, the criteria and the user's own words leave the expected outcome unclear. Ask about what the user gets at the end: the deliverable, how they will check it, the look or behaviour, scope limits. Do not ask about anything already settled, about details the worker can decide, or just to confirm. When in doubt, do not ask.
+
+At most 3 short questions, in the user's language (the language of the goal), each with at most 4 short suggested answers. The user can also type an answer or skip.
+
+Reply with ONE JSON object and nothing else, either
+{"ask": false}
+or
+{"ask": true, "questions": [{"question": "...", "options": ["...", "..."]}]}
 "#;
 
 const PROXY_ASK_INSTRUCTIONS: &str = r#"You are the user's proxy in grokaagent task mode: a separate model the user set up to act for them while a worker agent does the work. The worker asked the user a multiple-choice question. Decide whether you may answer it for the user.
@@ -179,6 +201,14 @@ pub struct TaskState {
     /// The proxy's latest message to the worker, for the UI.
     #[serde(default)]
     pub last_proxy: String,
+    /// The proxy had its one chance to ask the user about the final result.
+    #[serde(default)]
+    pub intake_done: bool,
+    /// Set by satisfied / hand_back: the worker is writing its closing
+    /// summary, and its next stop ends the task. Saved, so a restart in
+    /// between still ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending: Option<Ending>,
 }
 
 /// One line of the proxy's memory.
@@ -222,10 +252,10 @@ fn push_log(state: &mut TaskState, who: &str, text: impl Into<String>) {
 }
 
 /// How the task ends once the worker has written its closing turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Ending {
-    phase: TaskPhase,
-    reason: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ending {
+    pub phase: TaskPhase,
+    pub reason: String,
 }
 
 pub struct TaskHub {
@@ -239,9 +269,9 @@ pub struct TaskHub {
     /// Bumped when a task starts or ends, so a review that was running for
     /// the old one is dropped.
     epoch: AtomicU64,
-    /// Set by satisfied / hand_back: the worker's next stop ends the task.
-    /// Lock order: `inner` before `ending`.
-    ending: Mutex<Option<Ending>>,
+    /// Where the proxy's intake questions go: the session's questionnaire.
+    /// `None` (children, headless) skips intake.
+    ask_hub: Mutex<Option<AskUserHub>>,
     /// The user's words and the worker's latest text, set by the kernel just
     /// before an ask_user call so the proxy can tell whether they settle it.
     ask_context: Mutex<String>,
@@ -261,7 +291,7 @@ impl TaskHub {
             review_now: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
-            ending: Mutex::new(None),
+            ask_hub: Mutex::new(None),
             ask_context: Mutex::new(String::new()),
         })
     }
@@ -296,29 +326,40 @@ impl TaskHub {
         self.epoch.load(Ordering::SeqCst)
     }
 
-    fn set_ending(&self, ending: Option<Ending>) {
-        *self.ending.lock().unwrap_or_else(|e| e.into_inner()) = ending;
-    }
-
     fn take_ending(&self) -> Option<Ending> {
-        self.ending.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let mut out = None;
+        self.update(|s| {
+            out = s.ending.take();
+            out.is_some()
+        });
+        out
     }
 
     /// The proxy was satisfied or handed back; the worker is writing its
     /// closing summary.
     pub fn ending_pending(&self) -> bool {
-        self.ending.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.lock().ending.is_some()
     }
 
     /// Whether the proxy may speak now: live, not paused, not stopped by
     /// Esc, not winding down.
     pub fn steering_open(&self) -> bool {
-        let s = self.snapshot();
+        let s = self.lock();
         s.phase.is_live()
             && s.phase != TaskPhase::ExplainingFail
             && !s.paused
             && !s.skip_steer
-            && !self.ending_pending()
+            && s.ending.is_none()
+    }
+
+    /// The questionnaire the proxy's intake questions go to (kit.rs sets
+    /// it for a session the user can answer).
+    pub fn set_ask_hub(&self, hub: Option<AskUserHub>) {
+        *self.ask_hub.lock().unwrap_or_else(|e| e.into_inner()) = hub;
+    }
+
+    fn ask_hub(&self) -> Option<AskUserHub> {
+        self.ask_hub.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn set_ask_context(&self, text: String) {
@@ -346,7 +387,6 @@ impl TaskHub {
         };
         self.epoch.fetch_add(1, Ordering::SeqCst);
         drop(g);
-        self.set_ending(None);
         self.review_now.store(false, Ordering::SeqCst);
         self.resumed.store(false, Ordering::SeqCst);
         self.persist();
@@ -366,19 +406,25 @@ impl TaskHub {
         push_log(&mut g, "user", text);
         g.goal = goal;
         g.criteria = criteria;
+        g.ending = None;
         if g.phase == TaskPhase::Done {
             g.phase = TaskPhase::Active;
         }
         drop(g);
-        self.set_ending(None);
         self.persist();
         self.request_review();
     }
 
-    /// Pause or resume the proxy. Resuming wakes an idle run.
+    /// Pause or resume the proxy. Resuming wakes an idle run, and lifts an
+    /// Esc stop: it is the user's explicit go-ahead.
     pub fn set_paused(&self, paused: bool) {
-        self.lock().paused = paused;
-        self.persist();
+        self.update(|s| {
+            s.paused = paused;
+            if !paused {
+                s.skip_steer = false;
+            }
+            true
+        });
         self.resumed.store(!paused, Ordering::SeqCst);
         if !paused {
             self.kick();
@@ -389,8 +435,9 @@ impl TaskHub {
         self.resumed.swap(false, Ordering::SeqCst)
     }
 
-    /// The user asked the proxy to look now.
+    /// The user asked the proxy to look now (which lifts an Esc stop too).
     pub fn request_review(&self) {
+        self.set_skip_steer(false);
         self.review_now.store(true, Ordering::SeqCst);
         self.kick();
     }
@@ -408,9 +455,9 @@ impl TaskHub {
         }
         g.phase = TaskPhase::Done;
         g.review_note = "使用者判定完成".into();
+        g.ending = None;
         push_log(&mut g, "user", "The user accepted the work as done.");
         drop(g);
-        self.set_ending(None);
         self.persist();
         self.kick();
     }
@@ -420,7 +467,6 @@ impl TaskHub {
         *g = TaskState::default();
         self.epoch.fetch_add(1, Ordering::SeqCst);
         drop(g);
-        self.set_ending(None);
         self.review_now.store(false, Ordering::SeqCst);
         self.persist();
         self.kick();
@@ -894,6 +940,10 @@ fn excerpt_item(item: &Value) -> Option<String> {
                 }
                 text = body;
                 role = "you (the proxy)".into();
+            } else if role == "user" && crate::notice::is_harness(&text) {
+                // A child's reply, a background exit, a failed request:
+                // the harness wrote it, not the user.
+                role = "harness note".into();
             }
             Some(format!("{role}: {}", head_tail(text.trim(), 1_500, 2_500)))
         }
@@ -1402,9 +1452,23 @@ fn fallback_message(list: &[CheckItem], claimed_done: bool) -> String {
     }
 }
 
+/// The closing turn an ending asks of the worker.
+fn closing_message(e: &Ending) -> String {
+    if e.phase == TaskPhase::Done {
+        satisfied_message(&e.reason)
+    } else {
+        hand_back_message(&e.reason)
+    }
+}
+
 /// First turn after task mode starts: the opening brief.
 pub async fn prepare_first_turn<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value]) -> Option<String> {
     let s = call.hub.snapshot();
+    if let Some(e) = s.ending.as_ref().filter(|_| s.phase.is_live()) {
+        // The run stopped (the app closed) while the worker owed its
+        // closing summary: ask for it again; the next stop ends the task.
+        return Some(closing_message(e));
+    }
     if s.phase != TaskPhase::NeedPlan || s.paused {
         return None;
     }
@@ -1456,16 +1520,21 @@ pub async fn after_wait<P: Provider>(
         return None;
     }
     let s = hub.snapshot();
-    if !s.phase.is_live() || s.paused || s.phase == TaskPhase::ExplainingFail || hub.ending_pending() {
+    if !s.phase.is_live() || s.paused || s.phase == TaskPhase::ExplainingFail || s.ending.is_some() {
         return None;
-    }
-    if s.phase == TaskPhase::NeedPlan {
-        hub.take_review_request();
-        return review(call, history, "", Kind::Plan, "").await;
     }
     let asked = hub.take_review_request();
     let resumed = hub.take_resumed();
-    if asked || (resumed && !s.skip_steer) {
+    if s.phase == TaskPhase::NeedPlan {
+        // After Esc the plan waits for the user (a message, a review
+        // request, a resume); a background exit or a timer does not count.
+        if s.skip_steer && !asked && !resumed {
+            return None;
+        }
+        hub.set_skip_steer(false);
+        return review(call, history, "", Kind::Plan, "").await;
+    }
+    if asked || resumed {
         hub.set_skip_steer(false);
         let why = if asked { "the user asked you to look now" } else { "the user resumed you" };
         return review(call, history, last_text, Kind::Push, why).await;
@@ -1488,6 +1557,170 @@ pub async fn checkpoint<P: Provider>(
     review(call, history, last_text, kind, why).await
 }
 
+/// A question the proxy wants to ask the user before it plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntakeQuestion {
+    question: String,
+    options: Vec<String>,
+}
+
+fn parse_intake(raw: &str) -> Result<Vec<IntakeQuestion>> {
+    let v = extract_json(raw)?;
+    let questions = v.get("questions").and_then(Value::as_array);
+    let ask = v
+        .get("ask")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| questions.is_some_and(|q| !q.is_empty()));
+    let Some(arr) = questions.filter(|_| ask) else {
+        return Ok(Vec::new());
+    };
+    Ok(arr
+        .iter()
+        .filter_map(|q| {
+            let text = q
+                .as_str()
+                .or_else(|| q.get("question").and_then(Value::as_str))
+                .unwrap_or("");
+            let question = clip(text, crate::ask::MAX_QUESTION);
+            if question.is_empty() {
+                return None;
+            }
+            let mut options: Vec<String> = Vec::new();
+            for o in q.get("options").and_then(Value::as_array).into_iter().flatten() {
+                let label = o
+                    .as_str()
+                    .or_else(|| o.get("label").and_then(Value::as_str))
+                    .unwrap_or("");
+                let label = clip(label, crate::ask::MAX_LABEL);
+                // The questionnaire adds its own input and skip choices.
+                if label.is_empty() || label == INTAKE_OTHER_LABEL || label == INTAKE_SKIP_LABEL || options.contains(&label) {
+                    continue;
+                }
+                options.push(label);
+                if options.len() == MAX_INTAKE_OPTIONS {
+                    break;
+                }
+            }
+            Some(IntakeQuestion { question, options })
+        })
+        .take(MAX_INTAKE_QUESTIONS)
+        .collect())
+}
+
+/// The proxy's suggestions, then a typed answer, then skipping it all.
+fn intake_choices(q: &IntakeQuestion) -> Vec<Choice> {
+    let mut out: Vec<Choice> = q
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, label)| Choice { id: format!("opt{i}"), label: label.clone(), input: false })
+        .collect();
+    out.push(Choice { id: INTAKE_OTHER.into(), label: INTAKE_OTHER_LABEL.into(), input: true });
+    out.push(Choice { id: INTAKE_SKIP.into(), label: INTAKE_SKIP_LABEL.into(), input: false });
+    out
+}
+
+/// The user's answer to one intake question. `None` = skipped or
+/// cancelled: stop asking and start with what is known.
+fn intake_answer(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    if v.get("cancelled").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for p in v.get("selected").and_then(Value::as_array).into_iter().flatten() {
+        if p.get("id").and_then(Value::as_str) == Some(INTAKE_SKIP) {
+            return None;
+        }
+        let typed = p.get("value").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
+        let text = clip(typed.or_else(|| p.get("label").and_then(Value::as_str)).unwrap_or(""), INTAKE_ANSWER_CHARS);
+        if !text.is_empty() {
+            out.push(text);
+        }
+    }
+    (!out.is_empty()).then(|| out.join("、"))
+}
+
+fn intake_prompt(state: &TaskState, history: &[Value]) -> String {
+    format!(
+        "The user's goal, in their words:\n{}\n\nThe user's acceptance criteria and preferences:\n{}\n\n{}\n",
+        state.goal,
+        or_none(&state.criteria, "(none given)"),
+        ask_context(history, ""),
+    )
+}
+
+/// Before the opening brief, once per task: the proxy may ask the user,
+/// through the session's questionnaire, what final result they want. The
+/// answers join the criteria. Without a questionnaire (children, headless)
+/// there is no intake.
+async fn intake<P: Provider>(call: &ProxyCall<'_, P>, history: &[Value], epoch: u64) {
+    let hub = call.hub;
+    let Some(ask) = hub.ask_hub() else {
+        return;
+    };
+    let mut snap = None;
+    hub.update(|s| {
+        if s.intake_done || s.phase != TaskPhase::NeedPlan || s.paused || hub.epoch() != epoch {
+            return false;
+        }
+        // Marked before asking: an Esc or a failure does not bring it back.
+        s.intake_done = true;
+        snap = Some(s.clone());
+        true
+    });
+    let Some(snap) = snap else {
+        return;
+    };
+    let prompt = intake_prompt(&snap, history);
+    let questions = match ask_twice(call, PROXY_INTAKE_INSTRUCTIONS, &prompt, false, parse_intake).await {
+        Ok(q) => q,
+        Err(e) => {
+            // Intake is optional: plan with what is known.
+            hub.update(|s| {
+                push_log(s, "note", format!("Your intake request failed ({e}); you planned without asking the user."));
+                s.phase.is_live()
+            });
+            return;
+        }
+    };
+    let mut lines = Vec::new();
+    for q in &questions {
+        let rx = ask.register();
+        call.sink.emit(&AgentEvent::AskUser {
+            meta: EventMeta { agent_name: AGENT_NAME.into(), ..meta(call.run_id) },
+            question: q.question.clone(),
+            allow_multiple: false,
+            options: intake_choices(q),
+        });
+        let body = rx.await.unwrap_or_else(|_| cancelled_json());
+        if hub.epoch() != epoch {
+            return;
+        }
+        match intake_answer(&body) {
+            Some(a) => lines.push(format!("用戶補充：{} → {a}", q.question)),
+            None => break,
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let added = hub.update(|s| {
+        if hub.epoch() != epoch || !s.phase.is_live() {
+            return false;
+        }
+        for line in &lines {
+            push_log(s, "user", line.clone());
+        }
+        let add = lines.join("\n");
+        s.criteria = if s.criteria.trim().is_empty() { add } else { format!("{}\n{add}", s.criteria.trim_end()) };
+        true
+    });
+    if added {
+        emit_notice(call.sink, call.run_id, "已把你的回答加進驗收條件".into());
+    }
+}
+
 async fn review<P: Provider>(
     call: &ProxyCall<'_, P>,
     history: &[Value],
@@ -1496,12 +1729,20 @@ async fn review<P: Provider>(
     why: &str,
 ) -> Option<String> {
     let hub = call.hub;
-    let snap = hub.snapshot();
     let epoch = hub.epoch();
-    if snap.goal.trim().is_empty() {
+    if hub.snapshot().goal.trim().is_empty() {
         return None;
     }
     emit_notice(call.sink, call.run_id, kind.notice().into());
+    if kind == Kind::Plan {
+        intake(call, history, epoch).await;
+        let s = hub.snapshot();
+        if hub.epoch() != epoch || !s.phase.is_live() || s.paused {
+            return None;
+        }
+    }
+    // Taken after intake, so the plan sees the criteria the user added.
+    let snap = hub.snapshot();
     let prompt = review_prompt(&snap, kind, why, &history_excerpt(history), last_text);
     let verdict = match ask_twice(call, PROXY_INSTRUCTIONS, &prompt, true, parse_verdict).await {
         Ok(v) => v,
@@ -1544,7 +1785,6 @@ fn apply<P>(
 ) -> Option<String> {
     let hub = call.hub;
     let mut out: Option<(String, String, String)> = None;
-    let mut ending = None;
     let applied = hub.update(|s| {
         // A review for a task that was ended, replaced, edited or paused
         // meanwhile does not count; anything else that changed (new notes,
@@ -1571,21 +1811,34 @@ fn apply<P>(
             s.phase = TaskPhase::Active;
         }
         let mut status = v.status;
-        // Code holds the line the prompt draws: unfinished notes or no
-        // cited evidence is not done.
-        if status == Status::Satisfied && (s.checklist.iter().any(|i| !i.done) || v.reason.trim().is_empty()) {
+        let mut message = v.message.trim().to_string();
+        // Code holds the lines the prompt draws: unfinished notes are not
+        // done, and an ending needs a reason. A refused ending is not passed
+        // on as said (the worker would read an acceptance and stop); the
+        // proxy reads why at its next look.
+        let refusal = refused(status, &s.checklist, &v.reason);
+        if let Some(why) = &refusal {
+            push_log(s, "note", why.clone());
+            message = if kind == Kind::Checkpoint {
+                String::new()
+            } else {
+                fallback_message(&s.checklist, status == Status::Satisfied)
+            };
             status = Status::Continue;
         }
         match status {
             Status::Continue => {
-                s.review_note = v.note.clone();
-                let mut message = v.message.trim().to_string();
+                // The proxy's own note may say it accepted; the screen
+                // should not.
+                s.review_note = if refusal.is_some() { refused_note(v.status).into() } else { v.note.clone() };
                 if message.is_empty() {
                     if kind == Kind::Checkpoint {
-                        push_log(s, "note", format!("Mid-run look: you let the worker carry on. {}", v.note));
+                        if refusal.is_none() {
+                            push_log(s, "note", format!("Mid-run look: you let the worker carry on. {}", v.note));
+                        }
                         return true;
                     }
-                    message = fallback_message(&s.checklist, v.status == Status::Satisfied);
+                    message = fallback_message(&s.checklist, false);
                 }
                 s.rounds += 1;
                 s.last_proxy = message.clone();
@@ -1598,28 +1851,20 @@ fn apply<P>(
                 s.rounds += 1;
                 s.last_proxy = format!("已滿意：{reason}");
                 push_log(s, "proxy", format!("(accept) Satisfied: {reason}"));
-                ending = Some(Ending { phase: TaskPhase::Done, reason: reason.clone() });
+                s.ending = Some(Ending { phase: TaskPhase::Done, reason: reason.clone() });
                 out = Some(("accept".into(), reason.clone(), satisfied_message(&reason)));
             }
             Status::HandBack => {
-                let reason = if v.reason.trim().is_empty() {
-                    "用戶代理判斷再推也沒有幫助，需要你決定下一步。".to_string()
-                } else {
-                    v.reason.trim().to_string()
-                };
+                let reason = v.reason.trim().to_string();
                 s.review_note = if v.note.is_empty() { reason.clone() } else { v.note.clone() };
                 s.rounds += 1;
                 s.last_proxy = format!("交還使用者：{reason}");
                 push_log(s, "proxy", format!("(hand_back) Handed back to the user: {reason}"));
-                ending = Some(Ending { phase: TaskPhase::HandedBack, reason: reason.clone() });
+                s.ending = Some(Ending { phase: TaskPhase::HandedBack, reason: reason.clone() });
                 out = Some(("hand_back".into(), reason.clone(), hand_back_message(&reason)));
             }
             Status::Impossible => {
-                let reason = if v.reason.trim().is_empty() {
-                    "用戶代理判定目標因不可改變的限制而無法完成。".to_string()
-                } else {
-                    v.reason.trim().to_string()
-                };
+                let reason = v.reason.trim().to_string();
                 s.phase = TaskPhase::ExplainingFail;
                 s.fail_reason = reason.clone();
                 s.review_note = reason.clone();
@@ -1634,12 +1879,48 @@ fn apply<P>(
     if !applied {
         return None;
     }
-    if ending.is_some() {
-        hub.set_ending(ending);
-    }
     let (intent, text, inject) = out?;
     emit_proxy(call.sink, call.run_id, &intent, text);
     Some(inject)
+}
+
+/// Why code refuses the proxy's verdict, if it does: satisfied with open
+/// items or no reason, hand_back or impossible with no reason.
+fn refused(status: Status, list: &[CheckItem], reason: &str) -> Option<String> {
+    let no_reason = reason.trim().is_empty();
+    match status {
+        Status::Continue => None,
+        Status::Satisfied => {
+            let open: Vec<&str> = list.iter().filter(|i| !i.done).map(|i| i.text.as_str()).collect();
+            if !open.is_empty() {
+                Some(format!(
+                    "Your satisfied was not accepted: these checklist items are still open: {}. Mark them done once you have seen the evidence, or drop them with a note.",
+                    open.join("; ")
+                ))
+            } else if no_reason {
+                Some("Your satisfied was not accepted: reason was empty. Name the concrete evidence in reason.".into())
+            } else {
+                None
+            }
+        }
+        Status::HandBack if no_reason => Some(
+            "Your hand_back was not accepted: reason was empty. Say in reason what the user needs to decide or do.".into(),
+        ),
+        Status::Impossible if no_reason => Some(
+            "Your impossible was not accepted: reason was empty. Name the unchangeable constraint in reason.".into(),
+        ),
+        Status::HandBack | Status::Impossible => None,
+    }
+}
+
+/// What the user's screen says when code refused the proxy's verdict.
+fn refused_note(status: Status) -> &'static str {
+    match status {
+        Status::Satisfied => "用戶代理想驗收，但還有未完成項目或沒有說明證據，繼續推進",
+        Status::HandBack => "用戶代理想交還但沒有說明理由，繼續推進",
+        Status::Impossible => "用戶代理判定無法完成但沒有說明理由，繼續推進",
+        Status::Continue => "",
+    }
 }
 
 /// The worker wrote its closing turn after satisfied / hand_back.
@@ -1856,9 +2137,10 @@ impl Watch {
     pub const SAME_FAILS: u32 = 3;
     pub const SAME_CALLS: u32 = 4;
 
-    /// One tool call and its output.
+    /// One tool call and its output. Calls compare by their full
+    /// arguments: two writes to one file with different content differ.
     pub fn call(&mut self, name: &str, args: &Value, output: &str) {
-        let sig = format!("{name} {}", clip_ellipsis(&args.to_string(), CALL_ARGS_CHARS));
+        let sig = format!("{name} {args}");
         if self.last_call.as_deref() == Some(sig.as_str()) {
             self.same_calls += 1;
         } else {
@@ -1898,14 +2180,14 @@ impl Watch {
             return Some(format!(
                 "the same failing tool call, {} times in a row: {}",
                 self.same_fails,
-                self.last_fail.as_deref().unwrap_or("")
+                shown_call(self.last_fail.as_deref())
             ));
         }
         if self.same_calls >= Self::SAME_CALLS {
             return Some(format!(
                 "the same tool call, {} times in a row: {}",
                 self.same_calls,
-                self.last_call.as_deref().unwrap_or("")
+                shown_call(self.last_call.as_deref())
             ));
         }
         if self.since_progress >= Self::STALL_ROUNDS {
@@ -1923,6 +2205,10 @@ impl Watch {
     }
 }
 
+fn shown_call(sig: Option<&str>) -> String {
+    clip_ellipsis(sig.unwrap_or(""), CALL_ARGS_CHARS)
+}
+
 /// An error result, a nonzero exit or a timeout.
 fn failed_output(output: &str) -> bool {
     let Ok(Value::Object(o)) = serde_json::from_str::<Value>(output) else {
@@ -1936,8 +2222,6 @@ fn failed_output(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::CompleteResponse;
-    use std::collections::VecDeque;
 
     #[test]
     fn kick_marker() {
@@ -1945,6 +2229,26 @@ mod tests {
         assert!(is_kick("  [grokaagent task] \n"));
         assert!(!is_kick("hello"));
     }
+
+    #[test]
+    fn start_goal_kicks_and_end_clears() {
+        let hub = TaskHub::new("");
+        hub.start_goal("  把登入做完  ");
+        assert!(hub.take_kick());
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::NeedPlan);
+        assert_eq!(s.goal, "把登入做完");
+        hub.end();
+        assert_eq!(hub.snapshot().phase, TaskPhase::Inactive);
+        assert!(hub.snapshot().goal.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use crate::provider::CompleteResponse;
+    use std::collections::VecDeque;
 
     #[test]
     fn an_old_task_json_still_loads() {
@@ -1957,6 +2261,7 @@ mod tests {
         assert_eq!(s.checklist, vec![CheckItem { text: "a".into(), done: true }]);
         assert!(s.criteria.is_empty() && !s.paused && s.proxy_log.is_empty());
         assert_eq!((s.rounds, s.last_proxy.as_str()), (0, ""));
+        assert!(!s.intake_done && s.ending.is_none());
         let handed: TaskState = serde_json::from_str(r#"{"goal":"y","phase":"handed_back"}"#).unwrap();
         assert_eq!(handed.phase, TaskPhase::HandedBack);
         assert!(!handed.phase.is_live());
@@ -2037,6 +2342,15 @@ mod tests {
         assert!(s.chars().count() <= EXCERPT_CHARS + 40);
         assert!(s.contains("msg199") && !s.contains("msg0 "), "newest kept");
         assert!(s.starts_with("[… older conversation cut …]"));
+        // Harness notes are not the user's words.
+        let s = history_excerpt(&[
+            json!({"role": "user", "content": format!("{} (HTTP 400). Continue the task yourself.", crate::notice::REQUEST_FAILED)}),
+            json!({"role": "user", "content": "[child agent `coder` replied] done"}),
+            json!({"role": "user", "content": "真的使用者"}),
+        ]);
+        assert!(s.contains("harness note: The previous model request failed"), "{s}");
+        assert!(s.contains("harness note: [child agent `coder` replied]"), "{s}");
+        assert_eq!(s.matches("user: ").count(), 1, "{s}");
     }
 
     #[test]
@@ -2071,19 +2385,6 @@ mod tests {
         let m = memory_text(&s.proxy_log);
         assert!(m.chars().count() <= MEMORY_CHARS + LOG_ENTRY_CHARS);
         assert!(m.contains("reply 59 ") && !m.contains("reply 20 "));
-    }
-
-    #[test]
-    fn start_goal_kicks_and_end_clears() {
-        let hub = TaskHub::new("");
-        hub.start_goal("  把登入做完  ");
-        assert!(hub.take_kick());
-        let s = hub.snapshot();
-        assert_eq!(s.phase, TaskPhase::NeedPlan);
-        assert_eq!(s.goal, "把登入做完");
-        hub.end();
-        assert_eq!(hub.snapshot().phase, TaskPhase::Inactive);
-        assert!(hub.snapshot().goal.is_empty());
     }
 
     #[tokio::test]
@@ -2165,6 +2466,19 @@ mod tests {
             w.tool_round();
         }
         assert!(w.due().unwrap().contains("without a file change"));
+
+        // Calls compare by their full arguments, and show clipped.
+        let mut w = Watch::default();
+        let long = "x".repeat(2 * CALL_ARGS_CHARS);
+        for i in 0..4 {
+            w.call("write_file", &json!({"path": "a.rs", "content": format!("{long}{i}")}), fail);
+            w.tool_round();
+        }
+        assert!(w.due().is_none(), "different content is a different call");
+        w.call("write_file", &json!({"path": "a.rs", "content": format!("{long}3")}), fail);
+        w.call("write_file", &json!({"path": "a.rs", "content": format!("{long}3")}), fail);
+        let why = w.due().expect("the same failing write 3 times");
+        assert!(why.chars().count() < CALL_ARGS_CHARS + 80, "{why}");
         assert!(failed_output(r#"{"error":"no such file"}"#));
         assert!(failed_output(r#"{"timed_out":true,"exit_code":null}"#));
         assert!(!failed_output(r#"{"exit_code":0}"#) && !failed_output("plain text"));
@@ -2215,7 +2529,7 @@ mod tests {
         })
     }
 
-    fn proxy_call<'a>(hub: &'a TaskHub, provider: &'a Proxy, ws: &'a Path, sink: &'a Rec) -> ProxyCall<'a, Proxy> {
+    fn proxy_call<'a>(hub: &'a TaskHub, provider: &'a Proxy, ws: &'a Path, sink: &'a dyn EventSink) -> ProxyCall<'a, Proxy> {
         ProxyCall {
             hub,
             provider,
@@ -2267,11 +2581,19 @@ mod tests {
 
     #[test]
     fn workspace_changes_is_empty_outside_git() {
+        // A `.git` file git cannot read stops it here, whatever repo the
+        // temp folder sits in.
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "not a git dir\n").unwrap();
         let v: Value = serde_json::from_str(&workspace_changes(dir.path())).unwrap();
-        if v["git"] == false {
-            assert_eq!(v["status"], "");
-            assert_eq!(v["diff_stat"], "");
+        assert_eq!(v, json!({"git": false, "status": "", "diff_stat": ""}));
+        // In a repo it shows the change (where git is installed).
+        let repo = tempfile::tempdir().unwrap();
+        if git_text(repo.path(), &["init", "-q"]).is_some() {
+            std::fs::write(repo.path().join("new.txt"), "x").unwrap();
+            let v: Value = serde_json::from_str(&workspace_changes(repo.path())).unwrap();
+            assert_eq!(v["git"], true);
+            assert!(v["status"].as_str().unwrap().contains("new.txt"), "{v}");
         }
     }
 
@@ -2560,6 +2882,290 @@ mod tests {
         knobs.lock().unwrap().task_model = " other-proxy ".into();
         assert_eq!(proxy_settings(Some(&knobs), "x", ReasoningEffort::Low).0, "other-proxy");
         assert_eq!(proxy_settings(None, "cli-model", ReasoningEffort::Low), ("cli-model".into(), ReasoningEffort::Low, true));
+    }
+
+    #[tokio::test]
+    async fn a_refused_ending_sends_the_open_items_not_the_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Proxy::new(vec![
+            says(json!({"status": "continue", "message": "寫測試", "checklist": [{"text": "寫測試", "done": false}]})),
+            says(json!({"status": "satisfied", "message": "Great work, I accept this. Write the summary.", "reason": "looks fine"})),
+            says(json!({"status": "hand_back", "message": "I give up on this.", "reason": ""})),
+            says(json!({"status": "impossible", "message": "Stop.", "reason": " "})),
+            says(json!({"status": "continue", "message": "測試呢？"})),
+        ]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        prepare_first_turn(&call, &[]).await.unwrap();
+        let out = after_natural_stop(&call, &[], "done").await.unwrap();
+        assert!(!out.contains("I accept") && out.contains("still open") && out.contains("寫測試"), "{out}");
+        assert!(!hub.ending_pending());
+        let s = hub.snapshot();
+        assert!(s.review_note.contains("繼續推進"), "{}", s.review_note);
+        assert!(s.proxy_log.iter().any(|t| t.who == "note" && t.text.contains("Your satisfied was not accepted") && t.text.contains("寫測試")), "{:?}", s.proxy_log);
+        assert!(s.proxy_log.iter().any(|t| t.who == "proxy" && t.text.starts_with("(push) Not done yet")));
+        // An ending needs a reason: no hand-back, no failure.
+        let out = after_natural_stop(&call, &[], "stuck").await.unwrap();
+        assert!(!out.contains("I give up") && !out.contains("handing this back"), "{out}");
+        assert_eq!(hub.snapshot().phase, TaskPhase::Active);
+        assert!(!hub.ending_pending());
+        // At a mid-run look a refused ending lets the worker carry on.
+        assert!(checkpoint(&call, &[], "", "30 tool rounds").await.is_none());
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::Active);
+        assert!(s.fail_reason.is_empty());
+        assert!(s.proxy_log.iter().any(|t| t.text.starts_with("Your hand_back was not accepted")));
+        assert!(s.proxy_log.iter().any(|t| t.text.starts_with("Your impossible was not accepted")));
+        // The proxy reads why at its next look.
+        after_natural_stop(&call, &[], "again").await.unwrap();
+        let prompt = provider.calls.lock().unwrap()[4].input[0]["content"].as_str().unwrap().to_string();
+        assert!(prompt.contains("[note] Your satisfied was not accepted"), "{prompt}");
+        let intents: Vec<String> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TaskProxy { intent, .. } => Some(intent.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(intents, ["plan", "push", "push", "push"]);
+    }
+
+    #[tokio::test]
+    async fn a_pending_ending_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Proxy::new(vec![says(json!({"status": "satisfied", "reason": "cargo test: 3 passed"}))]);
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await.unwrap();
+        let saved = serde_json::to_string(&hub.snapshot()).unwrap();
+        let back: TaskState = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.ending, Some(Ending { phase: TaskPhase::Done, reason: "cargo test: 3 passed".into() }));
+        let hub = TaskHub::from_state("", back);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        // A new run asks for the closing summary again; idle wakes do not push.
+        let out = prepare_first_turn(&call, &[]).await.unwrap();
+        assert!(out.starts_with("[user-proxy] The user's proxy is satisfied: cargo test: 3 passed. Write the final summary"), "{out}");
+        hub.request_review();
+        assert!(after_wait(&call, &[], "", &[]).await.is_none());
+        // The next stop ends it.
+        assert!(after_natural_stop(&call, &[], "總結").await.is_none());
+        let s = hub.snapshot();
+        assert_eq!(s.phase, TaskPhase::Done);
+        assert!(s.ending.is_none());
+        assert_eq!(provider.n(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_and_review_lift_an_esc_stop_and_the_plan_waits_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TaskHub::new("");
+        hub.start_goal("做登入");
+        hub.set_skip_steer(true);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let provider = Proxy::new(vec![
+            says(json!({"status": "continue", "message": "開始"})),
+            says(json!({"status": "continue", "message": "下一步"})),
+        ]);
+        let call = proxy_call(&hub, &provider, dir.path(), &rec);
+        // A wake that is not the user (a background exit, a timer) does not
+        // run the plan against Esc.
+        assert!(after_wait(&call, &[], "", &[]).await.is_none());
+        assert_eq!(provider.n(), 0);
+        hub.set_paused(true);
+        hub.set_paused(false);
+        assert!(!hub.snapshot().skip_steer, "resuming lifts the Esc stop");
+        assert!(after_wait(&call, &[], "", &[]).await.unwrap().contains("開始"));
+        hub.set_skip_steer(true);
+        assert!(after_wait(&call, &[], "", &[]).await.is_none());
+        hub.request_review();
+        assert!(!hub.snapshot().skip_steer, "so does asking for a look");
+        assert!(after_wait(&call, &[], "", &[]).await.unwrap().contains("下一步"));
+    }
+
+    /// Records events and answers each questionnaire from a script, as the
+    /// user would; with nothing left it cancels.
+    struct Human {
+        events: Mutex<Vec<AgentEvent>>,
+        hub: AskUserHub,
+        answers: Mutex<VecDeque<String>>,
+    }
+
+    impl Human {
+        fn new(hub: &AskUserHub, answers: Vec<String>) -> Self {
+            Self { events: Mutex::new(Vec::new()), hub: hub.clone(), answers: Mutex::new(answers.into()) }
+        }
+
+        /// (asking agent, question, options) of each questionnaire.
+        fn asked(&self) -> Vec<(String, String, Vec<Choice>)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::AskUser { meta, question, options, .. } => Some((meta.agent_name.clone(), question.clone(), options.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl EventSink for Human {
+        fn emit(&self, event: &AgentEvent) {
+            self.events.lock().unwrap().push(event.clone());
+            if matches!(event, AgentEvent::AskUser { .. }) {
+                match self.answers.lock().unwrap().pop_front() {
+                    Some(a) => self.hub.answer(a),
+                    None => self.hub.cancel(),
+                }
+            }
+        }
+    }
+
+    fn pick(id: &str, label: &str, value: Option<&str>) -> String {
+        crate::ask::encode_answer(&[crate::ask::Picked { id: id.into(), label: label.into(), value: value.map(String::from) }])
+    }
+
+    fn is_intake(req: &CompleteRequest) -> bool {
+        req.instructions == PROXY_INTAKE_INSTRUCTIONS
+    }
+
+    #[tokio::test]
+    async fn intake_asks_the_user_and_the_answers_join_the_criteria() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = AskUserHub::new();
+        let hub = TaskHub::new("");
+        hub.start_task("做一個天氣小工具", "要有測試");
+        hub.set_ask_hub(Some(ask.clone()));
+        let provider = Proxy::new(vec![
+            says(json!({"ask": true, "questions": [
+                {"question": "最後要交出什麼？", "options": ["命令列程式", "網頁", "", "網頁", "其他（自己填寫）"]},
+                {"question": "你會怎麼確認它能用？", "options": ["跑測試", "打開看看"]},
+            ]})),
+            says(json!({"status": "continue", "message": "先做網頁的骨架。"})),
+        ]);
+        let human = Human::new(&ask, vec![pick("opt1", "網頁", None), pick(INTAKE_OTHER, INTAKE_OTHER_LABEL, Some("打開頁面看得到今天的天氣"))]);
+        let call = proxy_call(&hub, &provider, dir.path(), &human);
+        let history = [json!({"role": "user", "content": "天氣資料用中央氣象署的"})];
+        let out = prepare_first_turn(&call, &history).await.expect("a plan");
+        let s = hub.snapshot();
+        assert_eq!(s.criteria, "要有測試\n用戶補充：最後要交出什麼？ → 網頁\n用戶補充：你會怎麼確認它能用？ → 打開頁面看得到今天的天氣");
+        assert!(s.intake_done);
+        assert!(s.proxy_log.iter().any(|t| t.who == "user" && t.text == "用戶補充：最後要交出什麼？ → 網頁"));
+        // From the proxy: its suggestions, a typed answer, then skip.
+        let asked = human.asked();
+        assert_eq!(asked.len(), 2);
+        let (agent, question, options) = &asked[0];
+        assert_eq!((agent.as_str(), question.as_str()), (AGENT_NAME, "最後要交出什麼？"));
+        let labels: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["命令列程式", "網頁", INTAKE_OTHER_LABEL, INTAKE_SKIP_LABEL]);
+        assert!(options[2].input && !options[3].input);
+        let reqs = provider.calls.lock().unwrap();
+        assert!(is_intake(&reqs[0]) && reqs[0].client_tools.is_empty());
+        let intake = reqs[0].input[0]["content"].as_str().unwrap();
+        assert!(intake.contains("做一個天氣小工具") && intake.contains("中央氣象署"), "{intake}");
+        // The plan works from the enriched criteria.
+        let plan = reqs[1].input[0]["content"].as_str().unwrap();
+        assert!(plan.contains("Review kind: plan") && plan.contains("用戶補充：最後要交出什麼？ → 網頁"), "{plan}");
+        assert!(out.contains("先做網頁的骨架。") && out.contains("用戶補充：你會怎麼確認它能用？"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn intake_that_does_not_ask_goes_straight_to_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = AskUserHub::new();
+        let hub = TaskHub::new("");
+        hub.start_task("把 README 的錯字改掉", "只改錯字");
+        hub.set_ask_hub(Some(ask.clone()));
+        let provider = Proxy::new(vec![says(json!({"ask": false})), says(json!({"status": "continue", "message": "改吧"}))]);
+        let human = Human::new(&ask, vec![]);
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[]).await.unwrap();
+        assert!(human.asked().is_empty());
+        assert_eq!(provider.n(), 2);
+        let s = hub.snapshot();
+        assert_eq!(s.criteria, "只改錯字");
+        assert!(s.intake_done);
+    }
+
+    #[tokio::test]
+    async fn skipping_or_cancelling_intake_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        for answers in [vec![pick(INTAKE_SKIP, INTAKE_SKIP_LABEL, None)], vec![]] {
+            let ask = AskUserHub::new();
+            let hub = TaskHub::new("");
+            hub.start_task("做登入", "");
+            hub.set_ask_hub(Some(ask.clone()));
+            let provider = Proxy::new(vec![
+                says(json!({"ask": true, "questions": [{"question": "要哪種登入？", "options": ["密碼", "OAuth"]}, {"question": "要記住我嗎？", "options": ["要", "不要"]}]})),
+                says(json!({"status": "continue", "message": "開始"})),
+            ]);
+            let human = Human::new(&ask, answers);
+            prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &human), &[]).await.unwrap();
+            assert_eq!(human.asked().len(), 1, "skip and cancel stop the asking");
+            let s = hub.snapshot();
+            assert_eq!(s.criteria, "");
+            assert!(s.proxy_log.iter().all(|t| t.who != "user"));
+            assert_eq!(provider.n(), 2, "and the plan goes ahead");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_questionnaire_there_is_no_intake() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let hub = TaskHub::new("");
+        hub.start_task("做登入", "");
+        hub.set_ask_hub(None);
+        let provider = Proxy::new(vec![says(json!({"status": "continue", "message": "開始"}))]);
+        prepare_first_turn(&proxy_call(&hub, &provider, dir.path(), &rec), &[]).await.unwrap();
+        assert_eq!(provider.n(), 1);
+        assert!(!is_intake(&provider.calls.lock().unwrap()[0]));
+        assert!(!rec.0.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::AskUser { .. })));
+        assert!(!hub.snapshot().intake_done);
+    }
+
+    #[tokio::test]
+    async fn intake_runs_once_per_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = AskUserHub::new();
+        let hub = TaskHub::new("");
+        hub.start_task("做登入", "");
+        hub.set_ask_hub(Some(ask.clone()));
+        let provider = Proxy::new(vec![
+            says(json!({"ask": true, "questions": [{"question": "要哪種登入？", "options": ["密碼", "OAuth"]}]})),
+            Err(Error::Provider("HTTP 500".into())),
+            Err(Error::Provider("HTTP 500".into())),
+            says(json!({"status": "continue", "message": "開始"})),
+            says(json!({"status": "continue", "message": "繼續"})),
+        ]);
+        let human = Human::new(&ask, vec![pick("opt1", "OAuth", None), pick("opt0", "密碼", None)]);
+        let call = proxy_call(&hub, &provider, dir.path(), &human);
+        // The plan fails after intake: paused.
+        assert!(prepare_first_turn(&call, &[]).await.is_none());
+        assert!(hub.snapshot().paused);
+        // Resuming retries the plan, not intake.
+        hub.set_paused(false);
+        assert!(after_wait(&call, &[], "", &[]).await.unwrap().contains("開始"));
+        // Nor do an edit and a review.
+        let criteria = hub.snapshot().criteria;
+        assert_eq!(criteria, "用戶補充：要哪種登入？ → OAuth");
+        hub.edit_task("做 OAuth 登入", criteria);
+        assert!(after_wait(&call, &[], "", &[]).await.unwrap().contains("繼續"));
+        assert_eq!(human.asked().len(), 1);
+        let reqs = provider.calls.lock().unwrap();
+        assert_eq!(reqs.iter().filter(|r| is_intake(r)).count(), 1);
+        assert!(is_intake(&reqs[0]));
+        drop(reqs);
+        // The mark is saved with the task; a new task asks again.
+        let back: TaskState = serde_json::from_str(&serde_json::to_string(&hub.snapshot()).unwrap()).unwrap();
+        assert!(back.intake_done);
+        hub.start_task("別的目標", "");
+        assert!(!hub.snapshot().intake_done);
     }
 
     struct Rec(Mutex<Vec<AgentEvent>>);

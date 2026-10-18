@@ -178,6 +178,9 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         tools.extend(ask_tools(provider, &spec, ask_hub, tee.clone(), &run_id));
     }
     if let Some(task) = spec.task.clone() {
+        // The proxy's intake questions use the same questionnaire; without
+        // one (headless) there is no intake.
+        task.set_ask_hub(spec.ask.clone());
         tools.push(Box::new(
             crate::task::TaskReportTool::new(task).with_events(tee.clone(), run_id.clone()),
         ));
@@ -319,19 +322,24 @@ fn ask_tools<P: Provider + Clone + 'static>(
 
 /// Drives a headless task-mode run: prints what the user's proxy says to
 /// stderr, sends `--then` messages each time the agent waits, and closes
-/// the inbox once nothing is left to push (the task ended or paused, or the
-/// turn cap was hit), which ends the run.
+/// the inbox once nothing is left to push (the task ended, paused or is
+/// winding down, the turn cap was hit, or the pokes ran out), which ends
+/// the run.
 pub struct TaskDriver {
     inner: Arc<dyn EventSink>,
     hub: Arc<crate::task::TaskHub>,
     queue: Mutex<std::collections::VecDeque<String>>,
     tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::agent::UserTurn>>>,
     capped: std::sync::atomic::AtomicBool,
-    /// Review requests sent while the task looked live but the agent waited.
+    /// Review requests sent while the proxy could speak but the agent
+    /// waited (its requests kept failing), since the agent last answered.
     pokes: std::sync::atomic::AtomicU32,
 }
 
 impl TaskDriver {
+    /// Review requests per stretch in which the agent never answered.
+    pub const MAX_POKES: u32 = 2;
+
     pub fn new(
         inner: Arc<dyn EventSink>,
         hub: Arc<crate::task::TaskHub>,
@@ -361,8 +369,13 @@ impl EventSink for TaskDriver {
         }
         match event {
             AgentEvent::TaskProxy { intent, text, .. } => {
-                self.pokes.store(0, Ordering::SeqCst);
                 eprintln!("[user-proxy {intent}] {text}");
+            }
+            // The agent answered: a later stall gets its pokes again. A
+            // proxy message alone does not count, or an agent whose
+            // requests keep failing would be pushed forever.
+            AgentEvent::ModelFinished { .. } => {
+                self.pokes.store(0, Ordering::SeqCst);
             }
             AgentEvent::Error { message, .. } if message.starts_with("max turns (") => {
                 self.capped.store(true, Ordering::SeqCst);
@@ -374,9 +387,10 @@ impl EventSink for TaskDriver {
                     let _ = sender.send(crate::agent::UserTurn::from(text));
                     return;
                 }
-                let s = self.hub.snapshot();
-                let live = s.phase.is_live() && !s.paused;
-                if live && !self.capped.load(Ordering::SeqCst) && self.pokes.fetch_add(1, Ordering::SeqCst) < 2 {
+                if self.hub.steering_open()
+                    && !self.capped.load(Ordering::SeqCst)
+                    && self.pokes.fetch_add(1, Ordering::SeqCst) < Self::MAX_POKES
+                {
                     self.hub.request_review();
                     return;
                 }
@@ -564,5 +578,193 @@ mod tests {
         let (driver, mut rx) = TaskDriver::new(rec, hub, vec![]);
         driver.emit(&wait_event());
         assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn the_headless_driver_stops_poking_what_cannot_move() {
+        use crate::events::EventMeta;
+        let m = || EventMeta { ts: chrono::Utc::now(), agent_name: "root".into(), run_id: "r".into(), parent_run_id: None, path: String::new() };
+        let closed = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::agent::UserTurn>| {
+            matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected))
+        };
+        // Paused, stopped by Esc, winding down after an acceptance: closed
+        // on the first wait, no review requested.
+        for setup in [
+            (|h: &crate::task::TaskHub| h.set_paused(true)) as fn(&crate::task::TaskHub),
+            |h| h.set_skip_steer(true),
+            |h| {
+                h.replace(crate::task::TaskState {
+                    goal: "x".into(),
+                    phase: crate::task::TaskPhase::Active,
+                    ending: Some(crate::task::Ending { phase: crate::task::TaskPhase::Done, reason: "seen".into() }),
+                    ..crate::task::TaskState::default()
+                })
+            },
+        ] {
+            let hub = crate::task::TaskHub::new("");
+            hub.start_goal("x");
+            setup(&hub);
+            hub.take_review_request();
+            let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+            let (driver, mut rx) = TaskDriver::new(rec, hub.clone(), vec![]);
+            driver.emit(&wait_event());
+            assert!(closed(&mut rx));
+            assert!(!hub.take_review_request());
+        }
+        // Pokes come back only once the agent answered again.
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("x");
+        let rec: Arc<dyn EventSink> = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, mut rx) = TaskDriver::new(rec, hub.clone(), vec![]);
+        let proxy = AgentEvent::TaskProxy { meta: m(), intent: "push".into(), text: "again".into() };
+        for _ in 0..TaskDriver::MAX_POKES {
+            driver.emit(&wait_event());
+            assert!(hub.take_review_request());
+            driver.emit(&proxy);
+        }
+        driver.emit(&AgentEvent::ModelFinished { meta: m(), text: "ok".into(), finish: "stop".into(), input_tokens: 0, cached_tokens: 0 });
+        driver.emit(&wait_event());
+        assert!(hub.take_review_request());
+        assert!(!closed(&mut rx));
+    }
+
+    /// The user proxy answers from a script (then `proxy_then`, forever);
+    /// the worker from its own, and once that runs out every request
+    /// fails.
+    struct Headless {
+        proxy: Mutex<std::collections::VecDeque<crate::error::Result<CompleteResponse>>>,
+        proxy_then: Option<serde_json::Value>,
+        worker: Mutex<std::collections::VecDeque<&'static str>>,
+        proxy_calls: std::sync::atomic::AtomicUsize,
+        worker_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Headless {
+        fn new(proxy: Vec<crate::error::Result<CompleteResponse>>, proxy_then: Option<serde_json::Value>, worker: Vec<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                proxy: Mutex::new(proxy.into()),
+                proxy_then,
+                worker: Mutex::new(worker.into()),
+                proxy_calls: Default::default(),
+                worker_calls: Default::default(),
+            })
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.proxy_calls.load(SeqCst), self.worker_calls.load(SeqCst))
+        }
+    }
+
+    fn says(v: serde_json::Value) -> crate::error::Result<CompleteResponse> {
+        Ok(CompleteResponse { text: v.to_string(), ..CompleteResponse::new("p") })
+    }
+
+    impl Provider for Headless {
+        async fn complete(&self, req: CompleteRequest) -> crate::error::Result<CompleteResponse> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if req.instructions.starts_with("You are the user's proxy") {
+                self.proxy_calls.fetch_add(1, SeqCst);
+                if let Some(r) = self.proxy.lock().unwrap().pop_front() {
+                    return r;
+                }
+                return match &self.proxy_then {
+                    Some(v) => says(v.clone()),
+                    None => Err(crate::error::Error::Provider("HTTP 500: proxy down".into())),
+                };
+            }
+            self.worker_calls.fetch_add(1, SeqCst);
+            match self.worker.lock().unwrap().pop_front() {
+                Some(t) => Ok(CompleteResponse { text: t.into(), ..CompleteResponse::new("w") }),
+                None => Err(crate::error::Error::Provider("HTTP 400: bad request".into())),
+            }
+        }
+        async fn compact(&self, _req: CompactRequest) -> crate::error::Result<CompactResponse> {
+            Err(crate::error::Error::Provider("no compact".into()))
+        }
+    }
+
+    /// `grokaagent run --task` minus the CLI: a kick-started task run whose
+    /// inbox the driver owns. It must end on its own.
+    async fn headless(provider: &Arc<Headless>, hub: &Arc<crate::task::TaskHub>) -> (Result<RunOutcome>, Vec<AgentEvent>) {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        let (driver, rx) = TaskDriver::new(rec.clone(), hub.clone(), vec![]);
+        let cfg = RunConfig {
+            agent_name: "root".into(),
+            instructions: "use tools".into(),
+            prompt: crate::task::KICK.into(),
+            model: "grok-4.6".into(),
+            max_turns: 0,
+            server_tools: vec![],
+            context_window: 0,
+            compact_keep_recent: 0,
+            parent_run_id: None,
+            run_id: "run-1".into(),
+            reasoning_effort: crate::provider::ReasoningEffort::High,
+            knobs: None,
+            inbox: Some(rx),
+            bg_notify: None,
+            workspace: dir.path().to_path_buf(),
+            images: Vec::new(),
+            closed_backgrounds: None,
+            prior_history: Vec::new(),
+            persist_history: None,
+            cancel: None,
+            skills: None,
+            task: Some(hub.clone()),
+        };
+        let tools = ToolRegistry::new(vec![]);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), agent::run(provider, &tools, driver.as_ref(), cfg))
+            .await
+            .expect("the headless task run must end on its own");
+        let events = rec.0.lock().unwrap().clone();
+        (out, events)
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_ends_when_the_task_is_done() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_task("write hello.txt", "it says hi");
+        let provider = Headless::new(
+            vec![
+                says(json!({"status": "continue", "message": "Write hello.txt."})),
+                says(json!({"status": "satisfied", "reason": "the worker showed the file"})),
+            ],
+            None,
+            vec!["wrote it: hi", "Summary: hello.txt says hi."],
+        );
+        let (out, events) = headless(&provider, &hub).await;
+        assert_eq!(out.unwrap().text, "Summary: hello.txt says hi.");
+        assert_eq!(hub.snapshot().phase, crate::task::TaskPhase::Done);
+        assert_eq!(provider.calls(), (2, 2));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { reason, .. } if reason == "stop")));
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_ends_when_the_proxy_fails_after_a_poke() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("fix the build");
+        // The plan, then the poked review fails twice and pauses the task.
+        let provider = Headless::new(vec![says(json!({"status": "continue", "message": "Fix it."}))], None, vec![]);
+        let (out, events) = headless(&provider, &hub).await;
+        assert!(out.is_err());
+        assert!(hub.snapshot().paused);
+        assert_eq!(provider.calls().0, 3, "the plan, then one review tried twice");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_headless_task_run_stops_pushing_an_agent_that_keeps_failing() {
+        let hub = crate::task::TaskHub::new("");
+        hub.start_goal("fix the build");
+        // The proxy always answers; the worker never does.
+        let provider = Headless::new(vec![], Some(json!({"status": "continue", "message": "Try again."})), vec![]);
+        let (out, events) = headless(&provider, &hub).await;
+        assert!(out.is_err());
+        let (proxy, worker) = provider.calls();
+        assert_eq!(proxy, 1 + TaskDriver::MAX_POKES as usize, "the plan and one push per poke");
+        assert_eq!(worker, 3 * (1 + TaskDriver::MAX_POKES as usize));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::RunFinished { .. })));
     }
 }
