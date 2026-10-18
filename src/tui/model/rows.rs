@@ -201,11 +201,29 @@ pub(crate) enum Row {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         source: String,
     },
+    /// Task mode: the user proxy spoke to the worker, or the worker reported
+    /// to it (`intent`, see [`proxy_label`]).
+    Proxy { intent: String, text: String },
 }
 
 impl Row {
     pub fn meta(s: impl Into<String>) -> Self {
         Self::Meta(s.into())
+    }
+}
+
+/// How a proxy row names what was said.
+pub(crate) fn proxy_label(intent: &str) -> &str {
+    match intent {
+        "plan" => "開場",
+        "push" => "要求",
+        "checkpoint" => "中途提醒",
+        "answer" => "代答",
+        "accept" => "驗收",
+        "hand_back" => "交還",
+        "impossible" => "無法完成",
+        "report" => "主代理回報",
+        other => other,
     }
 }
 

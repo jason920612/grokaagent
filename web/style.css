@@ -22,6 +22,8 @@
   --agent: #a3d1a3;
   --think: #b4a0e0;
   --tool: #d2b450;
+  --proxy: #e89e66;
+  --proxy-bg: rgba(232, 158, 102, 0.1);
   --warn: #f48771;
   --add: #3fb950;
   --del: #f85149;
@@ -54,6 +56,8 @@
   --agent: #2f7a45;
   --think: #6b5a8a;
   --tool: #8a6a2f;
+  --proxy: #a0531c;
+  --proxy-bg: rgba(160, 83, 28, 0.07);
   --warn: #b54a2f;
   --add: #1a7f37;
   --del: #cf222e;
@@ -220,6 +224,17 @@ pre, code { font-family: var(--mono); font-size: 12.5px; }
   color: var(--accent-ink);
 }
 .side-btn:hover { filter: brightness(1.1); }
+.side-note.task-text { color: var(--ink); white-space: pre-wrap; word-break: break-word; padding-top: 2px; padding-bottom: 4px; }
+.side-note.proxy-note { max-height: 14em; overflow: auto; border-left: 2px solid var(--proxy); margin-left: 16px; padding-left: 8px; }
+.side-section.proxy-head { color: var(--proxy); }
+.side-acts { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px 0; }
+.side-acts button {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-input);
+}
+.side-acts button:hover { background: var(--bg-hover); }
 #side-scrim {
   position: fixed;
   inset: 0 0 var(--status-h) var(--activity-w);
@@ -344,6 +359,20 @@ pre, code { font-family: var(--mono); font-size: 12.5px; }
 .row.agent .body table { border-collapse: collapse; }
 .row.agent .body td, .row.agent .body th { border: 1px solid var(--line); padding: 3px 8px; }
 .row.agent .work { color: var(--muted); font-size: 11px; }
+/* The task-mode user proxy: neither the user nor the agent. */
+.row.proxy .who { color: var(--proxy); }
+.row.proxy .proxy-bubble {
+  padding: 8px 12px;
+  border-left: 3px solid var(--proxy);
+  border-radius: 0 6px 6px 0;
+  background: var(--proxy-bg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.row.proxy .proxy-bubble.intent-accept { border-left-color: var(--agent); }
+.row.proxy .proxy-bubble.intent-hand_back,
+.row.proxy .proxy-bubble.intent-impossible { border-left-color: var(--warn); }
+.row.proxy .proxy-bubble.intent-report { border-left-style: dashed; background: none; }
 .row.meta { color: var(--muted); font-size: 12px; }
 .row.meta .who { display: none; }
 .row.err { color: var(--warn); }
@@ -570,6 +599,19 @@ button.sb:hover { background: rgba(255, 255, 255, 0.12); }
 .modal.lightbox.actual .lightbox-frame img { max-width: none; max-height: none; cursor: zoom-out; }
 .modal.lightbox .row-btns { margin-top: 8px; }
 .modal h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+.modal h3 { margin: 12px 0 4px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.modal h3.proxy-msg { color: var(--proxy); }
+.modal .task-text { white-space: pre-wrap; word-break: break-word; }
+.modal .task-text.proxy-msg {
+  max-height: 40vh;
+  overflow: auto;
+  padding: 6px 10px;
+  border-left: 3px solid var(--proxy);
+  background: var(--proxy-bg);
+}
+.hint.warn { color: var(--warn); }
+.modal .row-btns.task-acts { flex-wrap: wrap; }
+.ask-from { margin: 0 0 6px; color: var(--proxy); font-size: 12px; font-weight: 600; }
 .modal textarea, .modal input[type="text"], .modal input[type="password"], .modal select {
   width: 100%;
   padding: 6px 8px;
@@ -605,6 +647,7 @@ button.sb:hover { background: rgba(255, 255, 255, 0.12); }
 .opt:hover, .entry:hover { background: var(--bg-hover); }
 .opt.on, .entry.on { background: var(--bg-select); }
 .opt input { flex: 1; }
+.opt:focus-visible { outline: 1px solid var(--accent); }
 .skill { display: flex; align-items: center; gap: 6px; }
 .icon-btn {
   width: 24px;

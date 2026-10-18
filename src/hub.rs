@@ -356,6 +356,9 @@ pub struct UiRow {
     /// A picture row's original file, when `path` is the copy the model saw.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source: Option<String>,
+    /// A task-proxy row's intent (`push`, `accept`, …); `label` names it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub intent: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -437,6 +440,9 @@ pub struct UiSettings {
     /// Default model for child agents; empty follows the main model.
     #[serde(default)]
     pub child_model: String,
+    /// Model of the task-mode user proxy; empty follows the main model.
+    #[serde(default)]
+    pub task_model: String,
     /// The custom endpoint listed its models, so pickers can be dropdowns.
     #[serde(default)]
     pub custom_models: bool,
@@ -467,6 +473,9 @@ pub struct UiAsk {
     pub prompt: String,
     pub allow_multiple: bool,
     pub options: Vec<UiAskOpt>,
+    /// Asked by the task proxy (what final result the user wants).
+    #[serde(default)]
+    pub from_proxy: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -528,18 +537,51 @@ pub struct UiTaskItem {
 pub struct UiTask {
     #[serde(default)]
     pub note: String,
+    /// `form`, `edit` or `status`.
     pub mode: String,
     pub goal: String,
     pub draft: String,
+    #[serde(default)]
+    pub criteria_draft: String,
     pub phase: String,
     pub checklist: Vec<UiTaskItem>,
+    #[serde(default)]
+    pub criteria: String,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub rounds: u32,
+    /// The user proxy's latest message to the worker.
+    #[serde(default)]
+    pub last_proxy: String,
+    /// The proxy is still working on it (pause, review and accept apply).
+    #[serde(default)]
+    pub live: bool,
+    /// What the task's state allows: `pause`, `resume`, `review`, `accept`, `edit`, `end`.
+    #[serde(default)]
+    pub actions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiCommand {
     RefreshSettings,
-    StartTask { session_id: String, goal: String },
+    StartTask {
+        session_id: String,
+        goal: String,
+        #[serde(default)]
+        criteria: String,
+    },
+    /// Change the current task's goal and criteria.
+    EditTask {
+        session_id: String,
+        goal: String,
+        #[serde(default)]
+        criteria: String,
+    },
+    SetTaskPaused { paused: bool },
+    ReviewTask,
+    AcceptTask,
     Rename { id: String, text: String },
     UpdateQueue { session_id: String, request_id: String, index: usize, expected: String, text: String },
     /// Drop `queue[index]` if it still holds `expected` text and `images`.
@@ -570,6 +612,7 @@ pub enum UiCommand {
     SetContext { text: String },
     SetModel { id: String },
     SetChildModel { id: String },
+    SetTaskModel { id: String },
     SetEffort { id: String },
     ToggleSearch,
     ToggleDispatcher,
@@ -1366,6 +1409,7 @@ mod tests {
             path: None,
             label: None,
             source: None,
+            intent: None,
         }
     }
 

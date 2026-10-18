@@ -3,7 +3,7 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Position;
 
-use super::{activate_ask_option, activate_ws_entry, confirm_workspace, copy_login_code, create_workspace_dir, submit_ask};
+use super::{activate_ask_option, activate_ws_entry, cancel_task_form, confirm_workspace, copy_login_code, create_workspace_dir, submit_ask};
 use crate::config::ProviderKind;
 use crate::tui::app::{App, BottomTab, Focus, Hit, SendMode, SideItem, SideView, Tab, TaskUi};
 use crate::tui::edit::{click_to_index, index_at_width};
@@ -80,18 +80,17 @@ fn modal_click(app: &mut App, hit: Option<Hit>, col: u16, row: u16, shift: bool)
                 a.fill.click(idx, shift);
             }
         }
-        Some(Hit::TaskConfirm) => {
-            if let Some(TaskUi::Form(edit)) = &app.ui.task_ui {
-                let goal = edit.text.clone();
-                app.submit_task_goal(&goal);
-            }
-        }
-        Some(Hit::TaskCancel) => app.close_task(),
-        Some(Hit::TaskEnd) => app.end_task(),
-        Some(Hit::TaskDraft) => {
-            let inner = app.ui.field_inner;
-            if let Some(TaskUi::Form(edit)) = app.ui.task_ui.as_mut() {
-                let idx = click_to_index(&edit.text, inner, 0, col, row);
+        Some(Hit::TaskConfirm) => app.submit_task_form(),
+        Some(Hit::TaskCancel) => cancel_task_form(app),
+        Some(Hit::TaskAct(act)) => app.task_action(act),
+        Some(Hit::TaskDraft) | Some(Hit::TaskCriteria) => {
+            let on_criteria = hit == Some(Hit::TaskCriteria);
+            let inner = app.ui.task_fields[usize::from(on_criteria)];
+            if let Some(TaskUi::Form(form)) = app.ui.task_ui.as_mut() {
+                form.on_criteria = on_criteria;
+                let vs = form.scroll[usize::from(on_criteria)];
+                let edit = form.field_mut();
+                let idx = click_to_index(&edit.text, inner, vs, col, row);
                 edit.click(idx, shift);
             }
         }
@@ -369,6 +368,7 @@ fn side_item(app: &mut App, item: SideItem) {
         }
         SideItem::Monitor(name) => app.ui.inspector = Some(name),
         SideItem::OpenTask => app.open_task(),
+        SideItem::TaskAct(act) => app.task_action(act),
     }
     close_side_if_narrow(app);
 }
@@ -408,6 +408,7 @@ fn set_field(app: &mut App, i: usize, col: u16, row: u16, shift: bool) {
     let dropdown = match field {
         Field::Model if app.settings.model_picker() => Some(DropKind::Model),
         Field::ChildModel if app.settings.model_picker() => Some(DropKind::ChildModel),
+        Field::TaskModel if app.settings.model_picker() => Some(DropKind::TaskModel),
         Field::Effort => Some(DropKind::Effort),
         _ => None,
     };

@@ -328,7 +328,8 @@ impl Transcript {
                 // replace the streamed partial within this turn, do not repeat it.
                 for r in self.rows.iter_mut().rev() {
                     match r {
-                        Row::User(_) => break,
+                        // A proxy message is a user turn to the model.
+                        Row::User(_) | Row::Proxy { .. } => break,
                         Row::Agent(a) => {
                             if a.text.is_empty()
                                 || text.starts_with(a.text.as_str())
