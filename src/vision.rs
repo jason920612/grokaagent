@@ -54,17 +54,26 @@ pub fn data_uri_for_tool(workspace: &Path, output: &str) -> Result<Option<String
     if v.get("attach_image").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
-    // read_image already wrote the exact JPEG to send.
+    // read_image already wrote the exact JPEG to send. Anything at `view`
+    // that model_jpeg could not have written is ignored in favor of `path`.
     if let Some(view) = v.get("view").and_then(Value::as_str) {
-        let bytes = std::fs::read(resolve_in_workspace(workspace, view)?)?;
-        return Ok(Some(jpeg_data_uri(&bytes)));
+        if let Some(bytes) = resolve_in_workspace(workspace, view).ok().and_then(|abs| ready_jpeg(&abs)) {
+            return Ok(Some(jpeg_data_uri(&bytes)));
+        }
     }
     let path = v
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Tool("attach_image missing path".into()))?;
     let resolved = resolve_in_workspace(workspace, path)?;
-    Ok(Some(data_uri_from_file(&resolved)?))
+    Ok(Some(data_uri_from_region(&resolved, output_region(&v))?))
+}
+
+/// A read_image `region` echoed in its result: the crop that was sent.
+fn output_region(v: &Value) -> Option<(u32, u32, u32, u32)> {
+    let r = v.get("region")?;
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+    Some((n("x")?, n("y")?, n("width")?, n("height")?))
 }
 
 pub fn function_call_output(call_id: &str, output: &str, image_uri: Option<&str>) -> Value {
@@ -422,12 +431,17 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let id = uuid::Uuid::new_v4();
     let tmp = path.with_extension(format!("{}.part", &id.to_string()[..8]));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    // A failed write (disk full) must not leave the partial file behind either.
+    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
-        Error::from(e)
-    })
+        return Err(e.into());
+    }
+    Ok(())
 }
+
+/// Seen copies kept: the newest, up to a count and a total size.
+const SEEN_KEEP: usize = 200;
+const SEEN_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Keep the exact JPEG the model was sent as `.groka/seen/<hash>.jpg`. Picture
 /// rows point here, so the history still shows what the model saw after the
@@ -436,19 +450,66 @@ pub fn save_seen(workspace: &Path, jpeg: &[u8]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let hash = format!("{:x}", Sha256::digest(jpeg));
     let name = format!("{}.jpg", &hash[..16]);
-    let file = groka_dir(workspace, "seen")?.join(&name);
-    if !file.is_file() {
+    groka_dir(workspace, "seen")?;
+    // A committed `.groka` symlink must not carry the copy out of the
+    // workspace, where it could not be read back either.
+    let dir = resolve_in_workspace(workspace, ".groka/seen")?;
+    let file = dir.join(&name);
+    // Not `is_file`: a planted link of that name is replaced, not touched.
+    if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+        // Seen again: count it as new so the prune keeps it.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    } else {
         write_replacing(&file, jpeg)?;
+        prune_seen(&dir, SEEN_KEEP, SEEN_MAX_BYTES);
     }
     Ok(format!(".groka/seen/{name}"))
 }
 
-pub fn data_uri_from_file(path: &Path) -> Result<String> {
-    check_source_size(path)?;
-    if let Some(bytes) = ready_jpeg(path) {
-        return Ok(jpeg_data_uri(&bytes));
+/// Drop the oldest `.jpg` files in `dir` beyond `keep` files or `max_bytes`
+/// in all. The newest always stays; older picture rows lose their preview.
+fn prune_seen(dir: &Path, keep: usize, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let path = e.path();
+            if !meta.is_file() || path.extension().map_or(true, |x| x != "jpg") {
+                return None;
+            }
+            Some((meta.modified().ok()?, meta.len(), path))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut total = 0u64;
+    for (i, (_, len, path)) in files.iter().enumerate() {
+        total += len;
+        if i > 0 && (i >= keep || total > max_bytes) {
+            let _ = std::fs::remove_file(path);
+        }
     }
-    let img = open_image(path)?;
+}
+
+pub fn data_uri_from_file(path: &Path) -> Result<String> {
+    data_uri_from_region(path, None)
+}
+
+/// `data_uri_from_file`, cropped first to `(x, y, width, height)` when given.
+fn data_uri_from_region(path: &Path, region: Option<(u32, u32, u32, u32)>) -> Result<String> {
+    check_source_size(path)?;
+    if region.is_none() {
+        if let Some(bytes) = ready_jpeg(path) {
+            return Ok(jpeg_data_uri(&bytes));
+        }
+    }
+    let mut img = open_image(path)?;
+    if let Some((x, y, w, h)) = region {
+        img = img.crop_imm(x, y, w, h);
+    }
     if below_vision_min(img.width(), img.height()) {
         return Err(Error::Tool(enlarge_yourself_note(img.width(), img.height())));
     }
@@ -747,6 +808,83 @@ pub(crate) mod vision_tests {
         // The source changed (or is gone) since: the model still gets the view bytes.
         let out = json!({"attach_image": true, "path": "gone.png", "view": view}).to_string();
         assert_eq!(data_uri_for_tool(ws.path(), &out).unwrap().unwrap(), jpeg_data_uri(&jpeg));
+    }
+
+    #[test]
+    fn a_view_that_is_not_a_prepared_jpeg_falls_back_to_the_path() {
+        let ws = tempfile::tempdir().unwrap();
+        black_on_clear(40, 40).save(ws.path().join("a.png")).unwrap();
+        std::fs::write(ws.path().join("big.bin"), vec![0xFFu8; 4096]).unwrap();
+        DynamicImage::new_rgb8(2000, 100).save(ws.path().join("wide.jpg")).unwrap();
+        let want = data_uri_from_file(&ws.path().join("a.png")).unwrap();
+        for view in ["big.bin", "wide.jpg", "missing.jpg", "../out.jpg"] {
+            let out = json!({"attach_image": true, "path": "a.png", "view": view}).to_string();
+            assert_eq!(data_uri_for_tool(ws.path(), &out).unwrap().unwrap(), want, "{view}");
+        }
+        // Without a view, a read_image region is cropped from the path again.
+        let out = json!({"attach_image": true, "path": "a.png", "region": {"x": 10, "y": 10, "width": 20, "height": 30}});
+        let seen = decode_uri(&data_uri_for_tool(ws.path(), &out.to_string()).unwrap().unwrap()).to_rgb8();
+        assert_eq!(seen.dimensions(), (20, 30));
+        assert!(seen.get_pixel(15, 5)[0] < 20, "{:?}", seen.get_pixel(15, 5));
+        assert!(is_white(seen.get_pixel(15, 28).0), "{:?}", seen.get_pixel(15, 28));
+    }
+
+    #[test]
+    fn seen_copies_are_pruned_oldest_first_and_a_reread_counts_as_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(1000);
+        let age = |f: &Path, t: std::time::SystemTime| {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(t).unwrap();
+        };
+        for i in 0..5u64 {
+            let f = dir.path().join(format!("{i}.jpg"));
+            std::fs::write(&f, vec![0u8; 100]).unwrap();
+            age(&f, old + std::time::Duration::from_secs(i));
+        }
+        std::fs::write(dir.path().join("notes.txt"), "not ours").unwrap();
+        let left = || {
+            let mut v: Vec<String> =
+                std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        prune_seen(dir.path(), 3, u64::MAX);
+        assert_eq!(left(), ["2.jpg", "3.jpg", "4.jpg", "notes.txt"]);
+        prune_seen(dir.path(), 50, 250);
+        assert_eq!(left(), ["3.jpg", "4.jpg", "notes.txt"]);
+
+        let ws = tempfile::tempdir().unwrap();
+        let (jpeg, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        let file = ws.path().join(save_seen(ws.path(), &jpeg).unwrap());
+        age(&file, old);
+        save_seen(ws.path(), &jpeg).unwrap();
+        let touched = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(touched > old + std::time::Duration::from_secs(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seen_copies_never_land_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join(".groka")).unwrap();
+        let (jpeg, _, _) = model_jpeg(&black_on_clear(32, 32)).unwrap();
+        assert!(save_seen(&ws, &jpeg).is_err());
+        let copies = std::fs::read_dir(outside.join("seen")).map_or(0, |d| d.count());
+        assert_eq!(copies, 0);
+        // A link planted under the copy's name is replaced; its target is untouched.
+        let ws2 = dir.path().join("ws2");
+        std::fs::create_dir_all(&ws2).unwrap();
+        let rel = save_seen(&ws2, &jpeg).unwrap();
+        std::fs::remove_file(ws2.join(&rel)).unwrap();
+        std::fs::write(outside.join("victim"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), ws2.join(&rel)).unwrap();
+        assert_eq!(save_seen(&ws2, &jpeg).unwrap(), rel);
+        assert!(!ws2.join(&rel).is_symlink());
+        assert_eq!(std::fs::read(ws2.join(&rel)).unwrap(), jpeg);
+        assert_eq!(std::fs::read_to_string(outside.join("victim")).unwrap(), "keep");
     }
 
     #[cfg(unix)]

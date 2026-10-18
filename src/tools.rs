@@ -1778,8 +1778,6 @@ impl ReadImageTool {
             img = img.crop_imm(x, y, w, h);
         }
         let (jpeg, sent_width, sent_height) = crate::vision::model_jpeg(&img)?;
-        // The exact pixels sent: attached from here and shown in the picture row.
-        let view = crate::vision::save_seen(&self.workspace, &jpeg)?;
         let scale = (sent_width as f64 / img.width().max(1) as f64 * 1000.0).round() / 1000.0;
         let mut out = json!({
             "path": path.replace('\\', "/"),
@@ -1789,9 +1787,14 @@ impl ReadImageTool {
             "height": height,
             "sent_width": sent_width,
             "sent_height": sent_height,
-            "scale": scale,
-            "view": view
+            "scale": scale
         });
+        // The exact pixels sent: attached from here and shown in the picture
+        // row. Best effort (a read-only workspace): the attach then re-reads
+        // `path` and `region`.
+        if let Ok(view) = crate::vision::save_seen(&self.workspace, &jpeg) {
+            out["view"] = json!(view);
+        }
         if let Some((x, y, w, h)) = region {
             out["region"] = json!({"x": x, "y": y, "width": w, "height": h});
         }
@@ -1980,14 +1983,45 @@ mod read_image_tests {
         assert!(err.to_string().contains("32MiB"), "{err}");
     }
 
-    #[tokio::test]
-    async fn the_registry_call_runs_off_the_async_worker() {
+    #[test]
+    fn the_registry_call_runs_on_the_blocking_pool() {
         let ws = tempfile::tempdir().unwrap();
         image::RgbImage::new(40, 40).save(ws.path().join("a.png")).unwrap();
-        let reg = ToolRegistry::new(vec![Box::new(ReadImageTool::new(ws.path().to_path_buf()))]);
-        let raw = reg.call("read_image", &json!({"path": "a.png"})).await.unwrap();
-        let out: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(out["attach_image"], true, "{out}");
+        let rt = tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).build().unwrap();
+        rt.block_on(async {
+            // Hold the only blocking thread, so a read sent to the pool cannot
+            // finish on its first poll, as one run inline would.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || held.recv());
+            let reg = ToolRegistry::new(vec![Box::new(ReadImageTool::new(ws.path().to_path_buf()))]);
+            let args = json!({"path": "a.png"});
+            let mut call = std::pin::pin!(reg.call("read_image", &args));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            release.send(()).unwrap();
+            holder.await.unwrap().unwrap();
+            let out: Value = serde_json::from_str(&call.await.unwrap()).unwrap();
+            assert_eq!(out["attach_image"], true, "{out}");
+        });
+    }
+
+    #[test]
+    fn without_a_seen_copy_the_attach_still_sends_what_was_read() {
+        let ws = tempfile::tempdir().unwrap();
+        // `.groka` cannot be created: as in a read-only checkout.
+        fs::write(ws.path().join(".groka"), "not a folder").unwrap();
+        let page = image::RgbImage::from_fn(640, 2560, |_, y| {
+            image::Rgb(if y < 1280 { [255; 3] } else { [0; 3] })
+        });
+        page.save(ws.path().join("page.png")).unwrap();
+        let out = read(ws.path(), json!({"path": "page.png"}));
+        assert!(out.get("view").is_none(), "{out}");
+        assert_eq!(sent(ws.path(), &out).dimensions(), (320, 1280));
+        let region = json!({"x": 0, "y": 1280, "width": 640, "height": 1280});
+        let out = read(ws.path(), json!({"path": "page.png", "region": region}));
+        assert!(out.get("view").is_none(), "{out}");
+        let pixels = sent(ws.path(), &out);
+        assert_eq!(pixels.dimensions(), (640, 1280));
+        assert!(pixels.pixels().all(|p| p[0] < 40), "only the black half was sent");
     }
 }
 
