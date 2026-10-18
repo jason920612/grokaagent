@@ -167,7 +167,8 @@ pub(crate) fn spinners_need_redraw(app: &App) -> bool {
     })
 }
 
-fn status_text(app: &App) -> (String, String) {
+/// Left and right halves of a status bar `width` columns wide.
+fn status_text(app: &App, width: u16) -> (String, String) {
     let s = app.cur();
     let t = &s.chat;
     let state = if s.ask.is_some() {
@@ -185,6 +186,11 @@ fn status_text(app: &App) -> (String, String) {
     } else {
         format!(" ● {state}")
     };
+    let right = status_right(app);
+    if let Some(url) = &app.web.url {
+        let room = width.saturating_sub(display_cols(&right));
+        left.push_str(&web_link_segment(&left, url, room));
+    }
     let agents = s.agents.alive_count();
     if agents > 0 {
         left.push_str(&format!("  ◎ 代理 {}/{agents}", s.agents.live_count()));
@@ -196,10 +202,23 @@ fn status_text(app: &App) -> (String, String) {
     left.push_str(&format!("  {}", if app.settings.logged_in { "已登入" } else { "未登入" }));
     if !t.running {
         left.push_str(&format!("  {}", t.cache));
-        if let Some(url) = &app.web.url {
-            left.push_str(&format!("  {url}"));
-        }
     }
+    (left, right)
+}
+
+/// The web link right after the state, whole or not at all: a clipped
+/// one-time code looks complete but opens nothing. Without room, point to
+/// the settings tab, which always shows it.
+fn web_link_segment(left: &str, url: &str, room: u16) -> String {
+    let used = display_cols(left);
+    [format!("  {url}"), "  網頁網址見設定分頁".to_string()]
+        .into_iter()
+        .find(|seg| used.saturating_add(display_cols(seg)) <= room)
+        .unwrap_or_default()
+}
+
+fn status_right(app: &App) -> String {
+    let s = app.cur();
     let effort = if app
         .settings
         .catalog
@@ -211,12 +230,11 @@ fn status_text(app: &App) -> (String, String) {
         format!(" · {}", app.opts.reasoning_effort.as_str())
     };
     let task = if s.task.snapshot().phase.is_live() { "任務●" } else { "任務" };
-    let right = format!(" {task}  {}{effort}  ⚙ ", app.opts.model);
-    (left, right)
+    format!(" {task}  {}{effort}  ⚙ ", app.opts.model)
 }
 
 fn render_status(buf: &mut Buffer, app: &App, area: Rect) -> (Rect, Rect, Rect) {
-    let (left, right) = status_text(app);
+    let (left, right) = status_text(app, area.width);
     let running = app.cur().chat.running;
     let bg = if running { Color::Rgb(0, 122, 204) } else { Color::Rgb(45, 45, 45) };
     let base = Style::default().bg(bg).fg(Color::White);

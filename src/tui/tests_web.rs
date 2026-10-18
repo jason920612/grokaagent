@@ -2,6 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+
 use super::app::{App, Rt};
 use super::bridge;
 use super::edit::Edit;
@@ -37,6 +40,19 @@ fn fixture() -> (App, tempfile::TempDir) {
     (app, dir)
 }
 
+/// Each screen row as text without whitespace (CJK cells span two).
+fn screen(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| {
+        let _ = super::ui::draw(f, app, false);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>().split_whitespace().collect())
+        .collect()
+}
+
 fn last_receipt(app: &App) -> &str {
     &app.web.receipts.last().expect("a receipt").1
 }
@@ -61,6 +77,8 @@ fn snapshots_never_carry_the_api_key_or_the_link_code() {
 #[test]
 fn an_uploaded_image_attaches_to_the_session_it_was_dropped_on() {
     let (mut app, dir) = fixture();
+    let snap = bridge::snapshot(&app);
+    assert_eq!((snap.pending_max, snap.upload_max), (crate::vision::MAX_USER_IMAGES, crate::hub::UPLOAD_MAX));
     let attach = |request: &str, session: &str, path: &str| UiCommand::AttachUpload {
         session_id: session.into(),
         request_id: request.into(),
@@ -122,4 +140,30 @@ fn a_queued_turn_with_only_images_can_be_removed() {
     assert_eq!(app.cur().queue.len(), 1);
     assert_eq!(app.cur().queue[0].images, ["a.jpg"]);
     assert_eq!(last_receipt(&app), "已接收");
+}
+
+#[test]
+fn the_web_link_is_shown_whole_or_not_at_all() {
+    let (mut app, _dir) = fixture();
+    let url = "http://127.0.0.1:41873/?code=0123456789abcdef";
+    app.web.url = Some(url.into());
+    app.cur_mut().chat.status = "待命".into();
+
+    let wide = screen(&mut app, 160, 30);
+    assert!(wide.last().unwrap().contains(url), "{:?}", wide.last());
+    app.cur_mut().chat.running = true;
+    let busy = screen(&mut app, 160, 30);
+    assert!(busy.last().unwrap().contains(url), "also during a run: {:?}", busy.last());
+    app.cur_mut().chat.running = false;
+
+    // Too narrow for the link: a cut code would look whole and fail.
+    let narrow = screen(&mut app, 64, 30);
+    let bar = narrow.last().unwrap();
+    assert!(!bar.contains("?code="), "{bar}");
+    assert!(bar.contains("網頁網址見設定分頁"), "{bar}");
+
+    app.open_settings();
+    app.ui.side_open = false; // it floats over the editor this narrow
+    let settings = screen(&mut app, 64, 30);
+    assert!(settings.iter().any(|row| row.contains(url)), "{settings:#?}");
 }

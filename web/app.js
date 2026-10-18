@@ -1,6 +1,7 @@
 (() => {
-  // The server already redirected the one-time code away; an old ?t= link
-  // or anything else in the query must not stay in the address bar either.
+  // The TUI's link carries a one-time code, traded below for the hub's key.
+  // Neither it nor an old ?t= token may stay in the address bar.
+  const linkCode = new URLSearchParams(location.search).get("code") || "";
   if (location.search) history.replaceState(null, "", location.pathname + location.hash);
   const $ = (id) => document.getElementById(id);
   const appEl = $("app");
@@ -52,6 +53,7 @@
   let overlayShownAt = 0;
   const uploads = new Set();  // upload request ids waiting for the TUI's receipt
   let uploadChain = Promise.resolve();
+  let uploadNote = "";      // what the last drop or paste could not attach
   const THUMB = 480;        // longest edge of chat and tray thumbnails
 
   const STATE_ICON = { starting: "◌", working: "◐", idle: "✓", paused: "‖", interrupted: "⊘", exited: "○" };
@@ -108,7 +110,7 @@
     }, 8000);
   }
 
-  // Authenticated by the session cookie; `max` asks for a scaled copy.
+  // Authenticated by the cookie /auth sets; `max` asks for a scaled copy.
   function mediaUrl(path, max) {
     return `/media?path=${encodeURIComponent(path)}${max ? `&max=${max}` : ""}`;
   }
@@ -257,8 +259,12 @@
 
   function settleUploads() {
     for (const [id, result] of (snap && snap.receipts) || []) {
-      if (uploads.delete(id)) $("delivery").textContent = result;
+      if (uploads.delete(id)) uploadStatus(result);
     }
+  }
+
+  function uploadStatus(text) {
+    $("delivery").textContent = uploadNote ? `${text} · ${uploadNote}` : text;
   }
 
   function renderAll() {
@@ -1348,28 +1354,38 @@
     if (activeTab) { $("delivery").textContent = "子代理分頁是唯讀的：切回主對話再加入圖片"; return; }
     const images = imageFiles(files);
     if (!images.length) { $("delivery").textContent = "只能加入圖片（PNG、JPEG、GIF、WebP、BMP）"; return; }
+    // Said here rather than by the server, which would have to refuse
+    // mid-upload: the browser then reports only a dropped connection.
+    const fits = images.filter((f) => !snap.upload_max || f.size <= snap.upload_max);
+    const room = snap.pending_max ? Math.max(0, snap.pending_max - (snap.pending || []).length) : fits.length;
+    const take = fits.slice(0, room);
+    const notes = [];
+    if (fits.length < images.length) notes.push(`${images.length - fits.length} 張超過 ${snap.upload_max >> 20} MiB`);
+    if (take.length < fits.length) notes.push(`最多 ${snap.pending_max} 張圖片`);
+    uploadNote = notes.length ? `未附上 ${images.length - take.length} 張：${notes.join("；")}` : "";
+    if (!take.length) { $("delivery").textContent = uploadNote; return; }
     const sid = snap.session_id;
     // One at a time: they attach in order and the limit applies to each.
-    images.forEach((f) => { uploadChain = uploadChain.then(() => uploadImage(f, sid)); });
+    take.forEach((f) => { uploadChain = uploadChain.then(() => uploadImage(f, sid)); });
   }
 
   async function uploadImage(file, sid) {
     const id = crypto.randomUUID();
-    $("delivery").textContent = `上傳圖片中… ${file.name || ""}`;
+    uploadStatus(`上傳圖片中… ${file.name || ""}`);
     try {
       const r = await fetch(`/upload?session_id=${encodeURIComponent(sid)}&request_id=${id}`,
-        { method: "POST", body: file, credentials: "same-origin" });
+        { method: "POST", body: file, headers: { [KEY_HEADER]: currentKey() } });
       if (r.ok) {
         // The TUI's receipt may already be here.
         uploads.add(id);
         settleUploads();
         return;
       }
-      $("delivery").textContent = r.status === 401 || r.status === 403
-        ? "未附上：存取已失效，請用 TUI 狀態列的網址重新開啟"
-        : (await r.text()) || `未附上（${r.status}）`;
+      uploadStatus(r.status === 401 || r.status === 403 ? `未附上：存取已失效，請${LINK_HINT}重新開啟` : (await r.text()) || `未附上（${r.status}）`);
     } catch {
-      $("delivery").textContent = "未附上：連線中斷";
+      // Refused mid-upload looks like a drop too; ask why.
+      await checkAccess();
+      uploadStatus(denied ? `未附上：存取已失效，請${LINK_HINT}重新開啟` : "未附上：連線中斷");
     }
   }
 
@@ -1397,13 +1413,61 @@
     attachImages(images);
   });
 
+  // —— Access ——
+  // The hub's key lives in localStorage, which is per origin: a cookie
+  // would also go to every other port on this host. The socket and uploads
+  // send it; /auth turns it into the cookie that <img> loads from /media need.
+  const KEY_SLOT = "groka.key";
+  const KEY_HEADER = "X-Groka-Key";
+  const LINK_HINT = "用 TUI 狀態列或設定分頁顯示的網址（每個網址只能用一次）";
+  let accessKey = "";
+  let linkUsed = false;     // this tab's link had been spent before it got here
+  let denied = false;       // the hub said the key does not work
+
+  function currentKey() {
+    let k = accessKey;
+    try { k = localStorage.getItem(KEY_SLOT) || k; } catch {}
+    return /^[0-9a-f]{1,64}$/.test(k) ? k : "";
+  }
+
+  function keepKey(k) {
+    accessKey = k;
+    try { localStorage.setItem(KEY_SLOT, k); } catch {}
+  }
+
+  async function redeem() {
+    if (!linkCode) return;
+    try {
+      const r = await fetch("/redeem", { method: "POST", body: linkCode, cache: "no-store" });
+      if (r.ok) keepKey(await r.text());
+      else linkUsed = r.status === 410;
+    } catch {}
+  }
+
+  function deniedText() {
+    return linkUsed
+      ? "這個網址已經用過：請改用 TUI 狀態列或設定分頁顯示的最新網址，草稿已保留"
+      : `需要重新開啟：${LINK_HINT}，草稿已保留`;
+  }
+
+  // A refused socket looks like any other drop; this tells them apart.
+  async function checkAccess() {
+    try {
+      const r = await fetch("/auth", { cache: "no-store", headers: { [KEY_HEADER]: currentKey() } });
+      denied = r.status === 401;
+      if (denied && !connected) connectionState(false, deniedText());
+    } catch {}
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    // A socket cannot carry headers: the key rides as a subprotocol.
+    ws = new WebSocket(`${proto}://${location.host}/ws`, ["groka", `k.${currentKey()}`]);
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type === "hello") {
+        denied = linkUsed = false;
         connectionState(true, "● 已連線");
         onHello(msg);
       } else if (msg.type === "delta") {
@@ -1411,19 +1475,15 @@
       }
     };
     ws.onclose = () => {
-      connectionState(false, "連線中斷 · 正在重新連線，草稿已保留");
+      connectionState(false, denied ? deniedText() : "連線中斷 · 正在重新連線，草稿已保留");
       if (awaitingReceipt) $("delivery").textContent = "送出結果尚未確認，重連後將查詢接收紀錄";
-      // A refused socket looks like any other drop; ask whether access is gone.
-      // Opening the TUI's current link in any tab sets the cookie for this one too.
-      fetch("/auth", { cache: "no-store", credentials: "same-origin" }).then((r) => {
-        if (r.status === 401 && !connected) {
-          connectionState(false, "需要重新開啟：用 TUI 狀態列顯示的網址（每個網址只能用一次），草稿已保留");
-        }
-      }).catch(() => {});
+      // Opening the TUI's current link in any tab stores the key for this one too.
+      checkAccess();
       setTimeout(connect, 1500);
     };
   }
-  connect();
+  // The cookie for /media is set before the first rows ask for images.
+  redeem().then(checkAccess).then(connect);
 
   // —— Theme: auto (follow the system) → dark → light ——
   const THEME_KEY = "groka.theme";

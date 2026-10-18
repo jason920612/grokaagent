@@ -169,6 +169,8 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         receipts: app.web.receipts.clone(),
         // Without the one-time code: every browser gets the snapshot.
         web_url: app.web.url.as_deref().map(|u| u.split('?').next().unwrap_or(u).to_string()).unwrap_or_default(),
+        pending_max: crate::vision::MAX_USER_IMAGES,
+        upload_max: hub::UPLOAD_MAX,
     }
 }
 

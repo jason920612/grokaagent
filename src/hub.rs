@@ -5,11 +5,20 @@
 //! `coder/lint` = a child agent). The hub keeps a full mirror so a new client,
 //! or one that missed a delta, gets a complete `hello`.
 //!
-//! Access: the link the TUI opens and shows carries a one-time code. Its
-//! first use trades it for an HttpOnly cookie and the TUI then shows a fresh
-//! code, so the link left in a browser's argv is already spent, and the saved
-//! transcript keeps only the bare origin. Every route checks `Host`; the
-//! socket and uploads also check `Origin`.
+//! Access: the link the TUI opens and shows carries a one-time code. The
+//! page trades it for the hub's key and keeps that in localStorage, which is
+//! per origin: a cookie would also go to every other port on this host. The
+//! socket and uploads need the key; `/media` takes a cookie that `/auth` sets
+//! for the key, because an `<img>` cannot send one, and serves only images.
+//! Spending a code mints the next one for the TUI to show; the saved
+//! transcript keeps only the bare origin. Every route checks `Host`, and
+//! requests that carry the key check `Origin`.
+//!
+//! Left open: the first link sits in the argv of the browser it opens, which
+//! other local users can read, until the page redeems it. One who polls for
+//! it can redeem it first; the page then says the link was already used.
+//! And the `/media` cookie also reaches `/media` on other local ports, so a
+//! server there could read workspace images, though nothing else.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -22,7 +31,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use image::codecs::jpeg::JpegEncoder;
@@ -44,7 +53,9 @@ const MEDIA_MAX: u64 = 20 * 1024 * 1024;
 /// Pixel budget of the copy that stands in for an oversized original.
 const PREVIEW_PIXELS: u64 = 16_000_000;
 /// Largest image the browser may upload, the same as for a pasted file.
-const UPLOAD_MAX: usize = 32 * 1024 * 1024;
+pub(crate) const UPLOAD_MAX: usize = 32 * 1024 * 1024;
+/// Header that carries the key on plain requests.
+const KEY_HEADER: &str = "x-groka-key";
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -53,8 +64,11 @@ struct Assets;
 #[derive(Clone)]
 struct HubState {
     port: u16,
-    /// Session cookie value. It is never put in a URL.
-    secret: String,
+    /// What the page sends on the socket and uploads; never in a URL or cookie.
+    key: String,
+    /// `/media` cookie value. Cookies reach every port of the host, so it
+    /// opens images and nothing else.
+    media: String,
     /// One-time code in the link the TUI shows.
     code: Arc<Mutex<String>>,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
@@ -281,6 +295,11 @@ pub struct UiSnapshot {
     #[serde(default)]
     pub receipts: Vec<(String, String)>,
     pub web_url: String,
+    /// Limits the page checks before uploading, so it can say why it won't.
+    #[serde(default)]
+    pub pending_max: usize,
+    #[serde(default)]
+    pub upload_max: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -601,7 +620,7 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
         .await
         .map_err(|e| Error::Io(e))?;
     let port = listener.local_addr().map_err(Error::Io)?.port();
-    let code = new_secret();
+    let code = new_code();
     let url = link(port, &code);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (out, _) = broadcast::channel(256);
@@ -609,7 +628,8 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
     let workspace = Arc::new(Mutex::new(workspace));
     let state = HubState {
         port,
-        secret: new_secret(),
+        key: new_secret(),
+        media: new_secret(),
         code: Arc::new(Mutex::new(code)),
         cmd_tx,
         out: out.clone(),
@@ -617,18 +637,19 @@ pub async fn start(workspace: PathBuf) -> Result<Option<Hub>> {
         workspace: workspace.clone(),
     };
     let app = Router::new()
-        .route("/", get(index))
+        .route("/redeem", post(redeem_code))
         .route("/auth", get(auth))
         .route("/ws", get(ws_upgrade))
         .route("/media", get(media))
         .route("/upload", post(upload))
         .fallback(static_file)
-        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .layer(middleware::from_fn(guard))
         .with_state(state);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Other local users can read argv; the code in it is spent on first use.
+    // Other local users can read argv until the page spends the code (see the
+    // module doc); a page that loses that race says its link was used.
     if !env_flag("GROKA_NO_WEB_OPEN") {
         open_browser(&url);
     }
@@ -662,6 +683,13 @@ fn new_secret() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// 64 random bits (v4 fixes different bits in each half): plenty for a code
+/// that works once, and short enough for the status bar to show whole.
+fn new_code() -> String {
+    let u = Uuid::new_v4().as_u128();
+    format!("{:016x}", (u >> 64) as u64 ^ u as u64)
+}
+
 fn origin(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -670,7 +698,7 @@ fn link(port: u16, code: &str) -> String {
     format!("http://127.0.0.1:{port}/?code={code}")
 }
 
-/// Per port: cookies are shared by every port of a host.
+/// Per port, so two hubs do not overwrite each other's cookie.
 fn cookie_name(port: u16) -> String {
     format!("groka_{port}")
 }
@@ -682,29 +710,45 @@ fn secret_eq(got: &str, want: &str) -> bool {
         && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
-/// `127.0.0.1:<port>` or `localhost:<port>`: the names this server answers to.
-fn local_authority(s: &str, port: u16) -> bool {
-    let Some((host, p)) = s.rsplit_once(':') else {
-        return false;
+/// `127.0.0.1`, `localhost` or `[::1]` on any port: SSH or editor port
+/// forwarding may serve this hub on another one.
+fn local_authority(s: &str) -> bool {
+    let host = match s.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => s,
     };
-    p == port.to_string() && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+    host == "127.0.0.1" || host == "[::1]" || host.eq_ignore_ascii_case("localhost")
+}
+
+fn host_of(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::HOST).and_then(|v| v.to_str().ok())
 }
 
 /// Any other name means DNS rebinding, not our own page.
-fn host_ok(headers: &HeaderMap, port: u16) -> bool {
-    headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|h| local_authority(h, port))
+fn host_ok(headers: &HeaderMap) -> bool {
+    host_of(headers).is_some_and(local_authority)
 }
 
-/// Browsers let any page open a socket or POST here; only ours may.
-fn origin_ok(headers: &HeaderMap, port: u16) -> bool {
-    headers
+/// Browsers let any page open a socket or POST here; only ours may. Ours is
+/// the page served under this very `Host`, port included, so a page on
+/// another local port is refused while a forwarded one works.
+fn origin_ok(headers: &HeaderMap) -> bool {
+    let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
-        .and_then(|o| o.strip_prefix("http://"))
-        .is_some_and(|a| local_authority(a, port))
+        .and_then(|o| o.strip_prefix("http://"));
+    match (origin, host_of(headers)) {
+        (Some(o), Some(h)) => o.eq_ignore_ascii_case(h) && local_authority(o),
+        _ => false,
+    }
+}
+
+/// The key, sent by the page as a header.
+fn key_ok(headers: &HeaderMap, st: &HubState) -> bool {
+    headers
+        .get(KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|k| secret_eq(k, &st.key))
 }
 
 fn cookie_ok(headers: &HeaderMap, st: &HubState) -> bool {
@@ -715,7 +759,7 @@ fn cookie_ok(headers: &HeaderMap, st: &HubState) -> bool {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|kv| kv.trim().split_once('='))
-        .any(|(k, v)| k == name && secret_eq(v, &st.secret))
+        .any(|(k, v)| k == name && secret_eq(v, &st.media))
 }
 
 /// Requested by another site, or another port of this host (same-site).
@@ -734,7 +778,7 @@ fn redeem(st: &HubState, code: &str) -> bool {
     if !secret_eq(code, &cur) {
         return false;
     }
-    *cur = new_secret();
+    *cur = new_code();
     let _ = st.cmd_tx.send(UiCommand::WebUrl { url: link(st.port, &cur) });
     true
 }
@@ -744,8 +788,8 @@ fn workspace_of(st: &HubState) -> PathBuf {
 }
 
 /// Every route: refuse foreign `Host` names; responses are never sniffed.
-async fn guard(State(st): State<HubState>, req: Request, next: Next) -> Response {
-    if !host_ok(req.headers(), st.port) {
+async fn guard(req: Request, next: Next) -> Response {
+    if !host_ok(req.headers()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let mut res = next.run(req).await;
@@ -755,37 +799,31 @@ async fn guard(State(st): State<HubState>, req: Request, next: Next) -> Response
     res
 }
 
-#[derive(Deserialize)]
-struct IndexQ {
-    code: Option<String>,
+/// The page (`/?code=…`, served like `/`) trades the link's code for the
+/// key. Only our page may: a POST with our `Origin`, so a link preview or a
+/// prefetch of the link does not spend it.
+async fn redeem_code(State(st): State<HubState>, headers: HeaderMap, code: String) -> Response {
+    if !origin_ok(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !redeem(&st, code.trim()) {
+        return StatusCode::GONE.into_response();
+    }
+    ([(header::CACHE_CONTROL, "no-store")], st.key.clone()).into_response()
 }
 
-/// `/?code=…` trades the code for the cookie, then redirects so the code
-/// leaves the address bar. The page itself holds no data and needs no
-/// cookie; the socket and `/media` do.
-async fn index(headers: HeaderMap, Query(q): Query<IndexQ>, State(st): State<HubState>) -> Response {
-    let Some(code) = q.code else {
-        return asset("index.html", &headers);
-    };
-    let mut res = Redirect::to("/").into_response();
-    let h = res.headers_mut();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if redeem(&st, &code) {
-        let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", cookie_name(st.port), st.secret);
-        if let Ok(v) = HeaderValue::from_str(&cookie) {
-            h.insert(header::SET_COOKIE, v);
-        }
+/// Whether the key still works. The page asks on load and after a socket
+/// drops; the answer also renews the cookie its `<img>` loads need.
+async fn auth(headers: HeaderMap, State(st): State<HubState>) -> Response {
+    if !key_ok(&headers, &st) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    let cookie = format!("{}={}; Path=/media; HttpOnly; SameSite=Strict", cookie_name(st.port), st.media);
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
+        res.headers_mut().insert(header::SET_COOKIE, v);
     }
     res
-}
-
-/// Whether this browser holds the cookie; the page asks after a socket drops.
-async fn auth(headers: HeaderMap, State(st): State<HubState>) -> StatusCode {
-    if cookie_ok(&headers, &st) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::UNAUTHORIZED
-    }
 }
 
 async fn static_file(uri: Uri, headers: HeaderMap) -> Response {
@@ -809,7 +847,7 @@ fn asset(path: &str, headers: &HeaderMap) -> Response {
         .into_response();
     if mime.starts_with("text/html") {
         // `guard` already checked Host, so it names this server.
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let host = host_of(headers).unwrap_or("");
         if let Ok(v) = HeaderValue::from_str(&csp(host)) {
             res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
         }
@@ -842,13 +880,19 @@ async fn ws_upgrade(
     headers: HeaderMap,
     State(st): State<HubState>,
 ) -> Response {
-    if !origin_ok(&headers, st.port) {
+    if !origin_ok(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !cookie_ok(&headers, &st) {
+    // A browser socket cannot set headers: the key comes as a subprotocol,
+    // `k.<key>`, next to the `groka` one we answer with.
+    let keyed = ws
+        .requested_protocols()
+        .filter_map(|p| p.to_str().ok()?.strip_prefix("k."))
+        .any(|k| secret_eq(k, &st.key));
+    if !keyed {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.on_upgrade(move |socket| client_loop(socket, st))
+    ws.protocols(["groka"]).on_upgrade(move |socket| client_loop(socket, st))
 }
 
 fn mirror_hello(st: &HubState) -> Option<String> {
@@ -1072,20 +1116,17 @@ struct UploadQ {
 /// then the TUI attaches it to the session's pending images.
 async fn upload(State(st): State<HubState>, Query(q): Query<UploadQ>, req: Request) -> Response {
     let headers = req.headers();
-    if !origin_ok(headers, st.port) {
+    if !origin_ok(headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !cookie_ok(headers, &st) {
+    if !key_ok(headers, &st) {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if pending_full(&st, &q.session_id) {
-        let msg = format!("未附上：最多 {} 張圖片", vision::MAX_USER_IMAGES);
-        return (StatusCode::CONFLICT, msg).into_response();
     }
     let too_big = || {
         let msg = format!("未附上：圖片超過 {} MiB", UPLOAD_MAX >> 20);
         (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response()
     };
+    // The page checks the size first; this is for anything else.
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -1096,6 +1137,12 @@ async fn upload(State(st): State<HubState>, Query(q): Query<UploadQ>, req: Reque
     let Ok(body) = axum::body::to_bytes(req.into_body(), UPLOAD_MAX).await else {
         return too_big();
     };
+    // Only after the body is read: answered while the browser still sends,
+    // the connection is reset and the page could only say it dropped.
+    if pending_full(&st, &q.session_id) {
+        let msg = format!("未附上：最多 {} 張圖片", vision::MAX_USER_IMAGES);
+        return (StatusCode::CONFLICT, msg).into_response();
+    }
     let ws = workspace_of(&st);
     let dir = ws.clone();
     match tokio::task::spawn_blocking(move || save_upload(&dir, &body)).await {
@@ -1424,14 +1471,30 @@ mod web_tests {
         url.split("?code=").nth(1).expect("a code").to_string()
     }
 
-    /// Redeem the hub's current code like a browser opening the link.
-    async fn cookie(hub: &mut Hub, port: u16) -> String {
-        let r = get(port, &format!("/?code={}", code_of(&hub.url)), "").await;
-        let set = r.header("set-cookie").expect("a cookie");
+    async fn post(port: u16, path: &str, extra: &str, body: &[u8]) -> Reply {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: {}\r\n{extra}\r\n",
+            body.len()
+        );
+        send(port, &head, body).await
+    }
+
+    fn ours(port: u16) -> String {
+        format!("Origin: http://127.0.0.1:{port}\r\n")
+    }
+
+    /// Redeem the hub's current code as the page does: the key, then the
+    /// `/media` cookie that `/auth` hands out for it.
+    async fn access(hub: &mut Hub, port: u16) -> (String, String) {
+        let r = post(port, "/redeem", &ours(port), code_of(&hub.url).as_bytes()).await;
+        assert_eq!(r.status, 200);
+        let key = String::from_utf8(r.body).unwrap();
         if let Ok(UiCommand::WebUrl { url }) = hub.cmd_rx.try_recv() {
             hub.url = url;
         }
-        set.split(';').next().unwrap().to_string()
+        let r = get(port, "/auth", &format!("X-Groka-Key: {key}\r\n")).await;
+        let set = r.header("set-cookie").expect("a cookie");
+        (key, set.split(';').next().unwrap().to_string())
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -1443,34 +1506,43 @@ mod web_tests {
     }
 
     #[tokio::test]
-    async fn the_code_is_traded_once_for_a_cookie_and_a_clean_url() {
+    async fn the_page_trades_the_code_once_for_the_key() {
         let (mut hub, port, _dir) = hub().await;
         assert!(hub.url.starts_with(&format!("http://127.0.0.1:{port}/?code=")));
         assert!(!hub.origin.contains("code"), "the origin grants nothing");
         let first = code_of(&hub.url);
+        assert_eq!(first.len(), 16, "short enough for the status bar");
 
-        let r = get(port, &format!("/?code={first}"), "").await;
-        assert_eq!(r.status, 303);
-        assert_eq!(r.header("location").as_deref(), Some("/"), "the code leaves the address bar");
-        let set = r.header("set-cookie").expect("a cookie");
-        assert!(set.starts_with(&format!("groka_{port}=")), "{set}");
-        assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
-        let cookie = set.split(';').next().unwrap().to_string();
-        assert!(!cookie.contains(&first), "the cookie is not the code");
+        // Opening the link only serves the page, so a prefetch spends nothing.
+        let page = get(port, &format!("/?code={first}"), "").await;
+        assert_eq!(page.status, 200);
+        assert!(page.header("set-cookie").is_none());
+        assert!(hub.cmd_rx.try_recv().is_err());
 
+        assert_eq!(post(port, "/redeem", "", first.as_bytes()).await.status, 403, "only our page");
+        let other = "Origin: http://127.0.0.1:8000\r\n";
+        assert_eq!(post(port, "/redeem", other, first.as_bytes()).await.status, 403);
+
+        let r = post(port, "/redeem", &ours(port), first.as_bytes()).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("cache-control").as_deref(), Some("no-store"));
+        assert!(r.header("set-cookie").is_none(), "the key is never a cookie");
+        let key = String::from_utf8(r.body).unwrap();
+        assert_eq!(key.len(), 32);
         let Ok(UiCommand::WebUrl { url }) = hub.cmd_rx.try_recv() else {
             panic!("the TUI is told the next link");
         };
         assert_ne!(code_of(&url), first, "a fresh code replaces the spent one");
-
-        let again = get(port, &format!("/?code={first}"), "").await;
-        assert_eq!(again.status, 303);
-        assert!(again.header("set-cookie").is_none(), "a spent code grants nothing");
+        assert_eq!(post(port, "/redeem", &ours(port), first.as_bytes()).await.status, 410, "spent");
 
         assert_eq!(get(port, "/auth", "").await.status, 401);
-        assert_eq!(get(port, "/auth", &format!("Cookie: other=1; {cookie}\r\n")).await.status, 204);
-        let forged = format!("Cookie: groka_{port}={first}\r\n");
-        assert_eq!(get(port, "/auth", &forged).await.status, 401);
+        assert_eq!(get(port, "/auth", &format!("X-Groka-Key: {first}\r\n")).await.status, 401);
+        let r = get(port, "/auth", &format!("X-Groka-Key: {key}\r\n")).await;
+        assert_eq!(r.status, 204);
+        let set = r.header("set-cookie").expect("the /media cookie");
+        assert!(set.starts_with(&format!("groka_{port}=")), "{set}");
+        assert!(set.contains("Path=/media") && set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
+        assert!(!set.contains(&key), "the cookie, which every port gets, is not the key");
     }
 
     #[tokio::test]
@@ -1494,32 +1566,44 @@ mod web_tests {
         assert_eq!(send(port, &head, b"").await.status, 403, "assets too");
         let head = format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n");
         assert_eq!(send(port, &head, b"").await.status, 200);
+        // SSH or editor port forwarding: another local port in front of ours.
+        let head = "GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n";
+        let page = send(port, head, b"").await;
+        assert_eq!(page.status, 200, "forwarded");
+        assert!(page.header("content-security-policy").unwrap().contains("ws://127.0.0.1:8080"));
     }
 
     #[tokio::test]
-    async fn the_socket_needs_our_origin_and_the_cookie() {
+    async fn the_socket_needs_our_origin_and_the_key() {
         let (mut hub, port, _dir) = hub().await;
         hub.publish(UiSnapshot::default(), UiLogs::default(), vec![], vec![]);
-        let cookie = cookie(&mut hub, port).await;
-        let upgrade = |origin: &str, cookie: &str| {
+        let (key, cookie) = access(&mut hub, port).await;
+        let upgrade = |host: &str, origin: &str, extra: &str| {
             format!(
-                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{origin}{cookie}\r\n"
+                "GET /ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{origin}{extra}\r\n"
             )
         };
-        let ours = format!("Origin: http://127.0.0.1:{port}\r\n");
-        let with = format!("Cookie: {cookie}\r\n");
+        let host = format!("127.0.0.1:{port}");
+        let ours = ours(port);
+        let keyed = format!("Sec-WebSocket-Protocol: groka, k.{key}\r\n");
         let evil = "Origin: http://127.0.0.1:8000\r\n";
-        assert_eq!(send(port, &upgrade(evil, &with), b"").await.status, 403, "another port is another origin");
-        assert_eq!(send(port, &upgrade("", &with), b"").await.status, 403);
-        assert_eq!(send(port, &upgrade(&ours, ""), b"").await.status, 401);
-        assert_eq!(send(port, &upgrade(&ours, &with), b"").await.status, 101);
+        assert_eq!(send(port, &upgrade(&host, evil, &keyed), b"").await.status, 403, "another port is another origin");
+        assert_eq!(send(port, &upgrade(&host, "", &keyed), b"").await.status, 403);
+        assert_eq!(send(port, &upgrade(&host, &ours, ""), b"").await.status, 401);
+        let jar = format!("Cookie: {cookie}\r\nSec-WebSocket-Protocol: groka\r\n");
+        assert_eq!(send(port, &upgrade(&host, &ours, &jar), b"").await.status, 401, "the cookie opens images only");
+        let r = send(port, &upgrade(&host, &ours, &keyed), b"").await;
+        assert_eq!(r.status, 101);
+        assert_eq!(r.header("sec-websocket-protocol").as_deref(), Some("groka"), "the key is not echoed");
+        let forwarded = upgrade("localhost:8080", "Origin: http://localhost:8080\r\n", &keyed);
+        assert_eq!(send(port, &forwarded, b"").await.status, 101, "behind port forwarding");
     }
 
     #[tokio::test]
     async fn media_needs_the_cookie_revalidates_and_refuses_other_sites() {
         let (mut hub, port, dir) = hub().await;
-        let cookie = cookie(&mut hub, port).await;
+        let (_, cookie) = access(&mut hub, port).await;
         std::fs::write(dir.path().join("pic.png"), png(6, 4)).unwrap();
         let path = "/media?path=pic.png";
         assert_eq!(get(port, path, "").await.status, 401);
@@ -1591,22 +1675,23 @@ mod web_tests {
     #[tokio::test]
     async fn an_upload_is_saved_and_handed_to_the_tui() {
         let (mut hub, port, dir) = hub().await;
-        let cookie = cookie(&mut hub, port).await;
-        let post = |extra: &str, body: &[u8]| {
+        let (key, cookie) = access(&mut hub, port).await;
+        let upload = |extra: &str, body: &[u8]| {
             format!(
                 "POST /upload?session_id=s1&request_id=r1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
                  Content-Length: {}\r\n{extra}\r\n",
                 body.len()
             )
         };
-        let ours = format!("Origin: http://127.0.0.1:{port}\r\nCookie: {cookie}\r\n");
+        let keyed = format!("X-Groka-Key: {key}\r\n");
+        let ours = format!("{}{keyed}", ours(port));
         let img = png(32, 32);
 
-        assert_eq!(send(port, &post(&format!("Cookie: {cookie}\r\n"), &img), &img).await.status, 403, "no Origin");
-        let r = send(port, &post(&format!("Origin: http://127.0.0.1:{port}\r\n"), &img), &img).await;
-        assert_eq!(r.status, 401, "no cookie");
+        assert_eq!(send(port, &upload(&keyed, &img), &img).await.status, 403, "no Origin");
+        let jar = format!("{}Cookie: {cookie}\r\n", self::ours(port));
+        assert_eq!(send(port, &upload(&jar, &img), &img).await.status, 401, "the cookie opens images only");
 
-        let r = send(port, &post(&ours, &img), &img).await;
+        let r = send(port, &upload(&ours, &img), &img).await;
         assert_eq!(r.status, 200);
         let rel = String::from_utf8(r.body).unwrap();
         assert!(rel.starts_with(".groka/inbox/") && rel.ends_with(".jpg"), "{rel}");
@@ -1620,7 +1705,7 @@ mod web_tests {
         }
 
         let junk = b"not an image at all";
-        let r = send(port, &post(&ours, junk), junk).await;
+        let r = send(port, &upload(&ours, junk), junk).await;
         assert_eq!(r.status, 422);
         assert!(String::from_utf8_lossy(&r.body).starts_with("未附上"));
 
@@ -1637,7 +1722,10 @@ mod web_tests {
             ..UiSnapshot::default()
         };
         hub.publish(full, UiLogs::default(), vec![], vec![]);
-        assert_eq!(send(port, &post(&ours, &img), &img).await.status, 409, "the session has all it may");
+        // Answered after the body is read, so the browser gets the reason.
+        let r = send(port, &upload(&ours, &img), &img).await;
+        assert_eq!(r.status, 409, "the session has all it may");
+        assert!(String::from_utf8_lossy(&r.body).starts_with("未附上：最多"));
     }
 
     #[test]
@@ -1654,11 +1742,30 @@ mod web_tests {
 
     #[test]
     fn authorities_and_secrets_compare_strictly() {
-        assert!(local_authority("127.0.0.1:41873", 41873));
-        assert!(local_authority("LOCALHOST:41873", 41873));
-        assert!(!local_authority("127.0.0.1:041873", 41873));
-        assert!(!local_authority("127.0.0.2:41873", 41873));
-        assert!(!local_authority("127.0.0.1", 41873));
+        for ok in ["127.0.0.1:41873", "LOCALHOST:8080", "localhost", "[::1]:41873", "[::1]"] {
+            assert!(local_authority(ok), "{ok}");
+        }
+        for bad in ["127.0.0.2:41873", "evil.example:41873", "127.0.0.1:", "127.0.0.1:80x", "127.0.0.1.nip.io:41873"] {
+            assert!(!local_authority(bad), "{bad}");
+        }
+        let req = |host: &str, origin: Option<&str>| {
+            let mut h = HeaderMap::new();
+            h.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            if let Some(o) = origin {
+                h.insert(header::ORIGIN, HeaderValue::from_str(o).unwrap());
+            }
+            h
+        };
+        assert!(origin_ok(&req("127.0.0.1:41873", Some("http://127.0.0.1:41873"))));
+        assert!(origin_ok(&req("localhost:8080", Some("http://localhost:8080"))), "forwarded");
+        assert!(!origin_ok(&req("127.0.0.1:41873", Some("http://127.0.0.1:8000"))), "a page on another port");
+        assert!(!origin_ok(&req("127.0.0.1:41873", Some("http://localhost:41873"))));
+        assert!(!origin_ok(&req("evil.example:41873", Some("http://evil.example:41873"))), "rebinding");
+        assert!(!origin_ok(&req("127.0.0.1:41873", Some("null"))));
+        assert!(!origin_ok(&req("127.0.0.1:41873", None)));
+        let code = new_code();
+        assert!(code.len() == 16 && code.bytes().all(|b| b.is_ascii_hexdigit()), "{code}");
+        assert_ne!(code, new_code());
         assert!(secret_eq("abc", "abc"));
         assert!(!secret_eq("abd", "abc"));
         assert!(!secret_eq("ab", "abc"));
