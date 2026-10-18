@@ -49,6 +49,7 @@
   let localView = {};
   let taskDraft = { goal: "", criteria: "" };
   let taskFormNote = "";
+  let taskEndArmedAt = 0;   // 結束任務 pressed once; a second press soon after ends it
   let apiKeyDraft = null;   // typed in this tab; the server never sends the key
   let overlayTop = null;
   let overlayShownAt = 0;
@@ -352,7 +353,7 @@
       sideView === "agents" ? logs.agents : null,
       sideView === "changes" ? logs.changes : null,
       sideView === "background" ? [logs.rail.monitors, logs.rail.backgrounds.map((b) => [b.name, b.status, b.alive, b.command]), outputPick] : null,
-      sideView === "task" ? snap.task_summary : null]);
+      sideView === "task" ? [snap.task_summary, taskEndArmed()] : null]);
     if (key === sideKey) return;
     sideKey = key;
     const title = $("side-title");
@@ -461,7 +462,7 @@
         if (task.note) body.append(el("div", "side-note", task.note));
         const acts = el("div", "side-acts");
         (task.actions || []).forEach((name) => {
-          const b = el("button", "", `${TASK_ACTIONS[name][0]}`);
+          const b = el("button", name === "end" ? "danger" : "", taskActionLabel(name));
           b.type = "button";
           b.title = `${TASK_ACTIONS[name][0]} (${TASK_ACTIONS[name][1]})`;
           b.addEventListener("click", () => taskAction(name));
@@ -485,16 +486,40 @@
   };
 
   function taskState(t) {
-    return `${t.phase || ""}${t.paused ? " · 已暫停" : ""} · 回合 ${t.rounds || 0}`;
+    const hold = t.paused ? " · 已暫停" : t.stopped ? " · 已停止" : "";
+    return `${t.phase || ""}${hold} · 回合 ${t.rounds || 0}`;
   }
 
+  const TASK_END_CONFIRM_MS = 4000;
+  function taskEndArmed() {
+    return taskEndArmedAt > 0 && performance.now() - taskEndArmedAt < TASK_END_CONFIRM_MS;
+  }
+
+  function taskActionLabel(name) {
+    return name === "end" && taskEndArmed() ? "再按一次確認結束" : TASK_ACTIONS[name][0];
+  }
+
+  // Commands carry the session this page shows, so a click that races a
+  // session switch in the terminal does nothing.
   function taskAction(name) {
-    if (name === "pause" || name === "resume") return send({ type: "set_task_paused", paused: name === "pause" });
-    if (name === "review") return send({ type: "review_task" });
-    if (name === "accept") return send({ type: "accept_task" });
+    const sid = snap.session_id;
+    const armed = taskEndArmed();
+    taskEndArmedAt = 0;
+    if (name === "pause" || name === "resume") return send({ type: "set_task_paused", session_id: sid, paused: name === "pause" });
+    if (name === "review") return send({ type: "review_task", session_id: sid });
+    if (name === "accept") return send({ type: "accept_task", session_id: sid });
     if (name === "edit") return send({ type: "edit_task_form" });
+    if (name === "end" && !armed) {
+      // Ending wipes the goal, the progress notes and the proxy's memory:
+      // one stray key or click must not do that.
+      taskEndArmedAt = performance.now();
+      $("delivery").textContent = "再按一次「結束任務」確認：目標、進度筆記和用戶代理的記憶都會清除";
+      renderAll();
+      setTimeout(() => { if (!taskEndArmed()) renderAll(); }, TASK_END_CONFIRM_MS + 50);
+      return true;
+    }
     if (name === "end") {
-      const ok = send({ type: "end_task" });
+      const ok = send({ type: "end_task", session_id: sid });
       if (ok && localView.task) { localView = {}; renderOverlay(); }
       return ok;
     }
@@ -964,7 +989,7 @@
   // The form keeps its drafts in this tab; only the status view follows the task.
   function taskView(mode) {
     const t = snap.task_summary || {};
-    if (mode === "status") return t.goal ? { ...t, mode: "status" } : { mode: "form", note: taskFormNote };
+    if (mode === "status") return t.goal ? { ...t, mode: "status", end_armed: taskEndArmed() } : { mode: "form", note: taskFormNote };
     return { mode, note: taskFormNote };
   }
 
@@ -1200,9 +1225,10 @@
         modal.append(el("p", "hint", "按鈕上的字母鍵可直接執行 · Esc 關閉"));
         const row = el("div", "row-btns task-acts");
         (t.actions || []).forEach((name) => {
-          const b = el("button", name === "end" ? "danger" : "", `${TASK_ACTIONS[name][0]} (${TASK_ACTIONS[name][1]})`);
+          const b = el("button", name === "end" ? "danger" : "", `${taskActionLabel(name)} (${TASK_ACTIONS[name][1]})`);
           b.type = "button";
-          b.dataset.field = "task-act-" + name;
+          // Pause and resume are one button: focus stays on it as it flips.
+          b.dataset.field = "task-act-" + (name === "resume" ? "pause" : name);
           b.addEventListener("click", () => taskAction(name));
           row.append(b);
         });
@@ -1492,7 +1518,10 @@
     if (mod && !e.shiftKey && (e.key === "j" || e.key === "J")) { e.preventDefault(); setPanel(); return; }
     if (e.altKey && !mod && e.code === "KeyT") {
       e.preventDefault();
-      send({ type: "open_task" });
+      // A toggle for the status view; an open form keeps what was typed.
+      const shown = overlaySnapshot()?.task;
+      if (!shown) send({ type: "open_task" });
+      else if (shown.mode === "status") send({ type: "close_task" });
       return;
     }
     if (!mod && !e.altKey && e.key.length === 1 && overlayTop === "task" && localView.task?.mode === "status"

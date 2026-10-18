@@ -235,6 +235,7 @@ pre, code { font-family: var(--mono); font-size: 12.5px; }
   background: var(--bg-input);
 }
 .side-acts button:hover { background: var(--bg-hover); }
+.side-acts button.danger { border-color: var(--warn); color: var(--warn); }
 #side-scrim {
   position: fixed;
   inset: 0 0 var(--status-h) var(--activity-w);

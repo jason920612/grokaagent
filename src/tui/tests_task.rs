@@ -225,26 +225,45 @@ fn edit_prefills_the_form_and_edits_the_task() {
 }
 
 #[test]
-fn editing_a_handed_back_task_starts_it_over() {
+fn editing_a_handed_back_task_keeps_the_proxy_memory() {
     let mut fx = fixture();
     let app = &mut fx.app;
     let _rx = live_run(app);
+    let asked = task::ProxyTurn { who: "proxy".into(), text: "Option A or B? Only the user can decide.".into() };
     app.cur().task.replace(TaskState {
         goal: "g".into(),
         phase: TaskPhase::HandedBack,
         rounds: 4,
+        checklist: vec![task::CheckItem { text: "pick an option".into(), done: false }],
+        proxy_log: vec![asked.clone()],
+        review_note: "需要你決定 A 或 B".into(),
         ..TaskState::default()
     });
     app.open_task();
     let acts = task_actions(&task(app));
     assert_eq!(acts, [TaskAction::Edit, TaskAction::End, TaskAction::Close], "nothing to pause or accept");
     press(app, KeyCode::Char('e'));
-    assert!(render(app, 110, 34).contains("修改並重新開始任務"));
+    let screen = render(app, 110, 34);
+    assert!(screen.contains("修改任務") && !screen.contains("重新開始"), "{screen}");
     press(app, KeyCode::Tab);
     type_text(app, "use option B");
     press(app, KeyCode::Enter);
     let t = task(app);
-    assert_eq!((t.phase, t.criteria.as_str(), t.rounds), (TaskPhase::NeedPlan, "use option B", 0));
+    assert_eq!((t.phase, t.criteria.as_str(), t.rounds), (TaskPhase::Active, "use option B", 4), "not planned again");
+    assert_eq!(t.checklist.len(), 1, "progress notes stay");
+    assert_eq!(t.proxy_log.first(), Some(&asked), "the proxy remembers what it asked");
+    assert!(t.proxy_log.last().unwrap().text.contains("use option B"), "and hears the answer");
+    assert!(t.review_note.is_empty(), "the hand-back note is gone");
+    assert!(app.cur().task.take_review_request(), "the proxy looks again");
+
+    // An exempted task comes back the same way.
+    let mut s = task(app);
+    s.phase = TaskPhase::Failed;
+    s.fail_reason = "no network".into();
+    app.cur().task.replace(s);
+    app.edit_task("g", "network is back");
+    let t = task(app);
+    assert_eq!((t.phase, t.fail_reason.as_str(), t.rounds), (TaskPhase::Active, "", 4));
 }
 
 #[test]
@@ -276,6 +295,20 @@ fn dialog_keys_call_the_hub() {
     press(app, KeyCode::Char('d'));
     let t = task(app);
     assert_eq!((t.phase, t.review_note.as_str()), (TaskPhase::Done, "使用者判定完成"));
+
+    // Ending takes a second press.
+    press(app, KeyCode::Char('x'));
+    assert_eq!(task(app).phase, TaskPhase::Done, "one stray key ends nothing");
+    assert!(app.cur().chat.status.contains("再按一次"));
+    assert!(render(app, 110, 34).contains("再按一次確認結束(X)"));
+    press(app, KeyCode::Char('e'));
+    press(app, KeyCode::Esc);
+    press(app, KeyCode::Char('x'));
+    assert_eq!(task(app).phase, TaskPhase::Done, "another action in between disarms it");
+    let here = app.current.clone();
+    app.current = "elsewhere".into();
+    assert!(!app.task_end_armed(), "the press counts only in its own session");
+    app.current = here;
     press(app, KeyCode::Char('x'));
     assert_eq!(task(app).phase, TaskPhase::Inactive);
     assert!(app.ui.task_ui.is_none());
@@ -313,6 +346,18 @@ fn dialog_and_side_panel_buttons_work_by_mouse() {
     type_text(app, "c");
     click(app, hit_rect(app, Hit::TaskConfirm));
     assert_eq!(task(app).criteria, "c");
+
+    // 結束任務 in the side panel takes a second click, also on a narrow screen.
+    app.close_task();
+    let side = render(app, 80, 34);
+    assert!(side.contains("▸結束任務"), "{side}");
+    let i = app.ui.side_items.iter().position(|s| *s == SideItem::TaskAct(TaskAction::End)).expect("side action");
+    click(app, hit_rect(app, Hit::SideItem(i as u16)));
+    assert_eq!(task(app).phase, TaskPhase::NeedPlan);
+    assert!(app.ui.side_open, "the panel stays for the second click");
+    assert!(render(app, 80, 34).contains("▸再按一次確認結束"));
+    click(app, hit_rect(app, Hit::SideItem(i as u16)));
+    assert_eq!(task(app).phase, TaskPhase::Inactive);
 }
 
 #[test]
@@ -477,17 +522,28 @@ fn bridge_commands_drive_the_task() {
     assert_eq!((ui.criteria.as_str(), ui.paused, ui.rounds, ui.live), ("web criteria", false, 0, true));
     assert_eq!(ui.actions, ["pause", "review", "accept", "edit", "end"]);
 
-    bridge::apply_command(app, UiCommand::SetTaskPaused { paused: true });
+    bridge::apply_command(app, UiCommand::SetTaskPaused { session_id: sid.clone(), paused: true });
     let ui = bridge::snapshot(app).task_summary;
     assert!(ui.paused);
     assert_eq!(ui.actions, ["resume", "accept", "edit", "end"]);
-    bridge::apply_command(app, UiCommand::ReviewTask);
+    bridge::apply_command(app, UiCommand::ReviewTask { session_id: sid.clone() });
     assert!(!app.cur().task.take_review_request(), "paused");
-    bridge::apply_command(app, UiCommand::SetTaskPaused { paused: false });
-    bridge::apply_command(app, UiCommand::ReviewTask);
+    bridge::apply_command(app, UiCommand::SetTaskPaused { session_id: String::new(), paused: false });
+    assert!(!task(app).paused, "an older page sends no session id");
+    bridge::apply_command(app, UiCommand::ReviewTask { session_id: sid.clone() });
     assert!(app.cur().task.take_review_request());
 
-    bridge::apply_command(app, UiCommand::EditTask { session_id: sid, goal: "web goal 2".into(), criteria: String::new() });
+    // A page still showing another session acts on nothing here.
+    let other = || "other".to_string();
+    bridge::apply_command(app, UiCommand::SetTaskPaused { session_id: other(), paused: true });
+    bridge::apply_command(app, UiCommand::ReviewTask { session_id: other() });
+    bridge::apply_command(app, UiCommand::AcceptTask { session_id: other() });
+    bridge::apply_command(app, UiCommand::EndTask { session_id: other() });
+    let t = task(app);
+    assert_eq!((t.paused, t.phase), (false, TaskPhase::NeedPlan));
+    assert!(!app.cur().task.take_review_request());
+
+    bridge::apply_command(app, UiCommand::EditTask { session_id: sid.clone(), goal: "web goal 2".into(), criteria: String::new() });
     let t = task(app);
     assert_eq!((t.goal.as_str(), t.criteria.as_str()), ("web goal 2", ""));
 
@@ -498,10 +554,11 @@ fn bridge_commands_drive_the_task() {
     let ui = bridge::snapshot(app).task_summary;
     assert_eq!((ui.rounds, ui.last_proxy.as_str()), (3, "請跑測試"));
 
-    bridge::apply_command(app, UiCommand::AcceptTask);
+    bridge::apply_command(app, UiCommand::AcceptTask { session_id: sid.clone() });
     assert_eq!(task(app).phase, TaskPhase::Done);
     assert!(!bridge::snapshot(app).task_summary.live);
-    bridge::apply_command(app, UiCommand::EndTask);
+    // The page asks for the second press itself.
+    bridge::apply_command(app, UiCommand::EndTask { session_id: sid });
     assert_eq!(task(app).phase, TaskPhase::Inactive);
 
     // The TUI's own form, driven from the hub.
@@ -523,10 +580,14 @@ fn task_commands_parse_from_the_browser() {
         UiCommand::EditTask { goal, criteria, .. } => assert_eq!((goal.as_str(), criteria.as_str()), ("g", "c")),
         _ => panic!("wrong variant"),
     }
-    assert!(matches!(parse(json!({"type": "set_task_paused", "paused": true})), UiCommand::SetTaskPaused { paused: true }));
-    assert!(matches!(parse(json!({"type": "review_task"})), UiCommand::ReviewTask));
-    assert!(matches!(parse(json!({"type": "accept_task"})), UiCommand::AcceptTask));
-    assert!(matches!(parse(json!({"type": "end_task"})), UiCommand::EndTask));
+    assert!(matches!(parse(json!({"type": "set_task_paused", "paused": true})), UiCommand::SetTaskPaused { paused: true, .. }));
+    assert!(matches!(
+        parse(json!({"type": "set_task_paused", "session_id": "s", "paused": false})),
+        UiCommand::SetTaskPaused { session_id, paused: false } if session_id == "s"
+    ));
+    assert!(matches!(parse(json!({"type": "review_task"})), UiCommand::ReviewTask { session_id } if session_id.is_empty()));
+    assert!(matches!(parse(json!({"type": "accept_task", "session_id": "s"})), UiCommand::AcceptTask { session_id } if session_id == "s"));
+    assert!(matches!(parse(json!({"type": "end_task"})), UiCommand::EndTask { session_id } if session_id.is_empty()));
     assert!(matches!(parse(json!({"type": "set_task_model", "id": "x"})), UiCommand::SetTaskModel { id } if id == "x"));
 }
 
@@ -563,6 +624,7 @@ fn resuming_a_restored_task_starts_a_run_for_the_proxy() {
     app.task_action(TaskAction::Resume);
     assert!(!task(app).paused);
     assert!(app.cur().inbox.is_some());
+    assert!(app.cur().task.take_review_request(), "the new run starts with the proxy's look");
 }
 
 #[test]
@@ -627,9 +689,102 @@ fn ctrl_t_and_alt_t_toggle_the_task_dialog() {
     assert!(matches!(app.ui.task_ui, Some(TaskUi::Form(_))));
     press(app, KeyCode::Esc);
     assert!(app.ui.task_ui.is_none());
+    // In the form the key keeps what was typed (Esc leaves it).
+    key(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    type_text(app, "draft");
+    key(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    key(app, KeyCode::Char('t'), KeyModifiers::ALT);
+    assert!(matches!(&app.ui.task_ui, Some(TaskUi::Form(f)) if f.goal.text == "draft"));
+    press(app, KeyCode::Esc);
     app.cur().task.start_task("g", "");
     key(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
     assert!(matches!(app.ui.task_ui, Some(TaskUi::Status(_))));
     key(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
     assert!(app.ui.task_ui.is_none());
+    key(app, KeyCode::Char('t'), KeyModifiers::ALT);
+    key(app, KeyCode::Char('x'), KeyModifiers::ALT);
+    assert!(!app.task_end_armed(), "Alt+letter is no action key");
+    key(app, KeyCode::Char('t'), KeyModifiers::ALT);
+    assert!(app.ui.task_ui.is_none());
+}
+
+#[test]
+fn an_esc_stop_shows_and_resume_or_review_lifts_it() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let _rx = live_run(app);
+    app.cur().task.replace(TaskState { goal: "g".into(), phase: TaskPhase::Active, skip_steer: true, ..TaskState::default() });
+    app.open_task();
+    let screen = render(app, 110, 34);
+    assert!(screen.contains("進行中·已停止"), "{screen}");
+    assert!(screen.contains("繼續(P)") && screen.contains("立即審查(R)") && !screen.contains("暫停(P)"), "{screen}");
+    let ui = bridge::snapshot(app).task_summary;
+    assert!(ui.stopped && !ui.paused);
+    assert_eq!(ui.actions, ["resume", "review", "accept", "edit", "end"]);
+
+    press(app, KeyCode::Char('p'));
+    let t = task(app);
+    assert!(!t.skip_steer && !t.paused, "繼續 lifts the Esc stop");
+    assert!(app.cur().task.take_kick(), "and wakes the run");
+    assert!(!bridge::snapshot(app).task_summary.stopped);
+    assert!(render(app, 110, 34).contains("暫停(P)"));
+
+    app.cur().task.set_skip_steer(true);
+    press(app, KeyCode::Char('r'));
+    assert!(!task(app).skip_steer, "立即審查 lifts it too");
+    assert!(app.cur().task.take_review_request());
+
+    // A finished task is not 'stopped', whatever the flag says.
+    app.cur().task.set_skip_steer(true);
+    app.cur().task.accept_done();
+    assert!(!bridge::snapshot(app).task_summary.stopped);
+}
+
+#[test]
+fn the_mouse_wheel_scrolls_the_status_dialog() {
+    let mut fx = fixture();
+    let app = &mut fx.app;
+    let long: Vec<String> = (1..=60).map(|i| format!("line {i}")).collect();
+    app.cur().task.replace(TaskState { goal: "g".into(), phase: TaskPhase::Active, last_proxy: long.join("\n"), ..TaskState::default() });
+    app.open_task();
+    assert!(!render(app, 110, 30).contains("line60"));
+    let wheel = |app: &mut App, kind| {
+        input::handle(app, Event::Mouse(MouseEvent { kind, column: 50, row: 15, modifiers: KeyModifiers::NONE }));
+    };
+    for _ in 0..30 {
+        wheel(app, MouseEventKind::ScrollDown);
+    }
+    let screen = render(app, 110, 30);
+    assert!(screen.contains("line60"), "{screen}");
+    let scrolled = match &app.ui.task_ui {
+        Some(TaskUi::Status(st)) => st.scroll,
+        _ => panic!("the dialog closed"),
+    };
+    wheel(app, MouseEventKind::ScrollUp);
+    assert!(matches!(&app.ui.task_ui, Some(TaskUi::Status(st)) if st.scroll < scrolled));
+}
+
+#[test]
+fn a_row_from_a_newer_version_costs_only_itself() {
+    let saved = json!([
+        {"Meta": "kept before"},
+        {"Future": {"text": "said by a newer kind of row", "extra": 1}},
+        {"Gadget": 42},
+        {"Proxy": {"intent": "push", "text": "kept proxy"}},
+        {"Meta": "kept after"},
+    ]);
+    let rows = super::model::rows::decode_rows(&saved);
+    let text: Vec<String> = rows
+        .iter()
+        .map(|r| match r {
+            Row::Meta(s) => s.clone(),
+            Row::Proxy { text, .. } => text.clone(),
+            _ => panic!("unexpected row"),
+        })
+        .collect();
+    assert_eq!(text[0], "kept before");
+    assert_eq!(text[1], "said by a newer kind of row");
+    assert!(text[2].contains("較新版本"), "{}", text[2]);
+    assert_eq!(&text[3..], ["kept proxy", "kept after"]);
+    assert!(super::model::rows::decode_rows(&json!({"not": "a list"})).is_empty());
 }

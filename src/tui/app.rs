@@ -25,7 +25,7 @@ use crate::task::{self, TaskHub, TaskPhase, TaskState};
 
 use super::edit::{clipboard_get, clipboard_set, clipboard_set_image, Edit};
 use super::model::agents::{AgentTree, EventKind, SavedAgent};
-use super::model::rows::Row;
+use super::model::rows::{self, Row};
 use super::model::session::{intro_rows, user_row, ChatSel, Queued, Session};
 use super::settings::Settings;
 use super::TuiOptions;
@@ -383,12 +383,29 @@ impl TaskAction {
     }
 }
 
+/// How long a first press of 結束任務 waits for the second.
+pub(crate) const TASK_END_CONFIRM: Duration = Duration::from_secs(4);
+
+/// Why a live proxy is not pushing: paused by the user, or stopped by Esc
+/// (it stays quiet until 繼續, 立即審查 or a message of the user's own).
+pub(crate) fn task_hold(t: &TaskState) -> Option<&'static str> {
+    if !t.phase.is_live() {
+        None
+    } else if t.paused {
+        Some("已暫停")
+    } else if t.skip_steer {
+        Some("已停止")
+    } else {
+        None
+    }
+}
+
 /// The actions that make sense for the task as it stands. A paused proxy
 /// makes no calls at all, so it cannot review until resumed.
 pub(crate) fn task_actions(t: &TaskState) -> Vec<TaskAction> {
     let mut out = Vec::new();
     if t.phase.is_live() {
-        out.push(if t.paused { TaskAction::Resume } else { TaskAction::Pause });
+        out.push(if task_hold(t).is_some() { TaskAction::Resume } else { TaskAction::Pause });
         if !t.paused {
             out.push(TaskAction::Review);
         }
@@ -459,6 +476,9 @@ pub(crate) struct Ui {
     pub field_inner: Rect,
     /// Inner rects of the task form's goal and criteria fields.
     pub task_fields: [Rect; 2],
+    /// When and in which session 結束任務 was pressed once; a second press
+    /// there soon after ends the task.
+    pub task_end_armed: Option<(Instant, String)>,
     pub skill_inner: Rect,
     pub last_caret: Position,
     pub last_clock_cells: Vec<(u16, u16, Cell)>,
@@ -518,6 +538,7 @@ impl Default for Ui {
             bottom_area: Rect::default(),
             field_inner: Rect::default(),
             task_fields: [Rect::default(); 2],
+            task_end_armed: None,
             skill_inner: Rect::default(),
             last_caret: Position::ORIGIN,
             last_clock_cells: Vec::new(),
@@ -1171,7 +1192,7 @@ impl App {
         });
         let rows: Vec<Row> = store
             .and_then(|s| s.load_transcript(id).ok())
-            .and_then(|v| serde_json::from_value(v).ok())
+            .map(|v| rows::decode_rows(&v))
             .unwrap_or_default();
         let task = TaskHub::from_state(
             id,
@@ -1806,18 +1827,32 @@ impl App {
         }
     }
 
-    /// The user changed the goal or criteria. A task the proxy already let
-    /// go of (handed back, exempted, ended) starts over with the new text.
+    /// The user changed the goal or criteria. The proxy keeps its memory,
+    /// progress notes and rounds, so an edit after a hand-back (often the
+    /// decision it asked for) picks up where it stopped.
     pub fn edit_task(&mut self, goal: &str, criteria: &str) {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
             self.flash("請填寫任務目標");
             return;
         }
-        let phase = self.cur().task.snapshot().phase;
-        if !phase.is_live() && phase != TaskPhase::Done {
+        let snap = self.cur().task.snapshot();
+        if snap.phase == TaskPhase::Inactive {
+            // Ended elsewhere while the form was open: nothing left to edit.
             self.start_task(&goal, criteria);
             return;
+        }
+        if matches!(snap.phase, TaskPhase::HandedBack | TaskPhase::Failed) {
+            // TaskHub::edit_task only reopens Done; bring these back the same
+            // way, so intake and planning do not run again.
+            self.cur().task.replace(TaskState {
+                phase: TaskPhase::Active,
+                review_note: String::new(),
+                fail_reason: String::new(),
+                claim: None,
+                skip_steer: false,
+                ..snap
+            });
         }
         let s = self.cur_mut();
         s.task.edit_task(goal.clone(), criteria.trim().to_string());
@@ -1839,6 +1874,8 @@ impl App {
         if !task_actions(&snap).contains(&act) {
             return;
         }
+        let armed = self.task_end_armed();
+        self.ui.task_end_armed = None;
         match act {
             TaskAction::Pause => {
                 let s = self.cur_mut();
@@ -1848,13 +1885,18 @@ impl App {
             }
             TaskAction::Resume => {
                 let s = self.cur_mut();
+                // Resume also lifts an Esc stop; the kernel only reviews on a
+                // resume once that is clear.
+                s.task.set_skip_steer(false);
                 s.task.set_paused(false);
                 s.chat.push(Row::meta("用戶代理繼續推進任務"));
                 s.dirty = true;
                 self.ensure_task_run();
             }
             TaskAction::Review => {
-                self.cur().task.request_review();
+                let t = &self.cur().task;
+                t.set_skip_steer(false);
+                t.request_review();
                 self.flash("已請用戶代理立即審查");
                 self.ensure_task_run();
             }
@@ -1866,9 +1908,20 @@ impl App {
                 s.dirty = true;
             }
             TaskAction::Edit => self.ui.task_ui = Some(TaskUi::Form(TaskForm::editing(&snap))),
-            TaskAction::End => self.end_task(),
+            // Ending wipes the goal, the progress notes and the proxy's
+            // memory: one stray key or click must not do that.
+            TaskAction::End if armed => self.end_task(),
+            TaskAction::End => {
+                self.ui.task_end_armed = Some((Instant::now(), self.current.clone()));
+                self.flash("再按一次「結束任務」確認：目標、進度筆記和用戶代理的記憶都會清除");
+            }
             TaskAction::Close => self.close_task(),
         }
+    }
+
+    /// 結束任務 was pressed once and waits for the second press.
+    pub fn task_end_armed(&self) -> bool {
+        self.ui.task_end_armed.as_ref().is_some_and(|(t, id)| t.elapsed() < TASK_END_CONFIRM && *id == self.current)
     }
 
     /// A live task needs a run for the proxy to act in: a restored session
@@ -1876,6 +1929,11 @@ impl App {
     fn ensure_task_run(&mut self) {
         let snap = self.cur().task.snapshot();
         if snap.phase.is_live() && !snap.paused && self.cur().inbox.is_none() {
+            // A fresh run's first turn only plans a new task. Past planning,
+            // ask the proxy to look, so the run starts with its review.
+            if snap.phase != TaskPhase::NeedPlan {
+                self.cur().task.request_review();
+            }
             self.start_or_send(UserTurn::from(task::KICK), false);
         }
     }
@@ -2098,7 +2156,7 @@ pub(crate) fn boot_session(store: Option<&SessionStore>, workspace: PathBuf) -> 
     let rows_of = |id: &str| -> Vec<Row> {
         store
             .and_then(|s| s.load_transcript(id).ok())
-            .and_then(|v| serde_json::from_value(v).ok())
+            .map(|v| rows::decode_rows(&v))
             .unwrap_or_default()
     };
     let pick = listed

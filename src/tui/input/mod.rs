@@ -491,10 +491,13 @@ fn task_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 fn task_form_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     let shift = mods.contains(KeyModifiers::SHIFT);
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
     let widths = app.ui.task_fields.map(|r| r.width.max(1));
     let Some(TaskUi::Form(form)) = app.ui.task_ui.as_mut() else { return };
     match code {
         KeyCode::Esc => cancel_task_form(app),
+        // The dialog key does not throw away what was typed; Esc does.
+        KeyCode::Char('t' | 'T') if ctrl || alt => {}
         KeyCode::Tab | KeyCode::BackTab => form.on_criteria = !form.on_criteria,
         KeyCode::Enter if shift => {
             let limit = form.limit();
@@ -532,13 +535,14 @@ pub(crate) fn cancel_task_form(app: &mut App) {
 
 fn task_status_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
     let acts = task_actions(&app.cur().task.snapshot());
     let Some(TaskUi::Status(st)) = app.ui.task_ui.as_mut() else { return };
     let n = acts.len();
     let at = acts.iter().position(|a| a.same(st.focus));
     match code {
         KeyCode::Esc => app.close_task(),
-        KeyCode::Char('t' | 'T') if ctrl => app.close_task(),
+        KeyCode::Char('t' | 'T') if ctrl || alt => app.close_task(),
         KeyCode::Left | KeyCode::BackTab => st.focus = acts[(at.unwrap_or(0) + n - 1) % n],
         KeyCode::Right | KeyCode::Tab => st.focus = acts[at.map_or(0, |i| i + 1) % n],
         KeyCode::Up => st.scroll = st.scroll.saturating_sub(1),
@@ -550,7 +554,7 @@ fn task_status_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             let act = at.map_or(TaskAction::Close, |i| acts[i]);
             app.task_action(act);
         }
-        KeyCode::Char(c) if !ctrl => {
+        KeyCode::Char(c) if !ctrl && !alt => {
             let act = match c.to_ascii_lowercase() {
                 'p' if acts.contains(&TaskAction::Resume) => TaskAction::Resume,
                 'p' => TaskAction::Pause,

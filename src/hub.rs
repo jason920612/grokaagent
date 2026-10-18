@@ -549,6 +549,9 @@ pub struct UiTask {
     pub criteria: String,
     #[serde(default)]
     pub paused: bool,
+    /// Esc stopped the proxy; 繼續 or 立即審查 lets it speak again.
+    #[serde(default)]
+    pub stopped: bool,
     #[serde(default)]
     pub rounds: u32,
     /// The user proxy's latest message to the worker.
@@ -579,9 +582,21 @@ pub enum UiCommand {
         #[serde(default)]
         criteria: String,
     },
-    SetTaskPaused { paused: bool },
-    ReviewTask,
-    AcceptTask,
+    /// The task commands carry the session the page showed (empty from
+    /// older pages), so a click that races a session switch does nothing.
+    SetTaskPaused {
+        #[serde(default)]
+        session_id: String,
+        paused: bool,
+    },
+    ReviewTask {
+        #[serde(default)]
+        session_id: String,
+    },
+    AcceptTask {
+        #[serde(default)]
+        session_id: String,
+    },
     Rename { id: String, text: String },
     UpdateQueue { session_id: String, request_id: String, index: usize, expected: String, text: String },
     /// Drop `queue[index]` if it still holds `expected` text and `images`.
@@ -603,7 +618,10 @@ pub enum UiCommand {
     CloseTask,
     SetTaskDraft { text: String },
     SubmitTask,
-    EndTask,
+    EndTask {
+        #[serde(default)]
+        session_id: String,
+    },
     Login,
     Logout,
     SetProviderKind { kind: String },

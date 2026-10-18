@@ -11,7 +11,7 @@ use super::chat::{blit, wrap};
 use super::{centered, chip, draw_edit, line, panel};
 use crate::folderpick;
 use crate::task::{TaskPhase, TaskState};
-use crate::tui::app::{task_actions, App, Hit, TaskAction, TaskUi};
+use crate::tui::app::{task_actions, task_hold, App, Hit, TaskAction, TaskUi};
 use crate::tui::edit::{caret_row_col, display_cols, wrap_lines};
 use crate::tui::theme::*;
 
@@ -160,14 +160,7 @@ fn task_form(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position> {
         Some(TaskUi::Form(t)) => (t.editing, t.on_criteria),
         _ => return None,
     };
-    let phase = app.cur().task.snapshot().phase;
-    let title = if !editing {
-        "任務目標"
-    } else if phase.is_live() || phase == TaskPhase::Done {
-        "修改任務"
-    } else {
-        "修改並重新開始任務"
-    };
+    let title = if editing { "修改任務" } else { "任務目標" };
     let w = area.width.saturating_sub(8).clamp(40.min(area.width), 80);
     let r = centered(area, w, area.height.saturating_sub(2).clamp(13.min(area.height), 24));
     let body = panel(f, app, r, title);
@@ -207,7 +200,10 @@ fn task_form(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position> {
 }
 
 /// A button's label: the action and the letter that runs it.
-fn action_label(a: TaskAction) -> String {
+fn action_label(a: TaskAction, end_armed: bool) -> String {
+    if a == TaskAction::End && end_armed {
+        return " 再按一次確認結束(X) ".into();
+    }
     match a.key() {
         Some(k) => format!(" {}({}) ", a.label(), k.to_ascii_uppercase()),
         None => format!(" {} ", a.label()),
@@ -249,8 +245,8 @@ fn task_status_lines(t: &TaskState, width: u16) -> Vec<Line<'static>> {
         return out;
     }
     let mut state = t.phase.label().to_string();
-    if t.paused {
-        state.push_str(" · 已暫停");
+    if let Some(hold) = task_hold(t) {
+        state.push_str(&format!(" · {hold}"));
     }
     state.push_str(&format!(" · 回合 {}", t.rounds));
     out.push(Line::from(Span::styled(format!("狀態  {state}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))));
@@ -294,7 +290,8 @@ fn task_status(f: &mut Frame, app: &mut App, area: Rect) {
     let w = area.width.saturating_sub(8).clamp(40.min(area.width), 84);
     let text_w = w.saturating_sub(4);
     let lines = task_status_lines(&snap, text_w);
-    let labels: Vec<String> = acts.iter().map(|a| action_label(*a)).collect();
+    let armed = app.task_end_armed();
+    let labels: Vec<String> = acts.iter().map(|a| action_label(*a, armed)).collect();
     let btn_rows = button_rows(&labels, text_w);
     // Borders, the hint and the button rows around the text.
     let chrome = 3 + btn_rows;

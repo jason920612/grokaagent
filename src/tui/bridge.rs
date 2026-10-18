@@ -10,7 +10,7 @@ use crate::provider::ReasoningEffort;
 use crate::session;
 use crate::task;
 
-use super::app::{task_actions, App, SendMode, TaskAction, TaskUi};
+use super::app::{task_actions, task_hold, App, SendMode, TaskAction, TaskUi};
 use super::edit::Edit;
 use super::input;
 use super::model::rows::{proxy_label, Row};
@@ -75,6 +75,7 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
             .collect(),
         criteria: task_snap.criteria.clone(),
         paused: task_snap.paused,
+        stopped: task_hold(&task_snap).is_some() && !task_snap.paused,
         rounds: task_snap.rounds,
         last_proxy: task_snap.last_proxy.clone(),
         live: task_snap.phase.is_live(),
@@ -430,6 +431,12 @@ fn receipt(app: &mut App, id: String, result: &str) {
     }
 }
 
+/// A task command from a page that showed `session_id` (empty: an older
+/// page) still means the session on screen now.
+fn shows_current(app: &App, session_id: &str) -> bool {
+    session_id.is_empty() || session_id == app.current
+}
+
 /// Apply one command from the browser.
 pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
     match cmd {
@@ -461,11 +468,21 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
                 app.ui.task_ui = None;
             }
         }
-        UiCommand::SetTaskPaused { paused } => {
-            app.task_action(if paused { TaskAction::Pause } else { TaskAction::Resume });
+        UiCommand::SetTaskPaused { session_id, paused } => {
+            if shows_current(app, &session_id) {
+                app.task_action(if paused { TaskAction::Pause } else { TaskAction::Resume });
+            }
         }
-        UiCommand::ReviewTask => app.task_action(TaskAction::Review),
-        UiCommand::AcceptTask => app.task_action(TaskAction::Accept),
+        UiCommand::ReviewTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.task_action(TaskAction::Review);
+            }
+        }
+        UiCommand::AcceptTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.task_action(TaskAction::Accept);
+            }
+        }
         UiCommand::UpdateQueue { session_id, request_id, index, expected, text } => {
             if app.web.receipts.iter().any(|(id, _)| *id == request_id) {
                 return;
@@ -571,7 +588,12 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
             }
         }
         UiCommand::SubmitTask => app.submit_task_form(),
-        UiCommand::EndTask => app.end_task(),
+        // The page asked for the second press itself.
+        UiCommand::EndTask { session_id } => {
+            if shows_current(app, &session_id) {
+                app.end_task();
+            }
+        }
         UiCommand::Login => app.activate_account(),
         UiCommand::Logout => app.logout(),
         UiCommand::SetProviderKind { kind } => {

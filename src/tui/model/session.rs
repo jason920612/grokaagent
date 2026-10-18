@@ -796,8 +796,11 @@ impl Session {
     /// user proxy drives a live task the agent may never wait, so queued
     /// messages go in as interjections instead.
     pub fn flush_queue(&mut self) -> bool {
-        let driving = self.chat.running && self.task.snapshot().phase.is_live();
-        if !(self.chat.awaiting || driving) || self.queue_edit.is_some() || self.chat.status == "已停止" {
+        // Runs every loop: the task snapshot only once there is something to send.
+        if self.queue.is_empty() || self.queue_edit.is_some() || self.chat.status == "已停止" {
+            return false;
+        }
+        if !self.chat.awaiting && !(self.chat.running && self.task.snapshot().phase.is_live()) {
             return false;
         }
         let Some(tx) = self.inbox.clone() else {

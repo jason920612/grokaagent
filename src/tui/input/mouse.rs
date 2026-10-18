@@ -368,7 +368,13 @@ fn side_item(app: &mut App, item: SideItem) {
         }
         SideItem::Monitor(name) => app.ui.inspector = Some(name),
         SideItem::OpenTask => app.open_task(),
-        SideItem::TaskAct(act) => app.task_action(act),
+        SideItem::TaskAct(act) => {
+            app.task_action(act);
+            // A first press of 結束任務 waits for the second click right here.
+            if app.task_end_armed() {
+                return;
+            }
+        }
     }
     close_side_if_narrow(app);
 }
@@ -495,6 +501,14 @@ fn wheel(app: &mut App, col: u16, row: u16, delta: i32) {
     if let Some(ws) = app.ui.workspace_pick.as_mut() {
         ws.move_cursor(delta.signum());
         return;
+    }
+    // The task status dialog, unless a questionnaire sits on top of it.
+    if app.cur().ask.is_none() {
+        if let Some(TaskUi::Status(st)) = app.ui.task_ui.as_mut() {
+            let step = delta.unsigned_abs() as u16;
+            st.scroll = if delta < 0 { st.scroll.saturating_sub(step) } else { st.scroll.saturating_add(step) };
+            return;
+        }
     }
     if app.has_modal() {
         return;

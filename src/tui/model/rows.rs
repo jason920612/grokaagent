@@ -212,6 +212,35 @@ impl Row {
     }
 }
 
+/// Rows of a saved transcript, read one by one: a row this version does not
+/// know (written by a newer one) becomes a note with the text it carried,
+/// instead of losing the whole history.
+pub(crate) fn decode_rows(v: &Value) -> Vec<Row> {
+    let Some(items) = v.as_array() else {
+        return Vec::new();
+    };
+    items.iter().map(|item| Row::deserialize(item).unwrap_or_else(|_| Row::meta(unknown_row_text(item)))).collect()
+}
+
+/// [`decode_rows`] for a `rows` field inside a saved struct.
+pub(crate) fn lenient_rows<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Row>, D::Error> {
+    Ok(decode_rows(&Value::deserialize(d)?))
+}
+
+/// Rows are `{"Kind": "text"}` or `{"Kind": {.., "text": ..}}`.
+fn unknown_row_text(v: &Value) -> String {
+    let text = match v.as_object().and_then(|o| o.values().next()) {
+        Some(Value::String(s)) => s.as_str(),
+        Some(Value::Object(o)) => o.get("text").and_then(Value::as_str).unwrap_or_default(),
+        _ => "",
+    };
+    if text.trim().is_empty() {
+        "（較新版本寫入的紀錄，這個版本無法顯示）".into()
+    } else {
+        text.to_string()
+    }
+}
+
 /// How a proxy row names what was said.
 pub(crate) fn proxy_label(intent: &str) -> &str {
     match intent {

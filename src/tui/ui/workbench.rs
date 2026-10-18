@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use super::{draw_edit, line, truncate};
 use crate::md;
-use crate::tui::app::{task_actions, App, BottomTab, Hit, SideItem, SideView, Tab, TaskAction};
+use crate::tui::app::{task_actions, task_hold, App, BottomTab, Hit, SideItem, SideView, Tab, TaskAction};
 use crate::tui::edit::display_cols;
 use crate::tui::model::agents::{AgentState, EventKind};
 use crate::tui::model::tool_text::spinner;
@@ -315,9 +315,9 @@ fn task_lines(app: &App, width: u16) -> Vec<SideLine> {
         side_text(&mut out, &task.criteria, width, 6, TEXT, &open);
     }
     let done = task.checklist.iter().filter(|i| i.done).count();
-    let paused = if task.paused { " · 已暫停" } else { "" };
+    let hold = task_hold(&task).map(|h| format!(" · {h}")).unwrap_or_default();
     out.push((
-        format!(" {}{paused} · 回合 {} · {done}/{}", task.phase.label(), task.rounds, task.checklist.len()),
+        format!(" {}{hold} · 回合 {} · {done}/{}", task.phase.label(), task.rounds, task.checklist.len()),
         ACCENT,
         open.clone(),
         false,
@@ -337,8 +337,10 @@ fn task_lines(app: &App, width: u16) -> Vec<SideLine> {
         side_text(&mut out, &task.review_note, width, 4, DIM, &None);
     }
     out.push((String::new(), DIM, None, false));
+    let armed = app.task_end_armed();
     for act in task_actions(&task).into_iter().filter(|a| *a != TaskAction::Close) {
-        out.push((format!(" ▸ {}", act.label()), ACCENT, Some(SideItem::TaskAct(act)), false));
+        let label = if act == TaskAction::End && armed { "再按一次確認結束" } else { act.label() };
+        out.push((format!(" ▸ {label}"), ACCENT, Some(SideItem::TaskAct(act)), false));
     }
     out.push((" ▸ 開啟任務面板（Ctrl+T）".into(), ACCENT, open, false));
     out
