@@ -391,24 +391,13 @@ impl AgentTree {
             return false;
         }
         // A workflow agent's full outputs stay in its own log file; the tree
-        // (saved with the session) keeps a cut.
-        let clipped;
-        let ev = match ev {
-            AgentEvent::ToolFinished { output, .. } if output.len() > WORKFLOW_OUTPUT_CAP && self.in_workflow(&path) => {
-                let mut e = ev.clone();
-                if let AgentEvent::ToolFinished { output, .. } = &mut e {
-                    let mut end = WORKFLOW_OUTPUT_CAP;
-                    while !output.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    let cut = output.len() - end;
-                    output.truncate(end);
-                    output.push_str(&format!("\n…(cut {cut} bytes)"));
-                }
-                clipped = e;
-                &clipped
+        // (saved with the session) keeps a cut, made after the outcome and
+        // file changes were read from the whole output.
+        let clip = match ev {
+            AgentEvent::ToolFinished { call_id, output, .. } if output.len() > WORKFLOW_OUTPUT_CAP && self.in_workflow(&path) => {
+                Some(call_id.clone())
             }
-            _ => ev,
+            _ => None,
         };
         match ev {
             AgentEvent::ChildSpawned {
@@ -473,7 +462,11 @@ impl AgentTree {
             _ => {}
         }
         let settle = matches!(ev, AgentEvent::AwaitingInput { .. } | AgentEvent::RunFinished { .. });
-        if !node.transcript.apply(ev, false) {
+        let applied = node.transcript.apply(ev, false);
+        if let Some(id) = &clip {
+            node.transcript.clip_output(id, WORKFLOW_OUTPUT_CAP);
+        }
+        if !applied {
             let line = match ev {
                 AgentEvent::MonitorAttached { name, command, .. } => Some(format!("監控 {name}  $ {command}")),
                 AgentEvent::BackgroundStarted { name, command, .. } => Some(format!("背景 {name}  $ {command}")),
@@ -609,14 +602,20 @@ mod tests {
         t.spawned("", "wf-review", "review", "grok-4.6");
         assert!(t.in_workflow("wf-1/read-1") && !t.in_workflow("wf-review"));
         assert_eq!(t.interruptible_count(), 1);
-        let big = "x".repeat(WORKFLOW_OUTPUT_CAP * 3);
-        t.apply_relayed(&AgentEvent::ToolStarted { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "read_file".into(), args: json!({}), kind: "client".into() });
-        t.apply_relayed(&AgentEvent::ToolFinished { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "read_file".into(), output: big });
-        let kept = t.get("wf-1/read-1").unwrap().transcript.rows.iter().find_map(|r| match r {
-            Row::Tools(g) => g.calls.first().map(|c| c.output.len()),
+        // A failed command with a long output stays failed, and its stored
+        // output is cut but still JSON.
+        let big = json!({"exit_code": 1, "stdout": "x".repeat(WORKFLOW_OUTPUT_CAP * 3)}).to_string();
+        t.apply_relayed(&AgentEvent::ToolStarted { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "run_command".into(), args: json!({}), kind: "client".into() });
+        t.apply_relayed(&AgentEvent::ToolFinished { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "run_command".into(), output: big });
+        let call = t.get("wf-1/read-1").unwrap().transcript.rows.iter().find_map(|r| match r {
+            Row::Tools(g) => g.calls.first().cloned(),
             _ => None,
-        });
-        assert!(kept.is_some_and(|n| n < WORKFLOW_OUTPUT_CAP + 100), "{kept:?}");
+        }).unwrap();
+        assert!(call.output.len() < WORKFLOW_OUTPUT_CAP, "{}", call.output.len());
+        let v: Value = serde_json::from_str(&call.output).unwrap();
+        assert_eq!(v["exit_code"], 1);
+        assert_eq!(call.phase, "失敗");
+        assert_eq!(t.tool_log.back().unwrap().phase, "失敗");
         t.exited("", "wf-review", "killed");
         t.exited("", "wf-1", "完成");
         // Only the workflow is pruned as a workflow.

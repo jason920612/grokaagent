@@ -451,6 +451,19 @@ impl Transcript {
     /// The spawn call for `child` (a child agent, or a workflow run) is
     /// over: its process or run ended. Its row says how, instead of the
     /// "started" it said when the call returned.
+    /// Shorten a finished call's stored output to about `cap` bytes. JSON
+    /// keeps its shape (only long strings are cut), so whatever reads the
+    /// stored output later (the expanded row) still can.
+    pub fn clip_output(&mut self, call_id: &str, cap: usize) {
+        for r in self.rows.iter_mut().rev() {
+            let Row::Tools(g) = r else { continue };
+            if let Some(c) = g.calls.iter_mut().rev().find(|c| c.call_id == call_id) {
+                c.output = clip_text(&c.output, cap);
+                return;
+            }
+        }
+    }
+
     /// Returns the call's id and its new phase.
     pub fn mark_spawn_done(&mut self, child: &str, detail: &str) -> Option<(String, &'static str)> {
         // The hub's details, then the nursery's ("process exited (…)",
@@ -531,6 +544,36 @@ impl Transcript {
     /// Only meta rows so far (a blank draft).
     pub fn is_blank(&self) -> bool {
         self.rows.iter().all(|r| matches!(r, Row::Meta(_)))
+    }
+}
+
+/// `text` cut to about `cap` bytes; JSON keeps its shape, with each long
+/// string cut instead.
+fn clip_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    fn cut(s: &str, cap: usize) -> String {
+        let mut end = cap.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n…(cut {} bytes)", &s[..end], s.len() - end)
+    }
+    fn walk(v: &mut Value, each: usize) {
+        match v {
+            Value::String(s) if s.len() > each => *s = cut(s, each),
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, each)),
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, each)),
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut v) => {
+            walk(&mut v, cap / 2);
+            v.to_string()
+        }
+        Err(_) => cut(text, cap),
     }
 }
 
