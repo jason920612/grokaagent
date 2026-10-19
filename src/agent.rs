@@ -564,6 +564,9 @@ fn tell_blind(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, model: &str, 
     );
 }
 
+/// How often a held run without an inbox re-checks its hold.
+const HOLD_TICK: Duration = Duration::from_millis(250);
+
 /// Whether background work keeps this run alive past its inbox.
 fn held(cfg: &RunConfig) -> bool {
     cfg.hold.as_ref().is_some_and(|h| h())
@@ -584,9 +587,11 @@ fn accepted_result(output: &str) -> Option<String> {
 /// Esc while paused is ignored so it cannot cancel the next turn.
 async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
     loop {
-        // Without an inbox only held background work can still speak.
+        // Without an inbox only held background work can still speak. A
+        // notice it queued just before letting go is still news.
         if cfg.inbox.is_none() && !(held(cfg) && cfg.bg_notify.is_some()) {
-            return None;
+            let late = drain_session(cfg);
+            return (!late.is_empty()).then_some(late);
         }
         if let Some(c) = &cfg.cancel {
             c.take();
@@ -626,6 +631,9 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
                 msgs.extend(drain_session(cfg));
                 return Some(msgs);
             }
+            // A hold can end without a message (a workflow stopped on
+            // request sends none): look again now and then.
+            _ = tokio::time::sleep(HOLD_TICK), if cfg.inbox.is_none() && cfg.hold.is_some() => {}
             _ = wait_if_cancel(&cfg.cancel) => {
                 if let Some(c) = &cfg.cancel {
                     c.take();
@@ -772,6 +780,11 @@ async fn wait_for_input<P: Provider>(
             append_user(history, pending, msg, &cfg.workspace);
         }
         let users = user_texts(&msgs);
+        if let Some(hook) = &cfg.on_user_turn {
+            for t in &users {
+                hook(t);
+            }
+        }
         if let Some(instr) = task_idle(cfg, provider, sink, run_id, history, last_text, &users).await {
             append_user(history, pending, &UserTurn::from(instr), &cfg.workspace);
             return Some(woke);
@@ -1685,6 +1698,14 @@ pub async fn run<P: Provider + Clone + 'static>(
             Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls, &repeat_ctx) {
                 None => r,
                 Some(trip) => {
+                    // The dropped reply was billed all the same.
+                    sink.emit(&AgentEvent::UsageReported {
+                        meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                        kind: "loop".into(),
+                        input_tokens: r.usage.input_tokens,
+                        cached_tokens: r.usage.cached_tokens,
+                        output_tokens: r.usage.output_tokens,
+                    });
                     handle_loop(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
                     continue;
                 }
@@ -1994,8 +2015,9 @@ pub async fn run<P: Provider + Clone + 'static>(
             continue;
         }
 
-        if cfg.inbox.is_none() && held(&cfg) {
-            // Headless: a pending workflow's notice is the next message.
+        if cfg.inbox.is_none() && cfg.hold.is_some() {
+            // Headless: a pending workflow's notice is the next message
+            // (wait_session also picks up one that just arrived).
             if let Some(msgs) = wait_session(&mut cfg).await {
                 note_user_turns(&cfg, &msgs);
                 for msg in msgs {
@@ -3157,6 +3179,65 @@ mod tests {
         assert_eq!(provider.calls.lock().unwrap().len(), 2);
         // The first prompt counts as the user's; the notice does not.
         assert_eq!(seen.lock().unwrap().as_slice(), ["go"]);
+    }
+
+    #[tokio::test]
+    async fn a_hold_that_lets_go_without_a_message_still_ends_the_run() {
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![CompleteResponse { text: "stopped it".into(), ..CompleteResponse::new("1") }])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (_tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut c = cfg("go", 0);
+        c.bg_notify = Some(rx);
+        let flag = pending.clone();
+        c.hold = Some(Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        let out = tokio::time::timeout(Duration::from_secs(3), run(&provider, &tools, &rec, c))
+            .await
+            .expect("the run must notice the hold let go")
+            .unwrap();
+        assert_eq!(out.text, "stopped it");
+    }
+
+    #[tokio::test]
+    async fn every_message_the_user_sends_reaches_the_user_turn_hook() {
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse { text: "one".into(), ..CompleteResponse::new("1") },
+                CompleteResponse { text: "two".into(), ..CompleteResponse::new("2") },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (tx, inbox) = mpsc::unbounded_channel::<UserTurn>();
+        let mut c = cfg("go +100k", 0);
+        c.inbox = Some(inbox);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        c.on_user_turn = Some(Arc::new(move |t: &str| log.lock().unwrap().push(t.to_string())));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(UserTurn::from("next +2m"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(tx);
+        });
+        tokio::time::timeout(Duration::from_secs(5), run(&provider, &tools, &rec, c))
+            .await
+            .expect("the session ends when its inbox closes")
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["go +100k", "next +2m"]);
     }
 
     #[tokio::test]

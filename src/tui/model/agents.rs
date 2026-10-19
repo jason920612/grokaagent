@@ -17,6 +17,11 @@ use super::transcript::Transcript;
 const TOOL_LOG_CAP: usize = 400;
 const EVENT_LOG_CAP: usize = 400;
 const AGENT_ROWS_CAP: usize = 1_500;
+/// Rows each workflow agent keeps, and how much of a tool output.
+const WORKFLOW_ROWS_CAP: usize = 300;
+const WORKFLOW_OUTPUT_CAP: usize = 4_000;
+/// The model a workflow hub reports for a run's node.
+pub(crate) const WORKFLOW_MODEL: &str = "workflow";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AgentState {
@@ -206,10 +211,26 @@ impl AgentTree {
         self.nodes.iter_mut().find(|a| a.path == path)
     }
 
+    /// Whether `path` is a workflow run's node or one of its agents (the
+    /// hub reports a run's node with model `workflow`).
+    pub fn in_workflow(&self, path: &str) -> bool {
+        let root = path.split('/').next().unwrap_or(path);
+        self.get(root).is_some_and(|a| a.model == WORKFLOW_MODEL)
+    }
+
+    /// Working agents that Esc can interrupt: workflows do not stop on Esc.
+    pub fn interruptible_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|a| a.state.live() && !self.in_workflow(&a.path))
+            .count()
+    }
+
     pub fn ensure(&mut self, path: &str) -> &mut AgentNode {
         if let Some(i) = self.nodes.iter().position(|a| a.path == path) {
             return &mut self.nodes[i];
         }
+        let short = path.contains('/') && self.in_workflow(path);
         let at = match path.rsplit_once('/') {
             Some((parent, _)) => {
                 let prefix = format!("{parent}/");
@@ -221,7 +242,12 @@ impl AgentTree {
             }
             None => self.nodes.len(),
         };
-        self.nodes.insert(at, AgentNode::new(path));
+        let mut node = AgentNode::new(path);
+        if short {
+            // A workflow can have dozens of agents: keep each one's log short.
+            node.transcript = Transcript::new(Vec::new()).with_cap(WORKFLOW_ROWS_CAP);
+        }
+        self.nodes.insert(at, node);
         &mut self.nodes[at]
     }
 
@@ -275,6 +301,14 @@ impl AgentTree {
             t.done = true;
             t.ms = t.started.elapsed().as_millis() as u64;
             t.phase = tool_phase(name, output).into();
+        }
+    }
+
+    /// A call in the tool timeline changed its outcome after it returned
+    /// (a workflow or a child it started has ended).
+    pub fn set_tool_phase(&mut self, path: &str, call_id: &str, phase: &str) {
+        if let Some(t) = self.tool_log.iter_mut().rev().find(|t| t.path == path && t.call_id == call_id) {
+            t.phase = phase.to_string();
         }
     }
 
@@ -356,6 +390,26 @@ impl AgentTree {
         if path.is_empty() || path == "root" {
             return false;
         }
+        // A workflow agent's full outputs stay in its own log file; the tree
+        // (saved with the session) keeps a cut.
+        let clipped;
+        let ev = match ev {
+            AgentEvent::ToolFinished { output, .. } if output.len() > WORKFLOW_OUTPUT_CAP && self.in_workflow(&path) => {
+                let mut e = ev.clone();
+                if let AgentEvent::ToolFinished { output, .. } = &mut e {
+                    let mut end = WORKFLOW_OUTPUT_CAP;
+                    while !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let cut = output.len() - end;
+                    output.truncate(end);
+                    output.push_str(&format!("\n…(cut {cut} bytes)"));
+                }
+                clipped = e;
+                &clipped
+            }
+            _ => ev,
+        };
         match ev {
             AgentEvent::ChildSpawned {
                 name, prompt, model, ..
@@ -448,13 +502,13 @@ impl AgentTree {
         settle
     }
 
-    /// Drop the oldest finished workflow subtrees (top-level `wf-…` nodes)
+    /// Drop the oldest finished workflow subtrees (top-level workflow nodes)
     /// beyond the newest `keep`. Returns the paths removed.
     pub fn prune_workflows(&mut self, keep: usize) -> Vec<String> {
         let finished: Vec<String> = self
             .nodes
             .iter()
-            .filter(|a| a.path.starts_with("wf-") && !a.path.contains('/') && !a.alive())
+            .filter(|a| a.model == WORKFLOW_MODEL && !a.path.contains('/') && !a.alive())
             .map(|a| a.path.clone())
             .collect();
         let excess = finished.len().saturating_sub(keep);
@@ -537,6 +591,37 @@ mod tests {
         assert_eq!(gone, ["wf-1", "wf-1/find-1"]);
         let paths: Vec<&str> = t.nodes.iter().map(|a| a.path.as_str()).collect();
         assert_eq!(paths, ["wf-2", "wf-2/find-1", "wf-3", "wf-3/find-1"]);
+    }
+
+    #[test]
+    fn workflow_agents_do_not_count_for_esc_and_keep_short_logs() {
+        let mut t = AgentTree::default();
+        t.spawned("", "wf-1", "x — y", WORKFLOW_MODEL);
+        t.apply_relayed(&AgentEvent::RunStarted { meta: m("wf-1", "root"), model: "workflow".into() });
+        t.apply_relayed(&AgentEvent::ChildSpawned {
+            meta: m("wf-1", "root"),
+            name: "read-1".into(),
+            agent_card_url: String::new(),
+            prompt: "look".into(),
+            model: "grok-4.6".into(),
+        });
+        // A spawn_agent child that happens to be named wf-… is a child.
+        t.spawned("", "wf-review", "review", "grok-4.6");
+        assert!(t.in_workflow("wf-1/read-1") && !t.in_workflow("wf-review"));
+        assert_eq!(t.interruptible_count(), 1);
+        let big = "x".repeat(WORKFLOW_OUTPUT_CAP * 3);
+        t.apply_relayed(&AgentEvent::ToolStarted { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "read_file".into(), args: json!({}), kind: "client".into() });
+        t.apply_relayed(&AgentEvent::ToolFinished { meta: m("wf-1/read-1", "a"), call_id: "c".into(), name: "read_file".into(), output: big });
+        let kept = t.get("wf-1/read-1").unwrap().transcript.rows.iter().find_map(|r| match r {
+            Row::Tools(g) => g.calls.first().map(|c| c.output.len()),
+            _ => None,
+        });
+        assert!(kept.is_some_and(|n| n < WORKFLOW_OUTPUT_CAP + 100), "{kept:?}");
+        t.exited("", "wf-review", "killed");
+        t.exited("", "wf-1", "完成");
+        // Only the workflow is pruned as a workflow.
+        assert_eq!(t.prune_workflows(0), ["wf-1", "wf-1/read-1"]);
+        assert!(t.get("wf-review").is_some());
     }
 
     fn m(path: &str, run: &str) -> EventMeta {

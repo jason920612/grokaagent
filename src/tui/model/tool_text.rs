@@ -109,7 +109,7 @@ pub(crate) fn tool_subject(name: &str, args: &Value) -> String {
             } else if !arg(args, "script_path").is_empty() {
                 arg(args, "script_path").to_string()
             } else if let Some(script) = args.get("script").and_then(Value::as_str) {
-                crate::workflow::engine::parse(script).map(|s| s.meta.name).unwrap_or_default()
+                crate::workflow::engine::peek_name(script).unwrap_or_default()
             } else {
                 "列表".into()
             }

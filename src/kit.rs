@@ -119,6 +119,29 @@ pub async fn run_with_nursery<P: Provider + Clone + 'static>(
         // here on its way out: count it toward the turn's token target.
         tee = Arc::new(crate::workflow::BudgetSink { inner: tee, budget: budget.clone() });
     }
+    // Calls that are not agent turns (folds, the proxy, the reviewer) report
+    // their tokens as events too, for the token budget.
+    let usage_sink = tee.clone();
+    let (usage_name, usage_run, usage_parent) = (spec.agent_name.clone(), run_id.clone(), spec.parent_run_id.clone());
+    let metered = crate::provider::Metered {
+        inner: provider.clone(),
+        report: Arc::new(move |u: &crate::provider::CacheUsage| {
+            usage_sink.emit(&crate::events::AgentEvent::UsageReported {
+                meta: crate::events::EventMeta {
+                    ts: chrono::Utc::now(),
+                    agent_name: usage_name.clone(),
+                    run_id: usage_run.clone(),
+                    parent_run_id: usage_parent.clone(),
+                    path: String::new(),
+                },
+                kind: "call".into(),
+                input_tokens: u.input_tokens,
+                cached_tokens: u.cached_tokens,
+                output_tokens: u.output_tokens,
+            });
+        }),
+    };
+    let provider = &metered;
     let guard: Arc<dyn CommandReviewer> = Arc::new(ProviderGuard::new(
         provider.clone(),
         spec.model.clone(),

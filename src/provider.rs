@@ -241,6 +241,43 @@ impl<T: Provider> Provider for std::sync::Arc<T> {
     }
 }
 
+/// A provider that reports the usage of every non-streaming call (folds,
+/// the user proxy, the command reviewer: the calls that are not agent
+/// turns, which stream and report their own usage).
+#[derive(Clone)]
+pub struct Metered<P> {
+    pub inner: P,
+    pub report: std::sync::Arc<dyn Fn(&CacheUsage) + Send + Sync>,
+}
+
+impl<P: Provider> Provider for Metered<P> {
+    async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse> {
+        let r = self.inner.complete(req).await;
+        if let Ok(resp) = &r {
+            (self.report)(&resp.usage);
+        }
+        r
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        req: CompleteRequest,
+        on_text: &'a (dyn Fn(&str) + Send + Sync),
+        on_server: &'a (dyn Fn(&str, &Value) + Send + Sync),
+        on_reasoning: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> impl std::future::Future<Output = Result<CompleteResponse>> + Send + 'a {
+        self.inner.complete_stream(req, on_text, on_server, on_reasoning)
+    }
+
+    fn compact(&self, req: CompactRequest) -> impl std::future::Future<Output = Result<CompactResponse>> + Send {
+        self.inner.compact(req)
+    }
+
+    fn sees_images(&self, model: &str) -> bool {
+        self.inner.sees_images(model)
+    }
+}
+
 #[derive(Clone)]
 pub struct XaiOauthProvider {
     auth_path: PathBuf,

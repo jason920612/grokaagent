@@ -316,6 +316,19 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
                 app.ui.hits.push((r, field_hit(Field::WorkflowSize)));
             } else {
                 line(f, Rect::new(cx, y, room, 1), "主代理只規劃、指揮子代理", Style::default().fg(DIM));
+                // Too narrow to share the row: the workflow settings get
+                // their own, so a focused field is always on screen.
+                if y + 1 < bottom {
+                    y += 1;
+                    line(f, Rect::new(x, y, LABEL_W, 1), "Ultracode", focus_style(foc_u));
+                    toggle(f, app, ctl_x, y, app.opts.ultracode, foc_u, Hit::SetToggle(4));
+                    let sx = ctl_x + 7;
+                    let w = (ctl_x + ctl_w).saturating_sub(sx);
+                    let r = Rect::new(sx, y, w.min(display_cols(app.opts.workflow_size.short()) + 8), 1);
+                    let style = if foc_s { Style::default().fg(ACCENT).bg(COMPOSER) } else { Style::default().fg(DIM).bg(COMPOSER) };
+                    line(f, r, &format!(" 規模‹{}› ", app.opts.workflow_size.short()), style);
+                    app.ui.hits.push((r, field_hit(Field::WorkflowSize)));
+                }
             }
         }
         y += 1;

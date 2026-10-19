@@ -30,6 +30,11 @@ pub const AGENT_MAX_TURNS: u32 = 150;
 const SCHEMA_NUDGES: u32 = 2;
 const POLL: Duration = Duration::from_millis(200);
 const TAIL_TICK: Duration = Duration::from_millis(60);
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// After its task, an agent gets this long to shut down cleanly (its
+/// background processes and running commands stopped) once its lifeline
+/// closes, before its process group is killed.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// What every agent of a hub shares.
 pub struct PoolEnv {
@@ -100,7 +105,7 @@ pub async fn run_agent(env: &PoolEnv, job: AgentJob, mut stop: watch::Receiver<b
     let mut kept = None;
     let (workspace, worktree) = if job.worktree {
         match add_worktree(&env.workspace, &job.node, &job.seg).await {
-            Ok(wt) => (wt.clone(), Some(wt)),
+            Ok(wt) => (wt.workspace.clone(), Some(wt)),
             Err(e) => {
                 return AgentReport {
                     end: AgentEnd::Failed(format!("isolation: worktree: {e}")),
@@ -124,12 +129,15 @@ pub async fn run_agent(env: &PoolEnv, job: AgentJob, mut stop: watch::Receiver<b
         detail,
     });
     if let Some(wt) = worktree {
-        match finish_worktree(&env.workspace, &wt).await {
-            Some(branch) => {
-                note(env, &job.node, format!("{} 的 worktree 有變更，保留在 {} （分支 {branch}）", job.seg, wt.display()));
-                kept = Some(format!("{} (branch {branch})", wt.display()));
+        if let Some(k) = finish_worktree(&env.workspace, &wt).await {
+            let root = wt.root.display();
+            if k.committed {
+                note(env, &job.node, format!("{} 的 worktree 有變更：保留在 {root}，分支 {}（變更已提交）", job.seg, k.branch));
+                kept = Some(format!("{root} (branch {}, changes committed)", k.branch));
+            } else {
+                note(env, &job.node, format!("{} 的 worktree 有變更：保留在 {root}，分支 {}；提交失敗，變更未提交，留在 worktree 裡", job.seg, k.branch));
+                kept = Some(format!("{root} (branch {}; the commit failed, changes are uncommitted in the worktree)", k.branch));
             }
-            None => {}
         }
     }
     AgentReport {
@@ -292,12 +300,20 @@ async fn run_in(
             Err(problem) => break AgentEnd::Failed(format!("no valid structured result: {problem}")),
         }
     };
-    let _ = guard.kill().await;
+    finish_process(&mut guard).await;
     // Let the tailer read the last lines before it stops.
     tokio::time::sleep(TAIL_TICK * 2).await;
     let _ = tail_stop.send(());
     let _ = tail.await;
     end
+}
+
+/// End a worker: close its lifeline so it shuts its session down (and with
+/// it the processes its tools started), then kill whatever is left.
+async fn finish_process(guard: &mut ProcessGuard) {
+    drop(guard.child_mut().stdin.take());
+    let _ = tokio::time::timeout(EXIT_GRACE, guard.child_mut().wait()).await;
+    let _ = guard.kill().await;
 }
 
 /// The result for a schema call: the `submit_result` arguments the worker
@@ -394,6 +410,12 @@ async fn relay(
             cached_tokens,
             output_tokens,
             ..
+        }
+        | AgentEvent::UsageReported {
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            ..
         } = &ev
         {
             let usage = CacheUsage {
@@ -417,46 +439,89 @@ async fn relay(
     }
 }
 
-/// `git worktree add --detach` at HEAD under `.groka/worktrees/`.
-async fn add_worktree(workspace: &Path, node: &str, seg: &str) -> Result<PathBuf, String> {
-    let root = crate::vision::groka_dir(workspace, "worktrees").map_err(|e| e.to_string())?;
-    let path = root.join(format!("{node}-{seg}"));
-    let out = git(workspace, &["worktree", "add", "--detach", &path.to_string_lossy(), "HEAD"]).await?;
-    if !out.0 {
-        return Err(format!("git worktree add failed: {}", out.1.trim()));
-    }
-    Ok(path)
+/// An agent's own checkout.
+struct Worktree {
+    /// The worktree's root (what git commands run in).
+    root: PathBuf,
+    /// The agent's workspace in it: the same subfolder of the repository
+    /// as the main workspace.
+    workspace: PathBuf,
+    /// The commit it was created at.
+    base: String,
 }
 
-/// Remove an unchanged worktree. One with changes is kept, on a new branch
-/// (with its work committed) so it is easy to find and merge; returns that
-/// branch.
-async fn finish_worktree(workspace: &Path, wt: &Path) -> Option<String> {
-    let status = git(wt, &["status", "--porcelain"]).await.ok()?;
-    let head = git(wt, &["rev-parse", "HEAD"]).await.ok()?;
-    let base = git(workspace, &["rev-parse", "HEAD"]).await.ok()?;
-    let changed = !status.1.trim().is_empty() || head.1.trim() != base.1.trim();
-    if !changed {
-        let _ = git(workspace, &["worktree", "remove", "--force", &wt.to_string_lossy()]).await;
+/// `git worktree add --detach` at the current commit, under
+/// `.groka/worktrees/`.
+async fn add_worktree(workspace: &Path, node: &str, seg: &str) -> Result<Worktree, String> {
+    let (ok, base) = git(workspace, &["rev-parse", "HEAD"]).await?;
+    if !ok {
+        return Err(format!("the workspace is not a git repository with a commit: {}", base.trim()));
+    }
+    let base = base.trim().to_string();
+    let (_, prefix) = git(workspace, &["rev-parse", "--show-prefix"]).await?;
+    let root = crate::vision::groka_dir(workspace, "worktrees").map_err(|e| e.to_string())?;
+    let path = root.join(format!("{node}-{seg}"));
+    let (ok, out) = git(workspace, &["worktree", "add", "--detach", &path.to_string_lossy(), &base]).await?;
+    if !ok {
+        return Err(format!("git worktree add failed: {}", out.trim()));
+    }
+    let prefix = prefix.trim().trim_end_matches('/');
+    let agent_ws = if prefix.is_empty() { path.clone() } else { path.join(prefix) };
+    Ok(Worktree {
+        root: path,
+        workspace: agent_ws,
+        base,
+    })
+}
+
+struct Kept {
+    branch: String,
+    /// Its changes are committed on the branch (a hook or signing can
+    /// refuse the commit: then they stay uncommitted in the worktree).
+    committed: bool,
+}
+
+/// Remove an unchanged worktree. One with changes is kept on a new branch
+/// with its work committed, so it is easy to find and merge.
+async fn finish_worktree(workspace: &Path, wt: &Worktree) -> Option<Kept> {
+    let (_, status) = git(&wt.root, &["status", "--porcelain"]).await.ok()?;
+    let (_, head) = git(&wt.root, &["rev-parse", "HEAD"]).await.ok()?;
+    let dirty = !status.trim().is_empty();
+    if !dirty && head.trim() == wt.base {
+        let _ = git(workspace, &["worktree", "remove", "--force", &wt.root.to_string_lossy()]).await;
         return None;
     }
-    let name = wt.file_name()?.to_string_lossy().to_string();
+    let name = wt.root.file_name()?.to_string_lossy().to_string();
     let branch = format!("groka-workflow/{name}");
-    let _ = git(wt, &["checkout", "-B", &branch]).await;
-    if !status.1.trim().is_empty() {
-        let _ = git(wt, &["add", "-A"]).await;
-        let _ = git(wt, &["-c", "user.name=grokaagent", "-c", "user.email=grokaagent@localhost", "commit", "-qm", &format!("workflow agent {name}")]).await;
+    let _ = git(&wt.root, &["checkout", "-B", &branch]).await;
+    let mut committed = true;
+    if dirty {
+        let _ = git(&wt.root, &["add", "-A"]).await;
+        // The agent's work, as it left it: no hooks, no signing prompt.
+        let msg = format!("workflow agent {name}");
+        committed = matches!(
+            git(
+                &wt.root,
+                &["-c", "user.name=grokaagent", "-c", "user.email=grokaagent@localhost", "-c", "commit.gpgsign=false", "commit", "--no-verify", "-qm", &msg],
+            )
+            .await,
+            Ok((true, _))
+        );
     }
-    Some(branch)
+    Some(Kept { branch, committed })
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<(bool, String), String> {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| format!("git {} timed out", args.first().unwrap_or(&"")))?
         .map_err(|e| format!("git: {e}"))?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
@@ -469,6 +534,51 @@ async fn git(dir: &Path, args: &[&str]) -> Result<(bool, String), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn sh(dir: &Path, args: &[&str]) {
+        let (ok, out) = git(dir, args).await.unwrap();
+        assert!(ok, "git {args:?}: {out}");
+    }
+
+    #[tokio::test]
+    async fn worktrees_follow_the_workspace_subfolder_and_their_own_base() {
+        let repo = tempfile::tempdir().unwrap();
+        // Not canonicalized: a verbatim (\\?\) Windows path is not one git takes.
+        let root = repo.path().to_path_buf();
+        let app = root.join("app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(app.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        sh(&root, &["init", "-q"]).await;
+        sh(&root, &["add", "-A"]).await;
+        let who = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"];
+        sh(&root, &[&who[..], &["commit", "-qm", "one"]].concat()).await;
+        // A hook that refuses every commit: the agent's work is still kept.
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(hooks.join("pre-commit"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let quiet = add_worktree(&app, "wf-1", "read-1").await.unwrap();
+        assert!(quiet.workspace.join("src/lib.rs").is_file(), "the agent works in the same subfolder");
+        // The main workspace moves on meanwhile: an untouched worktree still goes.
+        std::fs::write(app.join("b.txt"), "b").unwrap();
+        sh(&root, &["add", "-A"]).await;
+        sh(&root, &[&who[..], &["commit", "--no-verify", "-qm", "two"]].concat()).await;
+        assert!(finish_worktree(&app, &quiet).await.is_none());
+        assert!(!quiet.root.exists());
+
+        let busy = add_worktree(&app, "wf-1", "edit-2").await.unwrap();
+        std::fs::write(busy.workspace.join("src/lib.rs"), "fn b() {}\n").unwrap();
+        let kept = finish_worktree(&app, &busy).await.unwrap();
+        assert!(kept.committed);
+        assert_eq!(kept.branch, "groka-workflow/wf-1-edit-2");
+        let (_, shown) = git(&root, &["show", &format!("{}:app/src/lib.rs", kept.branch)]).await.unwrap();
+        assert_eq!(shown, "fn b() {}\n");
+    }
 
     #[test]
     fn structured_results_come_from_json_text_and_must_fit() {

@@ -191,6 +191,12 @@ impl EventSink for BudgetSink {
             cached_tokens,
             output_tokens,
             ..
+        }
+        | AgentEvent::UsageReported {
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            ..
         } = event
         {
             self.budget.add(

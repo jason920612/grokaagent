@@ -23,7 +23,7 @@
 | 續跑 | 每個 run 在 `.groka/workflow-runs/<id>/` 留 `script.js`、`journal.jsonl`、`result.json`、`agents/*.jsonl`。`resume_from_run_id` 以「內容雜湊 + 第幾次出現」對應已完成的呼叫 | `pipeline` 讓呼叫的發出順序取決於誰先跑完，用位置對應不穩定；上游結果變了，下游 prompt 跟著變而重跑 |
 | 可重播 | `Date.now()`、無參數的 `new Date()`、`Math.random()` 會丟錯 | 否則續跑時腳本走不同路徑 |
 | 隔離 | `isolation: 'worktree'` → `git worktree add --detach HEAD` 到 `.groka/worktrees/`；沒變更就移除，有變更就留在 `groka-workflow/<名稱>` 分支 | 平行寫入同一工作區會互相覆蓋 |
-| Token 預算 | 使用者訊息裡的 `+500k`／`+2m` 設定本回合目標；計算 output tokens + 沒命中快取的 input tokens，主代理、子代理、工作流程代理共用；用完後 `agent()` 丟錯 | 使用者決定的計算方式；Grok 訂閱與按量計費的端點都適用 |
+| Token 預算 | 使用者訊息裡的 `+500k`／`+2m` 設定本回合目標；計算每次模型呼叫（回合、上下文摺疊、審查）的 output tokens + 沒命中快取的 input tokens，主代理、子代理、工作流程代理共用；用完後 `agent()` 丟錯、不再啟動新代理，已在工作的代理會做完（可能超出）；使用者的下一則訊息開始新回合，目標換成它的（或沒有） | 使用者決定的計算方式；Grok 訂閱與按量計費的端點都適用 |
 | 何時使用 | 只在使用者選擇時：訊息含「ultracode」、ultracode 模式開啟、使用者明說要工作流程／多代理編排、或指名已存的工作流程 | 與 Claude Code 相同；工作流程很耗資源 |
 | 已存的工作流程 | `.groka/workflows/<name>.js`（專案）與 `~/.grokaagent/workflows/<name>.js`（個人）；`workflow({name})` 或腳本內 `workflow(name, args)`（巢狀一層） | |
 

@@ -438,14 +438,6 @@ async fn real_main() -> grokaagent::Result<()> {
             lifeline,
             api,
         }) => {
-            if lifeline {
-                std::thread::spawn(|| {
-                    let mut sink = [0u8; 256];
-                    let mut stdin = io::stdin();
-                    while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
-                    std::process::exit(0);
-                });
-            }
             let result_schema = match result_schema {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path)?;
@@ -471,7 +463,7 @@ async fn real_main() -> grokaagent::Result<()> {
                 reasoning_effort: reasoning,
                 search,
                 result_schema,
-            })
+            }, lifeline)
             .await?;
         }
     }

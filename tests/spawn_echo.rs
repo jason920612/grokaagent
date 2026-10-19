@@ -207,3 +207,44 @@ fn a_lifeline_worker_exits_when_its_parent_lets_go() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[tokio::test]
+async fn a_lifeline_worker_ends_its_session_and_exits() {
+    let bin = env!("CARGO_BIN_EXE_grokaagent");
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(bin)
+        .args([
+            "worker",
+            "--name",
+            "busy",
+            "--mode",
+            "echo",
+            "--listen",
+            "127.0.0.1:0",
+            "--lifeline",
+            "--events",
+            dir.path().join("w.jsonl").to_str().unwrap(),
+            "--workspace",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(child.stdout.take().unwrap()));
+    let line = lines.next_line().await.unwrap().unwrap();
+    let origin = Handshake::parse_line(&line).unwrap().origin().unwrap();
+    let client = A2aClient::new().unwrap();
+    let task = client.send_text(&origin, "hello", None).await.unwrap();
+    let done = client.wait_task(&origin, task, Duration::from_secs(10)).await.unwrap();
+    assert_eq!(a2a::artifact_text(&done), "echo:hello");
+    // With a live session, closing the lifeline still ends the worker.
+    drop(child.stdin.take());
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("the worker must exit once its lifeline closes")
+        .unwrap();
+    assert!(status.success(), "{status}");
+}

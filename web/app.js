@@ -812,7 +812,11 @@
         box.append(b);
       });
     }
-    const liveAgents = logs.agents.some((a) => a.state === "working" || a.state === "starting");
+    // Workflows do not stop on Esc: their nodes do not count here.
+    const workflows = new Set(logs.agents.filter((a) => a.model === "workflow" && a.depth === 0).map((a) => a.path));
+    const liveAgents = logs.agents.some(
+      (a) => (a.state === "working" || a.state === "starting") && !workflows.has(a.path.split("/")[0])
+    );
     $("interrupt").classList.toggle("hidden", !snap.header.running && !liveAgents);
     $("interrupt").textContent = snap.header.running ? "停止目前工作" : "中斷子代理";
     $("mode-queue").classList.toggle("on", sendMode !== "insert");

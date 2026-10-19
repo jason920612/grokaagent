@@ -448,11 +448,21 @@ impl Transcript {
         true
     }
 
-    /// Mark the spawn call for `child` done (its child process ended).
-    pub fn mark_spawn_done(&mut self, child: &str) {
+    /// The spawn call for `child` (a child agent, or a workflow run) is
+    /// over: its process or run ended. Its row says how, instead of the
+    /// "started" it said when the call returned.
+    /// Returns the call's id and its new phase.
+    pub fn mark_spawn_done(&mut self, child: &str, detail: &str) -> Option<(String, &'static str)> {
+        let phase = if detail.starts_with("失敗") {
+            "失敗"
+        } else if detail.starts_with("已停止") {
+            "已停止"
+        } else {
+            "完成"
+        };
         for r in self.rows.iter_mut().rev() {
             let Row::Tools(g) = r else { continue };
-            for c in g.calls.iter_mut().rev().filter(|c| (c.name == "spawn_agent" || c.name == "workflow") && !c.done) {
+            for c in g.calls.iter_mut().rev().filter(|c| c.name == "spawn_agent" || c.name == "workflow") {
                 let out = serde_json::from_str::<Value>(&c.output).ok();
                 let named = if c.name == "workflow" {
                     // A workflow's tree node is its run id.
@@ -465,12 +475,12 @@ impl Transcript {
                 };
                 if named {
                     c.done = true;
-                    c.phase = "完成".into();
-                    return;
+                    c.phase = phase.into();
+                    return Some((c.call_id.clone(), phase));
                 }
             }
-            return;
         }
+        None
     }
 
     /// Every file change: (row, call, path, kind).
@@ -514,6 +524,23 @@ impl Transcript {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_finished_workflow_flips_its_started_call() {
+        let mut t = Transcript::new(Vec::new());
+        t.tool_started("c1", "workflow", &serde_json::json!({"script": "x"}));
+        t.tool_finished("c1", "workflow", r#"{"run_id":"wf-1","status":"running"}"#);
+        t.tool_started("c2", "now", &serde_json::json!({}));
+        t.tool_finished("c2", "now", "{}");
+        assert_eq!(t.mark_spawn_done("wf-1", "失敗：boom"), Some(("c1".to_string(), "失敗")));
+        let phase = t.rows.iter().find_map(|r| match r {
+            Row::Tools(g) => g.calls.iter().find(|c| c.call_id == "c1").map(|c| c.phase.clone()),
+            _ => None,
+        });
+        assert_eq!(phase.as_deref(), Some("失敗"));
+        assert_eq!(t.mark_spawn_done("wf-2", "完成"), None);
+    }
+
     use super::*;
     use crate::events::EventMeta;
     use serde_json::json;

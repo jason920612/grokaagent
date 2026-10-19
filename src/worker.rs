@@ -90,6 +90,8 @@ struct WorkerState {
     book: Arc<Mutex<Book>>,
     interrupting: Arc<AtomicBool>,
     session: tokio::sync::Mutex<Option<Session>>,
+    /// A session task is running (cleared once its kernel has torn down).
+    live: Arc<AtomicBool>,
     sink: Arc<dyn EventSink>,
 }
 
@@ -110,6 +112,7 @@ pub struct BoundWorker {
     pub listener: TcpListener,
     pub handshake: Handshake,
     pub app: Router,
+    state: Arc<WorkerState>,
 }
 
 fn lock(book: &Mutex<Book>) -> std::sync::MutexGuard<'_, Book> {
@@ -225,6 +228,7 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
         book,
         interrupting,
         session: tokio::sync::Mutex::new(None),
+        live: Arc::new(AtomicBool::new(false)),
         sink,
     });
     let app = Router::new()
@@ -233,11 +237,12 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
         .route("/v1/message:send", post(message_send))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
-        .with_state(state);
+        .with_state(state.clone());
     Ok(BoundWorker {
         listener,
         handshake,
         app,
+        state,
     })
 }
 
@@ -248,14 +253,50 @@ pub async fn serve_worker(bound: BoundWorker) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
+/// How long a worker whose lifeline closed waits for its session to shut
+/// down (background processes, running commands) before it exits anyway.
+const LIFELINE_GRACE: Duration = Duration::from_secs(2);
+
+/// `lifeline`: stdin is a pipe the parent holds. When it closes (the parent
+/// is done with this worker, or died), the session is ended cleanly, so
+/// what its tools started stops too, and the process exits.
+pub async fn run_worker(cfg: WorkerConfig, lifeline: bool) -> Result<()> {
     let bound = bind_worker(cfg).await?;
     println!(
         "{}",
         serde_json::to_string(&bound.handshake).expect("handshake json")
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    serve_worker(bound).await
+    if !lifeline {
+        return serve_worker(bound).await;
+    }
+    let state = bound.state.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        while matches!(std::io::Read::read(&mut stdin, &mut sink), Ok(n) if n > 0) {}
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        r = serve_worker(bound) => r,
+        _ = rx => {
+            end_session(&state, LIFELINE_GRACE).await;
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Stop the session's turn and close its inbox, then wait (up to `grace`)
+/// for its kernel to tear down.
+async fn end_session(st: &WorkerState, grace: Duration) {
+    if let Some(s) = st.session.lock().await.take() {
+        s.cancel.trip();
+    }
+    let deadline = tokio::time::Instant::now() + grace;
+    while st.live.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn agent_card(State(st): State<Arc<WorkerState>>) -> Json<a2a::AgentCard> {
@@ -300,6 +341,7 @@ fn start_session(st: Arc<WorkerState>, prompt: String) -> Session {
         inbox: tx,
         cancel: cancel.clone(),
     };
+    st.live.store(true, Ordering::SeqCst);
     tokio::spawn(async move {
         let result = match st.mode {
             WorkerMode::Echo => run_session(&st, EchoProvider::from_env(), prompt, rx, cancel).await,
@@ -320,6 +362,7 @@ fn start_session(st: Arc<WorkerState>, prompt: String) -> Session {
         };
         finish_open(&mut lock(&st.book), done);
         *st.session.lock().await = None;
+        st.live.store(false, Ordering::SeqCst);
     });
     session
 }

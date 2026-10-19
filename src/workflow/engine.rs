@@ -24,6 +24,12 @@ pub const MAX_FAN_OUT: usize = 4096;
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const JS_STACK: usize = 4 * 1024 * 1024;
 const THREAD_STACK: usize = 16 * 1024 * 1024;
+const PARSE_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+const PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+/// After a stop, how long the script gets to end on its own before the
+/// engine is abandoned (a script waiting on a promise that never settles
+/// runs no code the interrupt could stop).
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhaseMeta {
@@ -89,11 +95,16 @@ pub fn parse(source: &str) -> Result<Script, String> {
         return Err("the script must begin with `export const meta = { name, description, ... }`".into());
     };
     let literal = &source[decl.literal.clone()];
+    if let Some(what) = not_literal(literal) {
+        return Err(format!("meta must be a pure literal (no variables, calls or interpolation): it contains {what}"));
+    }
     let rt = Runtime::new().map_err(|e| format!("script engine: {e}"))?;
+    // Parsing runs on the caller's thread (a tool call, a listing): bound it.
+    rt.set_memory_limit(PARSE_MEMORY_LIMIT);
+    let deadline = std::time::Instant::now() + PARSE_DEADLINE;
+    rt.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() > deadline)));
     let ctx = Context::full(&rt).map_err(|e| format!("script engine: {e}"))?;
     let meta_json = ctx.with(|ctx| -> Result<String, String> {
-        // Nothing the literal could call is defined: a non-literal fails here.
-        ctx.globals().set("Math", rquickjs::Undefined).ok();
         let v = ctx
             .eval::<rquickjs::Value, _>(format!("({literal})"))
             .catch(&ctx)
@@ -122,10 +133,52 @@ pub fn parse(source: &str) -> Result<Script, String> {
     Ok(Script { meta, body })
 }
 
-/// The body as an async function taking the script's globals, line 1 of
-/// the body on line 2 of the function.
+/// The body as an async function taking the script's globals. The body
+/// starts on the function's first line, so error line numbers are the
+/// script file's.
 fn wrap(body: &str) -> String {
-    format!("(async function __workflow_script__(args) {{\n{body}\n}})")
+    format!("(async function __workflow_script__(args) {{{body}\n}})")
+}
+
+/// The meta's `name`, read without running anything (for display).
+pub fn peek_name(source: &str) -> Option<String> {
+    let decl = find_meta(source.trim_start_matches('\u{feff}'))?;
+    let literal = &source.trim_start_matches('\u{feff}')[decl.literal];
+    let re = regex::Regex::new(r#"\bname\s*:\s*(?:"([^"\\]*)"|'([^'\\]*)'|`([^`\\$]*)`)"#).ok()?;
+    let c = re.captures(literal)?;
+    c.get(1).or(c.get(2)).or(c.get(3)).map(|m| m.as_str().to_string())
+}
+
+/// What makes a meta literal not a plain literal (a call, a function, an
+/// interpolation), if anything; strings and comments are skipped.
+fn not_literal(literal: &str) -> Option<&'static str> {
+    let code = code_mask(literal);
+    let b = literal.as_bytes();
+    let mut template = false;
+    for i in 0..b.len() {
+        if !code[i] {
+            // Inside a template literal (between unescaped backticks).
+            if b[i] == b'`' && (i == 0 || b[i - 1] != b'\\') {
+                template = !template;
+            } else if template && b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+                return Some("a template interpolation");
+            }
+            continue;
+        }
+        template = false;
+        match b[i] {
+            b'(' => return Some("a call or parenthesized expression"),
+            b'=' if b.get(i + 1) == Some(&b'>') => return Some("a function"),
+            _ => {}
+        }
+    }
+    let words = regex::Regex::new(r"\b(function|new|class|import|await|yield)\b").ok()?;
+    let plain: String = b
+        .iter()
+        .zip(&code)
+        .map(|(c, keep)| if *keep { *c as char } else { ' ' })
+        .collect();
+    words.is_match(&plain).then_some("a function or an expression")
 }
 
 struct MetaDecl {
@@ -135,16 +188,22 @@ struct MetaDecl {
     literal: std::ops::Range<usize>,
 }
 
-/// Where `export const meta = {...}` sits, skipping comments.
+/// Where `export const meta = {...}` sits: the first such declaration in
+/// code (not in a comment or a string).
 fn find_meta(src: &str) -> Option<MetaDecl> {
-    let re = regex::Regex::new(r"\bexport(\s+)const\s+meta\s*=\s*").ok()?;
-    let m = re.captures_iter(src).find(|c| {
-        let at = c.get(0).map_or(0, |m| m.start());
-        !in_comment(src, at)
+    let re = regex::Regex::new(r"^export(\s+)const\s+meta\s*=\s*").ok()?;
+    let code = code_mask(src);
+    let b = src.as_bytes();
+    let at = (0..b.len()).find(|&i| {
+        code[i]
+            && b[i] == b'e'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'))
+            && re.is_match(&src[i..])
     })?;
+    let m = re.captures(&src[at..])?;
     let whole = m.get(0)?;
-    let export = whole.start()..m.get(1)?.end();
-    let open = whole.end();
+    let export = at..at + m.get(1)?.end();
+    let open = at + whole.end();
     if !src[open..].starts_with('{') {
         return None;
     }
@@ -155,19 +214,48 @@ fn find_meta(src: &str) -> Option<MetaDecl> {
     })
 }
 
-/// Whether byte `at` is inside a `//` or `/* */` comment (strings are not
-/// tracked: good enough to skip a commented-out example of the header).
-fn in_comment(src: &str, at: usize) -> bool {
-    let before = &src[..at];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    if before[line_start..].contains("//") {
-        return true;
+/// For each byte: true where it is code, false inside a comment or a
+/// string / template literal (quotes included).
+fn code_mask(src: &str) -> Vec<bool> {
+    let b = src.as_bytes();
+    let mut mask = vec![true; b.len()];
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            q @ (b'"' | b'\'' | b'`') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        let end = (i + 1).min(b.len());
+        for m in &mut mask[start..end] {
+            *m = false;
+        }
+        i = end;
     }
-    match (before.rfind("/*"), before.rfind("*/")) {
-        (Some(open), Some(close)) => open > close,
-        (Some(_), None) => true,
-        _ => false,
-    }
+    mask
 }
 
 /// The index of the `}` that closes the `{` at `open`, skipping strings,
@@ -219,7 +307,6 @@ const PRELUDE: &str = r#"
 (function (h) {
   "use strict";
   const MAX = h.max;
-  const AsyncFunction = (async function () {}).constructor;
   const D = Date;
   const noClock = (what) => () => {
     throw new Error(what + " is unavailable in workflow scripts (it would break resume); pass timestamps in via args");
@@ -233,12 +320,23 @@ const PRELUDE: &str = r#"
   SafeDate.parse = D.parse;
   SafeDate.UTC = D.UTC;
   SafeDate.prototype = D.prototype;
+  Object.defineProperty(D.prototype, "constructor", { value: SafeDate, writable: true, configurable: true });
   globalThis.Date = SafeDate;
+  if (typeof globalThis.performance !== "undefined") {
+    globalThis.performance = Object.freeze({ now: noClock("performance.now()") });
+  }
   Math.random = () => {
     throw new Error("Math.random() is unavailable in workflow scripts (it would break resume); vary prompts by index instead");
   };
 
   const OPTION_KEYS = ["label", "phase", "schema", "model", "effort", "isolation", "agentType"];
+  // Any value as a log line: strings as they are, the rest as JSON (or
+  // String() for what JSON leaves out: undefined, functions).
+  const text = (v) => {
+    if (typeof v === "string") return v;
+    const s = JSON.stringify(v);
+    return s === undefined ? String(v) : s;
+  };
   function makeApi(group) {
     let current = null;
     async function agent(prompt, opts) {
@@ -259,11 +357,11 @@ const PRELUDE: &str = r#"
       return reply.value;
     }
     function phase(title) {
-      current = String(title);
+      current = text(title);
       h.phase(current, group);
     }
     function log(message) {
-      h.log(typeof message === "string" ? message : JSON.stringify(message), group);
+      h.log(text(message), group);
     }
     return { agent, phase, log };
   }
@@ -331,9 +429,12 @@ const PRELUDE: &str = r#"
     const loaded = JSON.parse(h.load(JSON.stringify(ref)));
     if ("throw" in loaded) throw new Error(loaded.throw);
     const api = makeApi(loaded.name);
-    const fn = new AsyncFunction("args", "agent", "phase", "log", "workflow", loaded.body);
+    // The API is an enclosing scope, not parameters, so the script may
+    // declare its own `log` or `phase` at its top level, as it can alone.
+    const make = new Function("agent", "phase", "log", "workflow", "return async function (args) {" + loaded.body + "\n}");
+    const fn = make(api.agent, api.phase, api.log, nestedWorkflow);
     h.log("workflow " + loaded.name + " started", "");
-    const result = await fn(childArgs, api.agent, api.phase, api.log, nestedWorkflow);
+    const result = await fn(childArgs);
     h.log("workflow " + loaded.name + " finished", "");
     return result;
   }
@@ -387,8 +488,7 @@ async fn run_async(body: String, args: Value, host: Arc<dyn Host>) -> Result<Val
     }
     let ctx = AsyncContext::full(&rt).await.map_err(|e| format!("script engine: {e}"))?;
     let args_json = args.to_string();
-    let out: Result<String, String> = ctx
-        .async_with(async |ctx| {
+    let js = ctx.async_with(async |ctx| -> Result<String, String> {
             let h = host_object(&ctx, host.clone()).map_err(|e| format!("script engine: {e}"))?;
             let install: Function = ctx
                 .eval(PRELUDE)
@@ -411,12 +511,27 @@ async fn run_async(body: String, args: Value, host: Arc<dyn Host>) -> Result<Val
                 .map_err(|e| format!("the script's return value is not JSON: {e}"))?
                 .map(|s| s.to_string().unwrap_or_else(|_| "null".into()))
                 .unwrap_or_else(|| "null".into()))
-        })
-        .await;
-    if stop.load(Ordering::SeqCst) || host.stopped() {
+        });
+    let watch = {
+        let host = host.clone();
+        async move {
+            while !host.stopped() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(STOP_GRACE).await;
+        }
+    };
+    // The interrupt ends a script that is running code; a script stuck
+    // waiting (a promise that never settles, or one QuickJS leaves pending
+    // when the interrupt lands inside a promise job) is abandoned instead.
+    let out = tokio::select! {
+        out = js => Some(out),
+        _ = watch => None,
+    };
+    if out.is_none() || stop.load(Ordering::SeqCst) || host.stopped() {
         return Err("stopped".into());
     }
-    let text = out?;
+    let text = out.unwrap_or_else(|| Err("stopped".into()))?;
     serde_json::from_str(&text).map_err(|e| format!("the script's return value is not JSON: {e}"))
 }
 
@@ -540,6 +655,9 @@ mod tests {
             (Some(25), self.spent.load(Ordering::SeqCst))
         }
         fn load(&self, reference: &Value) -> Result<Script, String> {
+            if reference == &json!("shadow") {
+                return parse(&format!("{HEAD}const log = 'mine'\nlet phase = 2\nconst agent = 3\nreturn [log, phase, agent]"));
+            }
             if reference == &json!("child") {
                 parse(&format!(
                     "{HEAD}phase('inner')\nconst r = await agent('child ' + args.n)\nreturn [r, await workflow('child').catch(e => e.message)]"
@@ -577,9 +695,13 @@ mod tests {
         assert!(parse("return 1").unwrap_err().contains("export const meta"));
         let e = parse("const n = 'x'\nexport const meta = { name: n, description: 'd' }").unwrap_err();
         assert!(e.contains("pure literal"), "{e}");
-        let e = parse("export const meta = { name: 'a', description: 'b', phases: [{ title: `t${1}` }] }\nreturn 1");
-        // A template with interpolation still evaluates to a literal string; it is accepted.
-        assert!(e.is_ok());
+        let e = parse("export const meta = { name: 'a', description: 'b', phases: [{ title: `t${1}` }] }\nreturn 1").unwrap_err();
+        assert!(e.contains("template interpolation"), "{e}");
+        assert!(parse("export const meta = { name: `a`, description: 'b (c) => d' }\nreturn 1").is_ok());
+        for bad in ["(() => 'x')()", "String(1)", "[1].map(x => x).join()", "new Date(0).toString()", "function () {}"] {
+            let e = parse(&format!("export const meta = {{ name: 'a', description: {bad} }}\nreturn 1")).unwrap_err();
+            assert!(e.contains("pure literal"), "{bad}: {e}");
+        }
         let e = parse("export const meta = { name: 'a' }").unwrap_err();
         assert!(e.contains("description"), "{e}");
         let e = parse(&format!("{HEAD}const x: string[] = []")).unwrap_err();
@@ -678,6 +800,8 @@ mod tests {
         );
         assert_eq!(host.calls.lock().unwrap()[0]["group"], "t");
         assert_eq!(host.phases.lock().unwrap().as_slice(), ["t|inner"]);
+        let shadow = go("return await workflow('shadow')", json!(null), host.clone()).unwrap();
+        assert_eq!(shadow, json!(["mine", 2, 3]));
         let e = go("return await workflow('nope')", json!(null), host).unwrap_err();
         assert!(e.contains("no workflow"), "{e}");
     }
@@ -692,6 +816,100 @@ mod tests {
         let e = go("await parallel(new Array(5000).fill(0))", json!(null), host.clone()).unwrap_err();
         assert!(e.contains("at most 4096"), "{e}");
         assert_eq!(go("return undefined", json!(null), host).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn the_header_is_found_after_comments_that_look_like_code() {
+        for head in ["// Review src/*.rs for bugs\n", "// see src/**/*.ts\n", "/* a block */\n", "// export const meta = {}\n"] {
+            let s = parse(&format!("{head}export const meta = {{ name: 'a', description: 'b' }}\nreturn 1")).unwrap();
+            assert_eq!(s.meta.name, "a", "{head}");
+        }
+        // A header inside a string is not the header.
+        let e = parse("const s = 'export const meta = { name: 1 }'\nreturn 1").unwrap_err();
+        assert!(e.contains("must begin"), "{e}");
+        assert_eq!(peek_name("// x\nexport const meta = { description: 'd', name: \"find-bugs\" }"), Some("find-bugs".into()));
+        assert_eq!(peek_name("return 1"), None);
+    }
+
+    #[test]
+    fn log_takes_any_value_and_nested_scripts_may_shadow_the_api() {
+        let host = Arc::new(Fake::default());
+        let out = go("log(undefined)\nlog()\nlog(() => 1)\nlog({a: 1})\nphase(undefined)\nreturn 1", json!(null), host.clone()).unwrap();
+        assert_eq!(out, json!(1));
+        assert_eq!(host.logs.lock().unwrap().as_slice(), ["|undefined", "|undefined", "|() => 1", "|{\"a\":1}"]);
+    }
+
+    #[test]
+    fn error_lines_match_the_script_file() {
+        let host = Arc::new(Fake::default());
+        // Line 1 is the header, line 2 a const, line 3 the error.
+        let e = go("const x = 1\nnull.foo", json!(null), host).unwrap_err();
+        assert!(e.contains(":3:"), "{e}");
+    }
+
+    #[test]
+    fn the_clock_cannot_be_reached_another_way() {
+        let host = Arc::new(Fake::default());
+        let out = go(
+            "const r = []\nfor (const f of [() => new Date(0).constructor.now(), () => performance.now()]) { try { f(); r.push('ok') } catch (e) { r.push(e.message.includes('unavailable')) } }\nreturn r",
+            json!(null),
+            host,
+        )
+        .unwrap();
+        assert_eq!(out, json!([true, true]));
+    }
+
+    /// A host whose agents fail once the run is stopped, like the hub's.
+    struct Stopping {
+        stop: Arc<AtomicBool>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Host for Stopping {
+        fn agent(&self, _req: Value) -> ReplyFut {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let stop = self.stop.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if stop.load(Ordering::SeqCst) {
+                    Reply::Throw("workflow stopped".into())
+                } else {
+                    Reply::Null("failed".into())
+                }
+            })
+        }
+        fn phase(&self, _: &str, _: &str) {}
+        fn log(&self, _: &str, _: &str) {}
+        fn budget(&self) -> (Option<u64>, u64) {
+            (None, 0)
+        }
+        fn load(&self, _: &Value) -> Result<Script, String> {
+            Err("none".into())
+        }
+        fn stopped(&self) -> bool {
+            self.stop.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_stop_ends_scripts_that_wait_forever_or_retry_in_loops() {
+        for body in [
+            "await new Promise(() => {})",
+            "let pending = Array.from({length: 50}, (_, i) => 'f' + i)\nwhile (pending.length) { const res = await parallel(pending.map(f => () => agent('fix ' + f))); pending = pending.filter((f, i) => !res[i]) }",
+            "while (true) { await pipeline([1, 2, 3], x => agent('a' + x), y => agent('b' + y)) }",
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let host = Arc::new(Stopping { stop: stop.clone(), calls: Default::default() });
+            let flag = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                flag.store(true, Ordering::SeqCst);
+            });
+            let t = std::time::Instant::now();
+            let script = parse(&format!("{HEAD}{body}")).unwrap();
+            assert_eq!(run(&script, json!(null), host).unwrap_err(), "stopped", "{body}");
+            assert!(t.elapsed() < Duration::from_secs(5), "{body}: {:?}", t.elapsed());
+        }
     }
 
     #[test]
