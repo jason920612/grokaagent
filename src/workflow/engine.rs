@@ -144,9 +144,17 @@ fn wrap(body: &str) -> String {
 pub fn peek_name(source: &str) -> Option<String> {
     let decl = find_meta(source.trim_start_matches('\u{feff}'))?;
     let literal = &source.trim_start_matches('\u{feff}')[decl.literal];
-    let re = regex::Regex::new(r#"\bname\s*:\s*(?:"([^"\\]*)"|'([^'\\]*)'|`([^`\\$]*)`)"#).ok()?;
-    let c = re.captures(literal)?;
-    c.get(1).or(c.get(2)).or(c.get(3)).map(|m| m.as_str().to_string())
+    let re = regex::Regex::new(r#"(?:\bname|"name"|'name')\s*:\s*(?:"([^"\\]*)"|'([^'\\]*)'|`([^`\\$]*)`)"#).ok()?;
+    let code = code_mask(literal);
+    // The key itself must be code (or a quoted key), not text in a string.
+    let name = re
+        .captures_iter(literal)
+        .find(|c| {
+            let at = c.get(0).map_or(0, |m| m.start());
+            code[at] || matches!(literal.as_bytes()[at], b'"' | b'\'') && (at == 0 || code[at - 1])
+        })
+        .and_then(|c| c.get(1).or(c.get(2)).or(c.get(3)).map(|m| m.as_str().to_string()));
+    name
 }
 
 /// What makes a meta literal not a plain literal (a call, a function, an
@@ -154,13 +162,13 @@ pub fn peek_name(source: &str) -> Option<String> {
 fn not_literal(literal: &str) -> Option<&'static str> {
     let code = code_mask(literal);
     let b = literal.as_bytes();
+    // Inside a non-code region that a backtick opened (a template literal).
     let mut template = false;
     for i in 0..b.len() {
         if !code[i] {
-            // Inside a template literal (between unescaped backticks).
-            if b[i] == b'`' && (i == 0 || b[i - 1] != b'\\') {
-                template = !template;
-            } else if template && b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+            if i == 0 || code[i - 1] || region_start(literal, &code, i) {
+                template = b[i] == b'`';
+            } else if template && b[i] == b'$' && b.get(i + 1) == Some(&b'{') && !escaped(b, i) {
                 return Some("a template interpolation");
             }
             continue;
@@ -179,6 +187,41 @@ fn not_literal(literal: &str) -> Option<&'static str> {
         .map(|(c, keep)| if *keep { *c as char } else { ' ' })
         .collect();
     words.is_match(&plain).then_some("a function or an expression")
+}
+
+/// Whether byte `i` (not code) opens a new string or comment right after
+/// another one closed (`'a'` directly followed by `// x`).
+fn region_start(src: &str, code: &[bool], i: usize) -> bool {
+    let b = src.as_bytes();
+    if i == 0 || code[i - 1] {
+        return true;
+    }
+    let prev = b[i - 1];
+    // The previous region closed on its own quote, or a block comment's `/`.
+    let closed = matches!(prev, b'"' | b'\'' | b'`') && !escaped(b, i - 1) && opener_of(src, code, i - 1) == Some(prev)
+        || (prev == b'/' && i >= 2 && b[i - 2] == b'*');
+    closed && matches!(b[i], b'"' | b'\'' | b'`' | b'/')
+}
+
+/// The first byte of the non-code region that byte `i` belongs to.
+fn opener_of(src: &str, code: &[bool], i: usize) -> Option<u8> {
+    let b = src.as_bytes();
+    let mut j = i;
+    while j > 0 && !code[j - 1] {
+        j -= 1;
+    }
+    (j < i).then(|| b[j])
+}
+
+/// Whether byte `i` is escaped by an odd number of backslashes.
+fn escaped(b: &[u8], i: usize) -> bool {
+    let mut n = 0;
+    let mut j = i;
+    while j > 0 && b[j - 1] == b'\\' {
+        n += 1;
+        j -= 1;
+    }
+    n % 2 == 1
 }
 
 struct MetaDecl {
@@ -334,8 +377,15 @@ const PRELUDE: &str = r#"
   // String() for what JSON leaves out: undefined, functions).
   const text = (v) => {
     if (typeof v === "string") return v;
-    const s = JSON.stringify(v);
-    return s === undefined ? String(v) : s;
+    try {
+      const s = JSON.stringify(v);
+      if (s !== undefined) return s;
+    } catch (_) {}
+    try {
+      return String(v);
+    } catch (_) {
+      return Object.prototype.toString.call(v);
+    }
   };
   function makeApi(group) {
     let current = null;
@@ -829,14 +879,21 @@ mod tests {
         assert!(e.contains("must begin"), "{e}");
         assert_eq!(peek_name("// x\nexport const meta = { description: 'd', name: \"find-bugs\" }"), Some("find-bugs".into()));
         assert_eq!(peek_name("return 1"), None);
+        assert_eq!(peek_name("export const meta = {\"name\": \"a\", \"description\": \"b\"}"), Some("a".into()));
+        assert_eq!(peek_name("export const meta = { description: 'set name: \"zzz\"', name: 'real' }"), Some("real".into()));
+        // Backticks inside plain strings are not templates.
+        for ok in ["'Fill the `${name}` slot'", "\"Runs `${cmd}` per file\"", "`cost \\${x}`"] {
+            let s = parse(&format!("export const meta = {{ name: 'a', description: {ok} }}\nreturn 1"));
+            assert!(s.is_ok(), "{ok}: {s:?}");
+        }
     }
 
     #[test]
     fn log_takes_any_value_and_nested_scripts_may_shadow_the_api() {
         let host = Arc::new(Fake::default());
-        let out = go("log(undefined)\nlog()\nlog(() => 1)\nlog({a: 1})\nphase(undefined)\nreturn 1", json!(null), host.clone()).unwrap();
+        let out = go("log(undefined)\nlog()\nlog(() => 1)\nlog({a: 1})\nphase(undefined)\nlog(10n)\nconst c = {}; c.c = c; log(c)\nreturn 1", json!(null), host.clone()).unwrap();
         assert_eq!(out, json!(1));
-        assert_eq!(host.logs.lock().unwrap().as_slice(), ["|undefined", "|undefined", "|() => 1", "|{\"a\":1}"]);
+        assert_eq!(host.logs.lock().unwrap().as_slice(), ["|undefined", "|undefined", "|() => 1", "|{\"a\":1}", "|10", "|[object Object]"]);
     }
 
     #[test]

@@ -1594,6 +1594,9 @@ pub async fn run<P: Provider + Clone + 'static>(
         let rid = run_id.clone();
         let streamed_server = std::sync::atomic::AtomicBool::new(false);
         let streamed_reasoning = std::sync::atomic::AtomicBool::new(false);
+        // Text and reasoning streamed by the current attempt, for the cost of
+        // one the loop guard cuts off.
+        let streamed_chars = std::sync::atomic::AtomicUsize::new(0);
         let repeat_ctx = crate::repeat::Context::from_items(&history);
         let repeat_guard = crate::repeat::Guard::with_context(repeat_ctx.clone());
         let on_text = |delta: &str| {
@@ -1601,6 +1604,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                 return;
             }
             repeat_guard.feed_text(delta);
+            streamed_chars.fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
             sink.emit(&AgentEvent::ModelDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -1620,6 +1624,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             }
             streamed_reasoning.store(true, std::sync::atomic::Ordering::Relaxed);
             repeat_guard.feed_reasoning(delta);
+            streamed_chars.fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
             sink.emit(&AgentEvent::ReasoningDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -1633,6 +1638,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         let mut transient_attempt = 0u32;
         loop {
             repeat_guard.reset();
+            streamed_chars.store(0, std::sync::atomic::Ordering::Relaxed);
             // A response that falls into a repetition loop is stopped as soon
             // as the loop shows, not when the model hits its output limit.
             let guarded = async {
@@ -1711,6 +1717,15 @@ pub async fn run<P: Provider + Clone + 'static>(
                 }
             },
             Ok(Err(e)) if crate::repeat::is_loop(&e) => {
+                // Cut off mid-stream, so no usage came back: estimate it from
+                // the last request's input and what streamed (≈4 chars a token).
+                sink.emit(&AgentEvent::UsageReported {
+                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                    kind: "loop".into(),
+                    input_tokens: last_usage.input_tokens,
+                    cached_tokens: last_usage.cached_tokens,
+                    output_tokens: (streamed_chars.load(std::sync::atomic::Ordering::Relaxed) / 4) as u32,
+                });
                 let trip = repeat_guard.trip().unwrap_or(crate::repeat::Trip {
                     source: "text".into(),
                     unit: String::new(),

@@ -34,7 +34,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// After its task, an agent gets this long to shut down cleanly (its
 /// background processes and running commands stopped) once its lifeline
 /// closes, before its process group is killed.
-const EXIT_GRACE: Duration = Duration::from_secs(3);
+pub const EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// What every agent of a hub shares.
 pub struct PoolEnv {
@@ -211,9 +211,9 @@ async fn run_in(
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(!cfg!(unix));
     let mut guard = match ProcessGuard::spawn(cmd) {
-        Ok(g) => g,
+        Ok(g) => g.with_lifeline(),
         Err(e) => return AgentEnd::Failed(format!("starting the agent: {e}")),
     };
     let origin = match handshake(&mut guard).await {
@@ -300,20 +300,12 @@ async fn run_in(
             Err(problem) => break AgentEnd::Failed(format!("no valid structured result: {problem}")),
         }
     };
-    finish_process(&mut guard).await;
+    guard.finish(EXIT_GRACE).await;
     // Let the tailer read the last lines before it stops.
     tokio::time::sleep(TAIL_TICK * 2).await;
     let _ = tail_stop.send(());
     let _ = tail.await;
     end
-}
-
-/// End a worker: close its lifeline so it shuts its session down (and with
-/// it the processes its tools started), then kill whatever is left.
-async fn finish_process(guard: &mut ProcessGuard) {
-    drop(guard.child_mut().stdin.take());
-    let _ = tokio::time::timeout(EXIT_GRACE, guard.child_mut().wait()).await;
-    let _ = guard.kill().await;
 }
 
 /// The result for a schema call: the `submit_result` arguments the worker
@@ -467,6 +459,12 @@ async fn add_worktree(workspace: &Path, node: &str, seg: &str) -> Result<Worktre
     }
     let prefix = prefix.trim().trim_end_matches('/');
     let agent_ws = if prefix.is_empty() { path.clone() } else { path.join(prefix) };
+    if !agent_ws.is_dir() {
+        let _ = git(workspace, &["worktree", "remove", "--force", &path.to_string_lossy()]).await;
+        return Err(format!(
+            "the workspace folder ({prefix}) has no committed files in this repository, so a worktree has nothing to work in; commit it first"
+        ));
+    }
     Ok(Worktree {
         root: path,
         workspace: agent_ws,

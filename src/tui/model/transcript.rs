@@ -453,16 +453,28 @@ impl Transcript {
     /// "started" it said when the call returned.
     /// Returns the call's id and its new phase.
     pub fn mark_spawn_done(&mut self, child: &str, detail: &str) -> Option<(String, &'static str)> {
-        let phase = if detail.starts_with("失敗") {
+        // The hub's details, then the nursery's ("process exited (…)",
+        // "killed" at shutdown, "killed by parent" after stop_agent).
+        let phase = if detail.starts_with("失敗")
+            || detail.starts_with("failed")
+            || (detail.starts_with("process exited") && !detail.contains("exit status: 0"))
+        {
             "失敗"
-        } else if detail.starts_with("已停止") {
+        } else if detail.starts_with("已停止") || detail == "killed" {
             "已停止"
         } else {
             "完成"
         };
         for r in self.rows.iter_mut().rev() {
             let Row::Tools(g) = r else { continue };
-            for c in g.calls.iter_mut().rev().filter(|c| c.name == "spawn_agent" || c.name == "workflow") {
+            // Only a call that returned and still says it started: a failed
+            // call (a duplicate name, say) is left alone.
+            for c in g
+                .calls
+                .iter_mut()
+                .rev()
+                .filter(|c| (c.name == "spawn_agent" || c.name == "workflow") && c.done && c.phase == "已啟動")
+            {
                 let out = serde_json::from_str::<Value>(&c.output).ok();
                 let named = if c.name == "workflow" {
                     // A workflow's tree node is its run id.
@@ -539,6 +551,12 @@ mod tests {
         });
         assert_eq!(phase.as_deref(), Some("失敗"));
         assert_eq!(t.mark_spawn_done("wf-2", "完成"), None);
+        // A failed duplicate spawn keeps its row; the started one flips.
+        t.tool_started("s1", "spawn_agent", &serde_json::json!({"name": "coder"}));
+        t.tool_finished("s1", "spawn_agent", r#"{"name":"coder","state":"working"}"#);
+        t.tool_started("s2", "spawn_agent", &serde_json::json!({"name": "coder"}));
+        t.tool_finished("s2", "spawn_agent", r#"{"error":"child coder already exists"}"#);
+        assert_eq!(t.mark_spawn_done("coder", "process exited (exit status: 101): panicked"), Some(("s1".to_string(), "失敗")));
     }
 
     use super::*;

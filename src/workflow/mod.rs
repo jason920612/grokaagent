@@ -262,6 +262,8 @@ struct Run {
     failed: AtomicUsize,
     cached: AtomicUsize,
     tokens: AtomicU64,
+    /// Agent tasks still running (a stopped script can end before they do).
+    inflight: AtomicUsize,
     /// Calls seen per cache key, to pick the n-th recorded result.
     seen: Mutex<HashMap<String, usize>>,
     segs: Mutex<HashSet<String>>,
@@ -447,6 +449,7 @@ impl WorkflowHub {
             failed: AtomicUsize::new(0),
             cached: AtomicUsize::new(0),
             tokens: AtomicU64::new(0),
+            inflight: AtomicUsize::new(0),
             seen: Mutex::new(HashMap::new()),
             segs: Mutex::new(HashSet::new()),
             cache,
@@ -501,6 +504,13 @@ impl WorkflowHub {
         tokio::spawn(async move {
             let out = tokio::task::spawn_blocking(move || engine::run(&script, script_args, host)).await;
             let out = out.unwrap_or_else(|_| Err("the script engine crashed".into()));
+            // Calls the script never awaited (or was stopped while awaiting)
+            // are being ended: let them shut down and be counted first.
+            driver_run.stop.send_replace(true);
+            let deadline = Instant::now() + pool::EXIT_GRACE + Duration::from_secs(2);
+            while driver_run.inflight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             me.finish(&driver_run, out);
         });
         let mut reply = json!({
@@ -743,8 +753,12 @@ impl WorkflowHub {
         for r in &live {
             r.stop.send_replace(true);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && live.iter().any(|r| r.status() == Status::Running) {
+        // Long enough for agents to end cleanly (their own grace) and the
+        // runs to record them.
+        let deadline = Instant::now() + pool::EXIT_GRACE + Duration::from_secs(4);
+        while Instant::now() < deadline
+            && live.iter().any(|r| r.status() == Status::Running || r.inflight.load(Ordering::SeqCst) > 0)
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         live.iter()
@@ -948,42 +962,25 @@ impl engine::Host for RunHost {
             let seg = job.seg.clone();
             let env = hub.inner.env.clone();
             let stop = run.stop.subscribe();
-            let report = rt
-                .spawn(async move {
+            let inflight = Inflight::new(run.clone());
+            // The agent's bookkeeping happens in its own task: a stopped
+            // script's engine can be abandoned while agents still shut down,
+            // and their journal lines and counts must not be lost with it.
+            let task = {
+                let (run, hub) = (run.clone(), hub.clone());
+                rt.spawn(async move {
                     let _permit = permit;
-                    pool::run_agent(&env, job, stop).await
+                    let _inflight = inflight;
+                    let report = pool::run_agent(&env, job, stop).await;
+                    record(&hub, &run, &key, n, label, phase, &seg, &report);
+                    report.end
                 })
-                .await;
-            let report = match report {
-                Ok(r) => r,
-                Err(_) => pool::AgentReport {
-                    end: AgentEnd::Failed("the agent task crashed".into()),
-                    tokens: 0,
-                    worktree: None,
-                },
             };
-            run.tokens.fetch_add(report.tokens, Ordering::SeqCst);
-            let (status, value, reason) = match &report.end {
-                AgentEnd::Ok(v) => ("ok", v.clone(), Value::Null),
-                AgentEnd::Failed(why) => ("null", Value::Null, json!(why)),
-                AgentEnd::Stopped => ("stopped", Value::Null, Value::Null),
-            };
-            run.journal.append(&json!({
-                "type": "agent", "key": key, "n": n, "label": label, "phase": phase, "node": seg,
-                "status": status, "value": value, "reason": reason, "tokens": report.tokens,
-                "worktree": report.worktree,
-            }));
-            match report.end {
-                AgentEnd::Ok(v) => {
-                    run.done.fetch_add(1, Ordering::SeqCst);
-                    Reply::Value(v)
-                }
-                AgentEnd::Failed(why) => {
-                    run.failed.fetch_add(1, Ordering::SeqCst);
-                    pool::note(&hub.inner.env, &run.id, format!("{seg} 失敗，結果為 null：{}", why.lines().next().unwrap_or("")));
-                    Reply::Null(why)
-                }
-                AgentEnd::Stopped => Reply::Throw("workflow stopped".into()),
+            match task.await {
+                Ok(AgentEnd::Ok(v)) => Reply::Value(v),
+                Ok(AgentEnd::Failed(why)) => Reply::Null(why),
+                Ok(AgentEnd::Stopped) => Reply::Throw("workflow stopped".into()),
+                Err(_) => Reply::Null("the agent task crashed".into()),
             }
         })
     }
@@ -1019,6 +1016,49 @@ impl engine::Host for RunHost {
 
     fn stopped(&self) -> bool {
         self.run.stopped()
+    }
+}
+
+/// One finished agent call in the run's counts, journal and log.
+#[allow(clippy::too_many_arguments)]
+fn record(hub: &WorkflowHub, run: &Run, key: &str, n: usize, label: Option<String>, phase: Option<String>, seg: &str, report: &pool::AgentReport) {
+    run.tokens.fetch_add(report.tokens, Ordering::SeqCst);
+    let (status, value, reason) = match &report.end {
+        AgentEnd::Ok(v) => ("ok", v.clone(), Value::Null),
+        AgentEnd::Failed(why) => ("null", Value::Null, json!(why)),
+        AgentEnd::Stopped => ("stopped", Value::Null, Value::Null),
+    };
+    run.journal.append(&json!({
+        "type": "agent", "key": key, "n": n, "label": label, "phase": phase, "node": seg,
+        "status": status, "value": value, "reason": reason, "tokens": report.tokens,
+        "worktree": report.worktree,
+    }));
+    match &report.end {
+        AgentEnd::Ok(_) => {
+            run.done.fetch_add(1, Ordering::SeqCst);
+        }
+        AgentEnd::Failed(why) => {
+            run.failed.fetch_add(1, Ordering::SeqCst);
+            pool::note(&hub.inner.env, &run.id, format!("{seg} 失敗，結果為 null：{}", why.lines().next().unwrap_or("")));
+        }
+        AgentEnd::Stopped => {}
+    }
+}
+
+/// Counts an agent task of a run while it lives (dropped with the task,
+/// even one that never got to run).
+struct Inflight(Arc<Run>);
+
+impl Inflight {
+    fn new(run: Arc<Run>) -> Self {
+        run.inflight.fetch_add(1, Ordering::SeqCst);
+        Self(run)
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

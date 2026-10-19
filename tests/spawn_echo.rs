@@ -248,3 +248,47 @@ async fn a_lifeline_worker_ends_its_session_and_exits() {
         .unwrap();
     assert!(status.success(), "{status}");
 }
+
+/// Dropping a lifeline guard (the parent quitting) leaves the worker to end
+/// its own session, and it does exit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dropped_lifeline_guard_lets_the_worker_exit_on_its_own() {
+    let bin = env!("CARGO_BIN_EXE_grokaagent");
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args([
+        "worker",
+        "--name",
+        "soft",
+        "--mode",
+        "echo",
+        "--listen",
+        "127.0.0.1:0",
+        "--lifeline",
+        "--events",
+        dir.path().join("w.jsonl").to_str().unwrap(),
+        "--workspace",
+        dir.path().to_str().unwrap(),
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(false);
+    let mut guard = grokaagent::procgroup::ProcessGuard::spawn(cmd).unwrap().with_lifeline();
+    let pid = guard.child_mut().id().unwrap() as i32;
+    let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(guard.child_mut().stdout.take().unwrap()));
+    lines.next_line().await.unwrap().unwrap();
+    drop(guard);
+    let t = std::time::Instant::now();
+    // Reap it if it is our zombie; gone either way once it has exited.
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid || unsafe { libc::kill(pid, 0) } != 0 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "the worker must exit once its lifeline closes");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
