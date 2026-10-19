@@ -300,7 +300,7 @@ pub(crate) fn tool_phase(name: &str, output: &str) -> &'static str {
         "已停止"
     } else if failed {
         "失敗"
-    } else if name == "spawn_agent" {
+    } else if name == "spawn_agent" || (name == "workflow" && result.get("status").and_then(Value::as_str) == Some("running")) {
         "已啟動"
     } else {
         "完成"

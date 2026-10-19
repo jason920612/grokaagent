@@ -448,24 +448,64 @@ impl Transcript {
         true
     }
 
-    /// Mark the spawn call for `child` done (its child process ended).
-    pub fn mark_spawn_done(&mut self, child: &str) {
+    /// The spawn call for `child` (a child agent, or a workflow run) is
+    /// over: its process or run ended. Its row says how, instead of the
+    /// "started" it said when the call returned.
+    /// Shorten a finished call's stored output to about `cap` bytes. JSON
+    /// keeps its shape (only long strings are cut), so whatever reads the
+    /// stored output later (the expanded row) still can.
+    pub fn clip_output(&mut self, call_id: &str, cap: usize) {
         for r in self.rows.iter_mut().rev() {
             let Row::Tools(g) = r else { continue };
-            for c in g.calls.iter_mut().rev().filter(|c| c.name == "spawn_agent" && !c.done) {
-                let named = serde_json::from_str::<Value>(&c.output)
-                    .ok()
-                    .and_then(|v| v.get("name").and_then(Value::as_str).map(|n| n == child))
-                    .unwrap_or(false)
-                    || c.args.get("name").and_then(Value::as_str) == Some(child);
+            if let Some(c) = g.calls.iter_mut().rev().find(|c| c.call_id == call_id) {
+                c.output = clip_text(&c.output, cap);
+                return;
+            }
+        }
+    }
+
+    /// Returns the call's id and its new phase.
+    pub fn mark_spawn_done(&mut self, child: &str, detail: &str) -> Option<(String, &'static str)> {
+        // The hub's details, then the nursery's ("process exited (…)",
+        // "killed" at shutdown, "killed by parent" after stop_agent).
+        let phase = if detail.starts_with("失敗")
+            || detail.starts_with("failed")
+            || (detail.starts_with("process exited") && !detail.contains("exit status: 0"))
+        {
+            "失敗"
+        } else if detail.starts_with("已停止") || detail == "killed" {
+            "已停止"
+        } else {
+            "完成"
+        };
+        for r in self.rows.iter_mut().rev() {
+            let Row::Tools(g) = r else { continue };
+            // Only a call that returned and still says it started: a failed
+            // call (a duplicate name, say) is left alone.
+            for c in g
+                .calls
+                .iter_mut()
+                .rev()
+                .filter(|c| (c.name == "spawn_agent" || c.name == "workflow") && c.done && c.phase == "已啟動")
+            {
+                let out = serde_json::from_str::<Value>(&c.output).ok();
+                let named = if c.name == "workflow" {
+                    // A workflow's tree node is its run id.
+                    out.as_ref().and_then(|v| v.get("run_id").and_then(Value::as_str)) == Some(child)
+                } else {
+                    out.as_ref()
+                        .and_then(|v| v.get("name").and_then(Value::as_str).map(|n| n == child))
+                        .unwrap_or(false)
+                        || c.args.get("name").and_then(Value::as_str) == Some(child)
+                };
                 if named {
                     c.done = true;
-                    c.phase = "完成".into();
-                    return;
+                    c.phase = phase.into();
+                    return Some((c.call_id.clone(), phase));
                 }
             }
-            return;
         }
+        None
     }
 
     /// Every file change: (row, call, path, kind).
@@ -507,8 +547,103 @@ impl Transcript {
     }
 }
 
+/// `text` cut to about `cap` bytes; JSON keeps its shape, with each long
+/// string cut instead.
+fn clip_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    fn cut(s: &str, cap: usize) -> String {
+        let mut end = cap.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n…(cut {} bytes)", &s[..end], s.len() - end)
+    }
+    fn walk(v: &mut Value, each: usize, items: usize) {
+        match v {
+            Value::String(s) if s.len() > each => *s = cut(s, each),
+            Value::Array(a) => {
+                if a.len() > items {
+                    let gone = a.len() - items;
+                    a.truncate(items);
+                    a.push(Value::String(format!("…(cut {gone} items)")));
+                }
+                a.iter_mut().for_each(|x| walk(x, each, items));
+            }
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, each, items)),
+            _ => {}
+        }
+    }
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return cut(text, cap);
+    };
+    // Tighten until the whole fits: long strings cut, long lists shortened.
+    let mut each = cap / 2;
+    let mut items = 50;
+    while each >= 64 {
+        let mut w = v.clone();
+        walk(&mut w, each, items);
+        let s = w.to_string();
+        if s.len() <= cap + 64 {
+            return s;
+        }
+        each /= 2;
+        items = (items / 2).max(5);
+    }
+    // Still too big: keep the outcome fields and a raw cut of the rest.
+    let mut small = serde_json::Map::new();
+    if let Value::Object(o) = &v {
+        for (k, x) in o {
+            if matches!(x, Value::Bool(_) | Value::Number(_) | Value::Null) || matches!(k.as_str(), "error" | "path" | "kind") {
+                if x.to_string().len() <= 300 {
+                    small.insert(k.clone(), x.clone());
+                }
+            }
+        }
+    }
+    small.insert("_cut".into(), Value::String(cut(text, cap / 2)));
+    Value::Object(small).to_string()
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn clipped_outputs_fit_their_cap_and_keep_their_outcome() {
+        let list = json!({"entries": (0..200).map(|i| json!({"name": format!("file-{i}.rs"), "dir": false, "size": i})).collect::<Vec<_>>()}).to_string();
+        let ctrl = json!({"exit_code": 1, "stdout": "\u{1}".repeat(3000)}).to_string();
+        let many = json!({"error": "boom", "lines": (0..2000).map(|i| format!("line {i} {}", "x".repeat(40))).collect::<Vec<_>>()}).to_string();
+        for text in [list, ctrl, many, "plain text ".repeat(1000)] {
+            let out = clip_text(&text, 4000);
+            assert!(out.len() <= 4000 + 200, "{} -> {}", text.len(), out.len());
+        }
+        let v: Value = serde_json::from_str(&clip_text(&json!({"exit_code": 1, "stdout": "\u{1}".repeat(3000)}).to_string(), 4000)).unwrap();
+        assert_eq!(v["exit_code"], 1);
+    }
+
+    #[test]
+    fn a_finished_workflow_flips_its_started_call() {
+        let mut t = Transcript::new(Vec::new());
+        t.tool_started("c1", "workflow", &serde_json::json!({"script": "x"}));
+        t.tool_finished("c1", "workflow", r#"{"run_id":"wf-1","status":"running"}"#);
+        t.tool_started("c2", "now", &serde_json::json!({}));
+        t.tool_finished("c2", "now", "{}");
+        assert_eq!(t.mark_spawn_done("wf-1", "失敗：boom"), Some(("c1".to_string(), "失敗")));
+        let phase = t.rows.iter().find_map(|r| match r {
+            Row::Tools(g) => g.calls.iter().find(|c| c.call_id == "c1").map(|c| c.phase.clone()),
+            _ => None,
+        });
+        assert_eq!(phase.as_deref(), Some("失敗"));
+        assert_eq!(t.mark_spawn_done("wf-2", "完成"), None);
+        // A failed duplicate spawn keeps its row; the started one flips.
+        t.tool_started("s1", "spawn_agent", &serde_json::json!({"name": "coder"}));
+        t.tool_finished("s1", "spawn_agent", r#"{"name":"coder","state":"working"}"#);
+        t.tool_started("s2", "spawn_agent", &serde_json::json!({"name": "coder"}));
+        t.tool_finished("s2", "spawn_agent", r#"{"error":"child coder already exists"}"#);
+        assert_eq!(t.mark_spawn_done("coder", "process exited (exit status: 101): panicked"), Some(("s1".to_string(), "失敗")));
+    }
+
     use super::*;
     use crate::events::EventMeta;
     use serde_json::json;
@@ -534,6 +669,7 @@ mod tests {
             finish: "stop".into(),
             input_tokens: 100,
             cached_tokens: 90,
+            output_tokens: 0,
         }
     }
 

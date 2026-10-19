@@ -57,7 +57,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, area: Rect) -> Position {
             x = r.right() + 1;
         }
     }
-    if running || app.cur().agents.live_count() > 0 {
+    if running || app.cur().agents.interruptible_count() > 0 {
         let label = if running { " 停止 Esc " } else { " 中斷子代理 " };
         let w = display_cols(label);
         if x + w <= right {

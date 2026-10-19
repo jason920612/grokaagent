@@ -40,6 +40,8 @@ pub(crate) fn snapshot(app: &App) -> UiSnapshot {
         efforts: app.effort_choices().into_iter().map(|e| (e.id, e.label)).collect(),
         web_search: app.opts.web_search,
         dispatcher: app.opts.dispatcher,
+        ultracode: app.opts.ultracode,
+        workflow_size: app.opts.workflow_size.label().to_string(),
         child_model: app.opts.child_model.clone(),
         task_model: st.task_model.clone(),
         custom_models: !st.custom_catalog.models.is_empty(),
@@ -634,6 +636,8 @@ pub(crate) fn apply_command(app: &mut App, cmd: UiCommand) {
         }
         UiCommand::ToggleSearch => app.toggle_search(),
         UiCommand::ToggleDispatcher => app.toggle_dispatcher(),
+        UiCommand::ToggleUltracode => app.toggle_ultracode(),
+        UiCommand::CycleWorkflowSize => app.cycle_workflow_size(true),
         UiCommand::ToggleImportClaude => app.toggle_import(true),
         UiCommand::ToggleImportCodex => app.toggle_import(false),
         UiCommand::ToggleSkill { index } => app.toggle_skill(index),

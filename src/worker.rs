@@ -60,6 +60,8 @@ pub struct WorkerConfig {
     pub reasoning_effort: crate::provider::ReasoningEffort,
     /// Parent's search toggle; the tools follow this child's model route.
     pub search: bool,
+    /// A workflow agent's result schema (see [`crate::workflow::submit`]).
+    pub result_schema: Option<Value>,
 }
 
 struct Session {
@@ -88,6 +90,8 @@ struct WorkerState {
     book: Arc<Mutex<Book>>,
     interrupting: Arc<AtomicBool>,
     session: tokio::sync::Mutex<Option<Session>>,
+    /// A session task is running (cleared once its kernel has torn down).
+    live: Arc<AtomicBool>,
     sink: Arc<dyn EventSink>,
 }
 
@@ -101,12 +105,14 @@ struct WorkerConfigView {
     depth: u32,
     reasoning_effort: crate::provider::ReasoningEffort,
     search: bool,
+    result_schema: Option<Value>,
 }
 
 pub struct BoundWorker {
     pub listener: TcpListener,
     pub handshake: Handshake,
     pub app: Router,
+    state: Arc<WorkerState>,
 }
 
 fn lock(book: &Mutex<Book>) -> std::sync::MutexGuard<'_, Book> {
@@ -217,10 +223,12 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
             depth: cfg.depth,
             reasoning_effort: cfg.reasoning_effort,
             search: cfg.search,
+            result_schema: cfg.result_schema.clone(),
         },
         book,
         interrupting,
         session: tokio::sync::Mutex::new(None),
+        live: Arc::new(AtomicBool::new(false)),
         sink,
     });
     let app = Router::new()
@@ -229,11 +237,12 @@ pub async fn bind_worker(cfg: WorkerConfig) -> Result<BoundWorker> {
         .route("/v1/message:send", post(message_send))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
-        .with_state(state);
+        .with_state(state.clone());
     Ok(BoundWorker {
         listener,
         handshake,
         app,
+        state,
     })
 }
 
@@ -244,14 +253,50 @@ pub async fn serve_worker(bound: BoundWorker) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
+/// How long a worker whose lifeline closed waits for its session to shut
+/// down (background processes, running commands) before it exits anyway.
+const LIFELINE_GRACE: Duration = Duration::from_secs(2);
+
+/// `lifeline`: stdin is a pipe the parent holds. When it closes (the parent
+/// is done with this worker, or died), the session is ended cleanly, so
+/// what its tools started stops too, and the process exits.
+pub async fn run_worker(cfg: WorkerConfig, lifeline: bool) -> Result<()> {
     let bound = bind_worker(cfg).await?;
     println!(
         "{}",
         serde_json::to_string(&bound.handshake).expect("handshake json")
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    serve_worker(bound).await
+    if !lifeline {
+        return serve_worker(bound).await;
+    }
+    let state = bound.state.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        while matches!(std::io::Read::read(&mut stdin, &mut sink), Ok(n) if n > 0) {}
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        r = serve_worker(bound) => r,
+        _ = rx => {
+            end_session(&state, LIFELINE_GRACE).await;
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Stop the session's turn and close its inbox, then wait (up to `grace`)
+/// for its kernel to tear down.
+async fn end_session(st: &WorkerState, grace: Duration) {
+    if let Some(s) = st.session.lock().await.take() {
+        s.cancel.trip();
+    }
+    let deadline = tokio::time::Instant::now() + grace;
+    while st.live.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn agent_card(State(st): State<Arc<WorkerState>>) -> Json<a2a::AgentCard> {
@@ -296,6 +341,7 @@ fn start_session(st: Arc<WorkerState>, prompt: String) -> Session {
         inbox: tx,
         cancel: cancel.clone(),
     };
+    st.live.store(true, Ordering::SeqCst);
     tokio::spawn(async move {
         let result = match st.mode {
             WorkerMode::Echo => run_session(&st, EchoProvider::from_env(), prompt, rx, cancel).await,
@@ -316,6 +362,7 @@ fn start_session(st: Arc<WorkerState>, prompt: String) -> Session {
         };
         finish_open(&mut lock(&st.book), done);
         *st.session.lock().await = None;
+        st.live.store(false, Ordering::SeqCst);
     });
     session
 }
@@ -366,6 +413,9 @@ async fn run_session<P: Provider + Clone + 'static>(
             cancel: Some(cancel),
             skills: None,
             task: None,
+            result_schema: st.cfg.result_schema.clone(),
+            workflows: false,
+            hold_for_workflows: false,
         },
     )
     .await?;
@@ -464,8 +514,34 @@ impl Provider for EchoProvider {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
+        // A test asks for structured output with `ECHO_SUBMIT {json}` in the
+        // newest message: the model hands that JSON to `submit_result`.
+        let last_is_user = req.input.last().and_then(|v| v.get("role")).and_then(Value::as_str) == Some("user");
+        let submit = req.client_tools.iter().any(|t| t.name == crate::workflow::submit::NAME);
+        if let (true, true, Some(last)) = (last_is_user, submit, user_lines(&req.input).last()) {
+            if let Some((_, json)) = last.split_once("ECHO_SUBMIT ") {
+                let args = json.lines().next().unwrap_or("").trim().to_string();
+                let call_id = format!("call-{}", uuid::Uuid::new_v4());
+                return Ok(CompleteResponse {
+                    function_calls: vec![crate::provider::FunctionCall {
+                        call_id: call_id.clone(),
+                        name: crate::workflow::submit::NAME.into(),
+                        arguments: args.clone(),
+                    }],
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": crate::workflow::submit::NAME,
+                        "arguments": args,
+                    })],
+                    usage: crate::provider::CacheUsage { input_tokens: 0, cached_tokens: 0, output_tokens: 10 },
+                    ..CompleteResponse::new(uuid::Uuid::new_v4().to_string())
+                });
+            }
+        }
         let text = format!("echo:{}", user_lines(&req.input).join(" | "));
         Ok(CompleteResponse {
+            usage: crate::provider::CacheUsage { input_tokens: 0, cached_tokens: 0, output_tokens: 10 },
             output_items: vec![json!({
                 "type": "message",
                 "role": "assistant",
@@ -500,6 +576,7 @@ mod tests {
             max_turns: 4,
             reasoning_effort: crate::provider::ReasoningEffort::High,
             search: false,
+            result_schema: None,
         })
         .await
         .unwrap();

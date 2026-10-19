@@ -54,6 +54,8 @@ fn fixture_with(store: bool) -> Fixture {
         dispatcher: false,
         child_model: String::new(),
         reasoning_effort: ReasoningEffort::High,
+        ultracode: false,
+        workflow_size: Default::default(),
     };
     // An empty session id: the hub never writes task.json from tests.
     let task = TaskHub::new("");
@@ -452,6 +454,7 @@ fn a_proxy_message_ends_the_streamed_turn() {
         finish: "stop".into(),
         input_tokens: 0,
         cached_tokens: 0,
+        output_tokens: 0,
     };
     app.route_event(finished(&m, "done"));
     app.route_event(AgentEvent::TaskProxy { meta: m.clone(), intent: "push".into(), text: "prove it".into() });
@@ -892,6 +895,16 @@ fn settings_fit_a_standard_terminal() {
     let screen = render(app, 80, 24);
     assert!(screen.contains("子代理／任務代理") && screen.contains("任務代理"), "{screen}");
     assert!(screen.contains("調度員模式") && screen.contains("引入Codex技能"), "{screen}");
+    assert!(screen.contains("Ultracode") && screen.contains("規模"), "{screen}");
+    // Ultracode and the size guideline reach the knobs (and so the prompt).
+    click(app, hit_rect(app, Hit::SetToggle(4)));
+    assert!(app.knobs.lock().unwrap().ultracode);
+    click(app, hit_rect(app, ui::settings::field_hit(Field::WorkflowSize)));
+    assert_eq!(app.knobs.lock().unwrap().workflow_size, crate::workflow::SizeGuide::Large);
+    app.settings.field = Field::WorkflowSize;
+    press(app, KeyCode::Left);
+    press(app, KeyCode::Left);
+    assert_eq!(app.knobs.lock().unwrap().workflow_size, crate::workflow::SizeGuide::Small);
     app.settings.field = Field::TaskModel;
     press(app, KeyCode::Enter);
     assert_eq!(app.settings.drop, Some(DropKind::TaskModel));

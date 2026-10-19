@@ -36,6 +36,9 @@ const TAIL_TICK: Duration = Duration::from_millis(60);
 /// Check the child process for exit every this many tail ticks.
 const EXIT_CHECK_EVERY: u32 = 8;
 const CHILD_DIR: &str = "groka-children";
+/// A child whose lifeline closes gets this long to end its session (and
+/// the processes its tools started) before it is killed.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildState {
@@ -355,12 +358,17 @@ impl Nursery {
         if self.child_search() {
             cmd.arg("--search");
         }
-        cmd.stdin(std::process::Stdio::null())
+        // The child holds the read end of stdin: if this process dies, the
+        // pipe closes and the child exits instead of running on unseen.
+        cmd.arg("--lifeline");
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(!cfg!(unix));
 
-        let mut guard = ProcessGuard::spawn(cmd).map_err(|e| Error::A2a(format!("spawn: {e}")))?;
+        let mut guard = ProcessGuard::spawn(cmd)
+            .map_err(|e| Error::A2a(format!("spawn: {e}")))?
+            .with_lifeline();
         let stdout = guard
             .child_mut()
             .stdout
@@ -645,7 +653,8 @@ impl Nursery {
         if let Some(tx) = e.stop_watch.take() {
             let _ = tx.send(());
         }
-        let _ = e.proc.lock().await.kill().await;
+        // Close its lifeline first so it can stop what its tools started.
+        e.proc.lock().await.finish(EXIT_GRACE).await;
         self.shared.changed.notify_waiters();
         self.exited_event(name, detail);
     }
@@ -691,11 +700,18 @@ impl Nursery {
             let _ = tx.send(());
         }
         let drained: Vec<(String, Entry)> = self.shared.kids().drain().collect();
+        let mut ends = Vec::new();
         for (name, mut e) in drained {
             if let Some(tx) = e.stop_watch.take() {
                 let _ = tx.send(());
             }
-            let _ = e.proc.lock().await.kill().await;
+            // All at once, so closing a session waits one grace, not one per child.
+            ends.push(async move {
+                e.proc.lock().await.finish(EXIT_GRACE).await;
+                name
+            });
+        }
+        for name in futures::future::join_all(ends).await {
             sink.emit(&AgentEvent::ChildExited {
                 meta: self.meta(),
                 name,
@@ -990,7 +1006,7 @@ async fn watch_child(w: Watch, path: PathBuf, mut stop: oneshot::Receiver<()>) {
     }
 }
 
-async fn read_new(path: &Path, offset: &mut u64, leftover: &mut String, mut each: impl FnMut(&str)) {
+pub(crate) async fn read_new(path: &Path, offset: &mut u64, leftover: &mut String, mut each: impl FnMut(&str)) {
     let Ok(mut f) = tokio::fs::OpenOptions::new().read(true).open(path).await else {
         return;
     };
@@ -1182,6 +1198,8 @@ mod tests {
             task_reasoning_effort: crate::provider::ReasoningEffort::High,
             task_send_reasoning: true,
             search: false,
+            ultracode: false,
+            workflow_size: Default::default(),
         }));
         let n = nursery(&dir, 0, Some(knobs.clone()));
         assert_eq!(n.default_child_model(), "grok-3-mini");
@@ -1329,6 +1347,7 @@ mod tests {
                 finish: "stop".into(),
                 input_tokens: 0,
                 cached_tokens: 0,
+                output_tokens: 0,
             }),
             ev_line(&AgentEvent::AwaitingInput { meta: own_meta("c1", "") }),
         ];

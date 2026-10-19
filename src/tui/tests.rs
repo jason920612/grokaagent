@@ -43,6 +43,8 @@ fn opts(dir: &std::path::Path) -> TuiOptions {
         dispatcher: false,
         child_model: String::new(),
         reasoning_effort: ReasoningEffort::High,
+        ultracode: false,
+        workflow_size: Default::default(),
     }
 }
 
@@ -473,6 +475,7 @@ fn transcripts_and_agents_survive_a_reload() {
         finish: "stop".into(),
         input_tokens: 0,
         cached_tokens: 0,
+        output_tokens: 0,
     });
     spawn_child(app, "coder");
     app.persist_all();

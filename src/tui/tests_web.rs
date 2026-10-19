@@ -29,6 +29,8 @@ fn fixture() -> (App, tempfile::TempDir) {
         dispatcher: false,
         child_model: String::new(),
         reasoning_effort: ReasoningEffort::High,
+        ultracode: false,
+        workflow_size: Default::default(),
     };
     let mut meta = SessionMeta::new(dir.path().to_path_buf());
     meta.id = "s".into();

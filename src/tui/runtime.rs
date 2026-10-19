@@ -538,6 +538,9 @@ async fn run_one(spec: RunSpec) -> Result<RunOutcome> {
             cancel: Some(cancel),
             skills: Some(skills),
             task: Some(task),
+            result_schema: None,
+            workflows: true,
+            hold_for_workflows: false,
         },
     )
     .await

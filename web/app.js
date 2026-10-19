@@ -812,7 +812,11 @@
         box.append(b);
       });
     }
-    const liveAgents = logs.agents.some((a) => a.state === "working" || a.state === "starting");
+    // Workflows do not stop on Esc: their nodes do not count here.
+    const workflows = new Set(logs.agents.filter((a) => a.model === "workflow" && a.depth === 0).map((a) => a.path));
+    const liveAgents = logs.agents.some(
+      (a) => (a.state === "working" || a.state === "starting") && !workflows.has(a.path.split("/")[0])
+    );
     $("interrupt").classList.toggle("hidden", !snap.header.running && !liveAgents);
     $("interrupt").textContent = snap.header.running ? "停止目前工作" : "中斷子代理";
     $("mode-queue").classList.toggle("on", sendMode !== "insert");
@@ -1407,6 +1411,16 @@
     disp.title = "開啟後模型只負責規劃並指揮子代理，盡量不直接動手";
     disp.addEventListener("click", () => send({ type: "toggle_dispatcher" }));
     modal.append(disp);
+    const ultra = el("button", "", st.ultracode ? "Ultracode：開" : "Ultracode：關");
+    ultra.type = "button";
+    ultra.title = "開啟後，每個實質任務都用工作流程（多代理編排）處理，追求最完整正確的結果";
+    ultra.addEventListener("click", () => send({ type: "toggle_ultracode" }));
+    modal.append(ultra);
+    const size = el("button", "", "工作流程規模：" + (st.workflow_size || "中（10 個代理以下）"));
+    size.type = "button";
+    size.title = "告訴模型工作流程該用多少代理（建議值，不是硬性上限）；點一下切換";
+    size.addEventListener("click", () => send({ type: "cycle_workflow_size" }));
+    modal.append(size);
     const ic = el("button", "", st.import_claude ? "Claude 技能：開" : "Claude 技能：關");
     ic.type = "button";
     ic.addEventListener("click", () => send({ type: "toggle_import_claude" }));

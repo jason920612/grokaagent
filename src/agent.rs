@@ -37,6 +37,10 @@ pub struct SessionKnobs {
     /// The user's search toggle. [`Self::server_tools`] is what the live
     /// model gets; this is what new child agents inherit.
     pub search: bool,
+    /// Standing opt-in to workflows for every substantive task.
+    pub ultracode: bool,
+    /// How big workflows should be (told to the model, not enforced).
+    pub workflow_size: crate::workflow::SizeGuide,
 }
 
 pub struct RunConfig {
@@ -74,6 +78,16 @@ pub struct RunConfig {
     pub skills: Option<Arc<Mutex<crate::skills::SkillStore>>>,
     /// Root TUI task mode. `None` for workers and headless one-shots.
     pub task: Option<Arc<crate::task::TaskHub>>,
+    /// A tool whose accepted call ends the turn chain: its `result` becomes
+    /// the final answer, as if the model had stopped with that text. A
+    /// workflow agent's `submit_result`.
+    pub terminal_tool: Option<String>,
+    /// Background work a run without an inbox (or whose inbox closed)
+    /// waits for before it ends: a headless run's pending workflows.
+    pub hold: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Called with each message the user wrote (the first prompt included):
+    /// a `+500k` in it sets the turn's token target for workflows.
+    pub on_user_turn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// Shared flag so the TUI can abort the current model turn without ending the session.
@@ -257,17 +271,22 @@ fn emit_model_finished(
         finish: finish.into(),
         input_tokens: usage.input_tokens,
         cached_tokens: usage.cached_tokens,
+        output_tokens: usage.output_tokens,
     });
 }
 
 fn live_instructions(cfg: &RunConfig) -> String {
     let mut out = cfg.instructions.clone();
-    let dispatcher = cfg
-        .knobs
-        .as_ref()
-        .is_some_and(|k| k.lock().unwrap_or_else(|e| e.into_inner()).dispatcher);
-    if dispatcher {
+    let knobs = cfg.knobs.as_ref().map(|k| {
+        let g = k.lock().unwrap_or_else(|e| e.into_inner());
+        (g.dispatcher, g.ultracode, g.workflow_size)
+    });
+    if knobs.is_some_and(|k| k.0) {
         out.push_str(crate::instructions::DISPATCHER_INSTRUCTIONS);
+    }
+    // Only a TUI root has live knobs, and only the root has workflows.
+    if let Some((_, ultracode, size)) = knobs {
+        out.push_str(&crate::workflow::instructions_suffix(ultracode, size));
     }
     let extra = cfg.skills.as_ref().map(|s| {
         s.lock()
@@ -545,13 +564,35 @@ fn tell_blind(sink: &dyn EventSink, cfg: &RunConfig, run_id: &str, model: &str, 
     );
 }
 
-/// Wait for the next user turn or background-exit notice. Closing the user inbox ends the session.
-/// Esc while paused is ignored so it cannot cancel the next turn.
-async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
-    if cfg.inbox.is_none() {
+/// How often a held run without an inbox re-checks its hold.
+const HOLD_TICK: Duration = Duration::from_millis(250);
+
+/// Whether background work keeps this run alive past its inbox.
+fn held(cfg: &RunConfig) -> bool {
+    cfg.hold.as_ref().is_some_and(|h| h())
+}
+
+/// The result of an accepted terminal-tool call: `{"accepted": true,
+/// "result": …}` → the result as JSON text.
+fn accepted_result(output: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(output).ok()?;
+    if v.get("accepted").and_then(Value::as_bool) != Some(true) {
         return None;
     }
+    Some(v.get("result")?.to_string())
+}
+
+/// Wait for the next user turn or background-exit notice. Closing the user
+/// inbox ends the session, unless held background work is still running.
+/// Esc while paused is ignored so it cannot cancel the next turn.
+async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
     loop {
+        // Without an inbox only held background work can still speak. A
+        // notice it queued just before letting go is still news.
+        if cfg.inbox.is_none() && !(held(cfg) && cfg.bg_notify.is_some()) {
+            let late = drain_session(cfg);
+            return (!late.is_empty()).then_some(late);
+        }
         if let Some(c) = &cfg.cancel {
             c.take();
         }
@@ -566,7 +607,8 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
         tokio::select! {
             user = recv_pending(&mut cfg.inbox) => {
                 let Some(msg) = user else {
-                    return None;
+                    cfg.inbox = None;
+                    continue;
                 };
                 if !msg.is_empty() {
                     msgs.push(msg);
@@ -589,6 +631,9 @@ async fn wait_session(cfg: &mut RunConfig) -> Option<Vec<UserTurn>> {
                 msgs.extend(drain_session(cfg));
                 return Some(msgs);
             }
+            // A hold can end without a message (a workflow stopped on
+            // request sends none): look again now and then.
+            _ = tokio::time::sleep(HOLD_TICK), if cfg.inbox.is_none() && cfg.hold.is_some() => {}
             _ = wait_if_cancel(&cfg.cancel) => {
                 if let Some(c) = &cfg.cancel {
                     c.take();
@@ -666,6 +711,11 @@ fn user_texts(msgs: &[UserTurn]) -> Vec<String> {
 /// memory (task mode); the worker handles them first. One also lifts an
 /// Esc stop kept from an earlier run.
 fn note_user_turns(cfg: &RunConfig, msgs: &[UserTurn]) {
+    if let Some(hook) = &cfg.on_user_turn {
+        for t in user_texts(msgs) {
+            hook(&t);
+        }
+    }
     if let Some(hub) = &cfg.task {
         let texts = user_texts(msgs);
         if !texts.is_empty() {
@@ -730,6 +780,11 @@ async fn wait_for_input<P: Provider>(
             append_user(history, pending, msg, &cfg.workspace);
         }
         let users = user_texts(&msgs);
+        if let Some(hook) = &cfg.on_user_turn {
+            for t in &users {
+                hook(t);
+            }
+        }
         if let Some(instr) = task_idle(cfg, provider, sink, run_id, history, last_text, &users).await {
             append_user(history, pending, &UserTurn::from(instr), &cfg.workspace);
             return Some(woke);
@@ -786,7 +841,11 @@ fn transient_backoff(attempt: u32) -> Duration {
     if cfg!(test) {
         return Duration::from_millis(5);
     }
-    Duration::from_secs((2u64 << attempt.min(5)).min(60))
+    // Up to a quarter more, at random: agents that hit a rate limit together
+    // (a workflow's parallel agents) should not all retry in the same second.
+    let base = Duration::from_secs((2u64 << attempt.min(5)).min(60));
+    let jitter = (Uuid::new_v4().as_u128() % 1000) as u32;
+    base + base * jitter / 4000
 }
 
 /// Stop retrying the same failing request so we do not hammer the API.
@@ -1535,6 +1594,9 @@ pub async fn run<P: Provider + Clone + 'static>(
         let rid = run_id.clone();
         let streamed_server = std::sync::atomic::AtomicBool::new(false);
         let streamed_reasoning = std::sync::atomic::AtomicBool::new(false);
+        // Text and reasoning streamed by the current attempt, for the cost of
+        // one the loop guard cuts off.
+        let streamed_chars = std::sync::atomic::AtomicUsize::new(0);
         let repeat_ctx = crate::repeat::Context::from_items(&history);
         let repeat_guard = crate::repeat::Guard::with_context(repeat_ctx.clone());
         let on_text = |delta: &str| {
@@ -1542,6 +1604,7 @@ pub async fn run<P: Provider + Clone + 'static>(
                 return;
             }
             repeat_guard.feed_text(delta);
+            streamed_chars.fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
             sink.emit(&AgentEvent::ModelDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -1561,6 +1624,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             }
             streamed_reasoning.store(true, std::sync::atomic::Ordering::Relaxed);
             repeat_guard.feed_reasoning(delta);
+            streamed_chars.fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
             sink.emit(&AgentEvent::ReasoningDelta {
                 meta: meta(&agent_name, &rid, parent.as_deref()),
                 text: delta.to_string(),
@@ -1574,6 +1638,7 @@ pub async fn run<P: Provider + Clone + 'static>(
         let mut transient_attempt = 0u32;
         loop {
             repeat_guard.reset();
+            streamed_chars.store(0, std::sync::atomic::Ordering::Relaxed);
             // A response that falls into a repetition loop is stopped as soon
             // as the loop shows, not when the model hits its output limit.
             let guarded = async {
@@ -1639,11 +1704,28 @@ pub async fn run<P: Provider + Clone + 'static>(
             Ok(Ok(r)) => match crate::repeat::check_response(&r.text, &r.function_calls, &repeat_ctx) {
                 None => r,
                 Some(trip) => {
+                    // The dropped reply was billed all the same.
+                    sink.emit(&AgentEvent::UsageReported {
+                        meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                        kind: "loop".into(),
+                        input_tokens: r.usage.input_tokens,
+                        cached_tokens: r.usage.cached_tokens,
+                        output_tokens: r.usage.output_tokens,
+                    });
                     handle_loop(&mut cfg, provider, sink, &run_id, &mut history, &mut pending, &mut loop_trips, &mut consecutive_provider_errors, &last_text, trip).await?;
                     continue;
                 }
             },
             Ok(Err(e)) if crate::repeat::is_loop(&e) => {
+                // Cut off mid-stream, so no usage came back: estimate it from
+                // the last request's input and what streamed (≈4 chars a token).
+                sink.emit(&AgentEvent::UsageReported {
+                    meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
+                    kind: "loop".into(),
+                    input_tokens: last_usage.input_tokens,
+                    cached_tokens: last_usage.cached_tokens,
+                    output_tokens: (streamed_chars.load(std::sync::atomic::Ordering::Relaxed) / 4) as u32,
+                });
                 let trip = repeat_guard.trip().unwrap_or(crate::repeat::Trip {
                     source: "text".into(),
                     unit: String::new(),
@@ -1749,6 +1831,8 @@ pub async fn run<P: Provider + Clone + 'static>(
             images_known = crate::vision::image_item_count(&history);
         }
 
+        // The accepted result of the terminal tool, if this batch made one.
+        let mut terminal: Option<String> = None;
         if !response.function_calls.is_empty() {
             emit_model_finished(
                 sink,
@@ -1854,6 +1938,9 @@ pub async fn run<P: Provider + Clone + 'static>(
                     pending.push(item);
                     continue;
                 }
+                if terminal.is_none() && cfg.terminal_tool.as_deref() == Some(call.name.as_str()) {
+                    terminal = accepted_result(&output);
+                }
                 watch.call(&call.name, &args, &output);
                 if emit_file_changes(
                     sink,
@@ -1908,11 +1995,17 @@ pub async fn run<P: Provider + Clone + 'static>(
                     ));
                 }
                 turn = 0;
+                continue;
             }
-            continue;
+            if terminal.is_none() {
+                continue;
+            }
         }
 
-        last_text = response.text;
+        // A handed-in result ends the chain like a stop; its tokens were
+        // counted with the tool-call turn.
+        let stop_usage = if terminal.is_some() { CacheUsage::default() } else { last_usage.clone() };
+        last_text = terminal.unwrap_or(response.text);
         emit_model_finished(
             sink,
             &cfg.agent_name,
@@ -1920,7 +2013,7 @@ pub async fn run<P: Provider + Clone + 'static>(
             cfg.parent_run_id.as_deref(),
             last_text.clone(),
             "stop",
-            &last_usage,
+            &stop_usage,
         );
 
         watch.progress();
@@ -1937,6 +2030,18 @@ pub async fn run<P: Provider + Clone + 'static>(
             continue;
         }
 
+        if cfg.inbox.is_none() && cfg.hold.is_some() {
+            // Headless: a pending workflow's notice is the next message
+            // (wait_session also picks up one that just arrived).
+            if let Some(msgs) = wait_session(&mut cfg).await {
+                note_user_turns(&cfg, &msgs);
+                for msg in msgs {
+                    append_user(&mut history, &mut pending, &msg, &cfg.workspace);
+                }
+                turn = 0;
+                continue;
+            }
+        }
         if cfg.inbox.is_none() {
             sink.emit(&AgentEvent::RunFinished {
                 meta: meta(&cfg.agent_name, &run_id, cfg.parent_run_id.as_deref()),
@@ -2246,6 +2351,9 @@ mod agent_tests {
             cancel: None,
             skills: None,
             task: None,
+            terminal_tool: None,
+            hold: None,
+            on_user_turn: None,
         }
     }
 
@@ -2409,7 +2517,7 @@ mod agent_tests {
         replies.extend(["c2", "c3", "c4"].map(now));
         // Usage past the trigger: the next turn folds the screenshot away.
         let mut big = now("c5").unwrap();
-        big.usage = CacheUsage { input_tokens: 15_000, cached_tokens: 0 };
+        big.usage = CacheUsage { input_tokens: 15_000, cached_tokens: 0, output_tokens: 0 };
         replies.push(Ok(big));
         replies.extend((6..=12).map(|i| now(&format!("c{i}"))));
         replies.push(text("matches now"));
@@ -2626,6 +2734,8 @@ mod agent_tests {
                 task_reasoning_effort: crate::provider::ReasoningEffort::High,
                 task_send_reasoning: true,
                 search: false,
+                ultracode: false,
+                workflow_size: Default::default(),
             }));
             let provider = Arc::new(Switching {
                 calls: Mutex::new(Vec::new()),
@@ -2800,6 +2910,9 @@ mod tests {
             cancel: None,
             skills: None,
             task: None,
+            terminal_tool: None,
+            hold: None,
+            on_user_turn: None,
         }
     }
 
@@ -2818,6 +2931,8 @@ mod tests {
             task_reasoning_effort: crate::provider::ReasoningEffort::High,
             task_send_reasoning: true,
             search: false,
+            ultracode: false,
+            workflow_size: Default::default(),
         })));
         let text = live_instructions(&c);
         assert!(text.starts_with("use tools"));
@@ -3001,6 +3116,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_accepted_terminal_tool_call_ends_the_run_with_its_result() {
+        let submit = |id: &str, args: &str| CompleteResponse {
+            function_calls: vec![FunctionCall {
+                call_id: id.into(),
+                name: "submit_result".into(),
+                arguments: args.into(),
+            }],
+            usage: CacheUsage { input_tokens: 100, cached_tokens: 0, output_tokens: 7 },
+            ..CompleteResponse::new(id)
+        };
+        // A misfit first: the error goes back, the model fixes it, and the
+        // accepted call ends the run without another model turn.
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![submit("c1", r#"{"n":"x"}"#), submit("c2", r#"{"n":3}"#)])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]});
+        let tools = ToolRegistry::new(vec![Box::new(crate::workflow::submit::SubmitResultTool::new(schema))]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let mut c = cfg("count", 8);
+        c.terminal_tool = Some("submit_result".into());
+        let out = run(&provider, &tools, &rec, c).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out.text).unwrap(), json!({"n": 3}));
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        let second = &provider.calls.lock().unwrap()[1];
+        assert!(second.input.iter().any(|i| i.to_string().contains("does not match the schema")));
+        let events = rec.0.lock().unwrap();
+        let stops: Vec<(&String, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ModelFinished { text, finish, output_tokens, .. } if finish == "stop" => Some((text, *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        // The stop carries the result and no tokens of its own (they were
+        // counted with the tool-call turn).
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].1, 0);
+        assert!(stops[0].0.contains("\"n\":3"));
+    }
+
+    #[tokio::test]
+    async fn a_held_one_shot_run_waits_for_background_news_before_it_ends() {
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse { text: "started it".into(), ..CompleteResponse::new("1") },
+                CompleteResponse { text: "it finished".into(), ..CompleteResponse::new("2") },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut c = cfg("go", 0);
+        c.bg_notify = Some(rx);
+        let flag = pending.clone();
+        c.hold = Some(Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        c.on_user_turn = Some(Arc::new(move |t: &str| log.lock().unwrap().push(t.to_string())));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(UserTurn::from(format!("{}wf-1 finished] done", crate::workflow::NOTICE_PREFIX)));
+        });
+        let out = tokio::time::timeout(Duration::from_secs(5), run(&provider, &tools, &rec, c))
+            .await
+            .expect("the run must end once the held work is done")
+            .unwrap();
+        assert_eq!(out.text, "it finished");
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        // The first prompt counts as the user's; the notice does not.
+        assert_eq!(seen.lock().unwrap().as_slice(), ["go"]);
+    }
+
+    #[tokio::test]
+    async fn a_hold_that_lets_go_without_a_message_still_ends_the_run() {
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![CompleteResponse { text: "stopped it".into(), ..CompleteResponse::new("1") }])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (_tx, rx) = mpsc::unbounded_channel::<UserTurn>();
+        let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut c = cfg("go", 0);
+        c.bg_notify = Some(rx);
+        let flag = pending.clone();
+        c.hold = Some(Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        let out = tokio::time::timeout(Duration::from_secs(3), run(&provider, &tools, &rec, c))
+            .await
+            .expect("the run must notice the hold let go")
+            .unwrap();
+        assert_eq!(out.text, "stopped it");
+    }
+
+    #[tokio::test]
+    async fn every_message_the_user_sends_reaches_the_user_turn_hook() {
+        let provider = Arc::new(Scripted {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(pop_front(vec![
+                CompleteResponse { text: "one".into(), ..CompleteResponse::new("1") },
+                CompleteResponse { text: "two".into(), ..CompleteResponse::new("2") },
+            ])),
+            compact_calls: Mutex::new(Vec::new()),
+            compact_ok: false,
+        });
+        let tools = ToolRegistry::new(vec![Box::new(NowTool)]);
+        let rec = Rec(Mutex::new(Vec::new()));
+        let (tx, inbox) = mpsc::unbounded_channel::<UserTurn>();
+        let mut c = cfg("go +100k", 0);
+        c.inbox = Some(inbox);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        c.on_user_turn = Some(Arc::new(move |t: &str| log.lock().unwrap().push(t.to_string())));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(UserTurn::from("next +2m"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(tx);
+        });
+        tokio::time::timeout(Duration::from_secs(5), run(&provider, &tools, &rec, c))
+            .await
+            .expect("the session ends when its inbox closes")
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["go +100k", "next +2m"]);
+    }
+
+    #[tokio::test]
     async fn separate_runs_get_separate_cache_keys() {
         async fn one_run(id: &str) -> String {
             let provider = Scripted {
@@ -3041,7 +3296,7 @@ mod tests {
                     }],
                     usage: CacheUsage {
                         input_tokens: 1000,
-                        cached_tokens: 0,
+                        cached_tokens: 0, output_tokens: 0,
                     },
                     ..CompleteResponse::new("1")
                 },
@@ -3049,7 +3304,7 @@ mod tests {
                     text: "ok".into(),
                     usage: CacheUsage {
                         input_tokens: 1000,
-                        cached_tokens: 10,
+                        cached_tokens: 10, output_tokens: 0,
                     },
                     ..CompleteResponse::new("2")
                 },
@@ -3437,7 +3692,7 @@ mod tests {
                         }],
                         usage: CacheUsage {
                             input_tokens: 80,
-                            cached_tokens: 0,
+                            cached_tokens: 0, output_tokens: 0,
                         },
                         output_items: {
                             let mut v = pad.clone();
@@ -3454,7 +3709,7 @@ mod tests {
                         }],
                         usage: CacheUsage {
                             input_tokens: 90,
-                            cached_tokens: 0,
+                            cached_tokens: 0, output_tokens: 0,
                         },
                         ..CompleteResponse::new("2")
                     },
@@ -3466,7 +3721,7 @@ mod tests {
                         }],
                         usage: CacheUsage {
                             input_tokens: 90,
-                            cached_tokens: 0,
+                            cached_tokens: 0, output_tokens: 0,
                         },
                         ..CompleteResponse::new("3")
                     },
@@ -3474,7 +3729,7 @@ mod tests {
                         text: "done".into(),
                         usage: CacheUsage {
                             input_tokens: 90,
-                            cached_tokens: 0,
+                            cached_tokens: 0, output_tokens: 0,
                         },
                         ..CompleteResponse::new("4")
                     },
@@ -3805,7 +4060,7 @@ mod tests {
             }],
             usage: CacheUsage {
                 input_tokens: 6_000,
-                cached_tokens: 0,
+                cached_tokens: 0, output_tokens: 0,
             },
             output_items: vec![
                 json!({"role":"user","content":"pad-1"}),
@@ -3829,7 +4084,7 @@ mod tests {
                     text: "done".into(),
                     usage: CacheUsage {
                         input_tokens: 20,
-                        cached_tokens: 18,
+                        cached_tokens: 18, output_tokens: 0,
                     },
                     ..CompleteResponse::new("2")
                 },
@@ -3945,7 +4200,7 @@ mod tests {
             }],
             usage: CacheUsage {
                 input_tokens: 6_000,
-                cached_tokens: 0,
+                cached_tokens: 0, output_tokens: 0,
             },
             output_items: vec![
                 json!({"role":"user","content":"pad-1"}),
@@ -4045,7 +4300,7 @@ mod tests {
             }],
             usage: CacheUsage {
                 input_tokens: 6_000,
-                cached_tokens: 0,
+                cached_tokens: 0, output_tokens: 0,
             },
             output_items: vec![
                 json!({"role":"user","content":"pad-1"}),
@@ -4854,7 +5109,7 @@ mod tests {
             }],
             usage: CacheUsage {
                 input_tokens: 6_000,
-                cached_tokens: 0,
+                cached_tokens: 0, output_tokens: 0,
             },
             output_items: vec![
                 json!({"role":"user","content":"pad-1"}),
@@ -5498,6 +5753,9 @@ mod task_proxy_tests {
             cancel: None,
             skills: None,
             task: Some(hub.clone()),
+            terminal_tool: None,
+            hold: None,
+            on_user_turn: None,
         };
         (c, closer, tx)
     }
@@ -5896,6 +6154,8 @@ mod task_proxy_tests {
                 task_reasoning_effort: crate::provider::ReasoningEffort::Medium,
                 task_send_reasoning: true,
                 search: false,
+                ultracode: false,
+                workflow_size: Default::default(),
             })));
             go(&provider, ToolRegistry::new(vec![]), &closer, c).await;
             let proxy = provider.proxy_calls.lock().unwrap();

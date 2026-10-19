@@ -1254,9 +1254,15 @@ fn cache_usage(body: &Value) -> CacheUsage {
         .or_else(|| u.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
+    let output_tokens = u
+        .get("completion_tokens")
+        .or_else(|| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
     CacheUsage {
         input_tokens,
         cached_tokens,
+        output_tokens,
     }
 }
 

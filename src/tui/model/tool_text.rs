@@ -101,6 +101,20 @@ pub(crate) fn tool_subject(name: &str, args: &Value) -> String {
         },
         "ask_user" => arg(args, "question").to_string(),
         "grok_search" => arg(args, "query").to_string(),
+        "workflow" => {
+            if args.get("reference").and_then(Value::as_bool) == Some(true) {
+                "撰寫說明".into()
+            } else if !arg(args, "name").is_empty() {
+                arg(args, "name").to_string()
+            } else if !arg(args, "script_path").is_empty() {
+                arg(args, "script_path").to_string()
+            } else if let Some(script) = args.get("script").and_then(Value::as_str) {
+                crate::workflow::engine::peek_name(script).unwrap_or_default()
+            } else {
+                "列表".into()
+            }
+        }
+        "stop_workflow" => arg(args, "run_id").to_string(),
         _ => String::new(),
     }
 }
@@ -125,6 +139,13 @@ pub(crate) fn tool_finished_line(name: &str, output: &str) -> String {
                 .and_then(|v| v.get("name").and_then(Value::as_str))
                 .unwrap_or("");
             format!("✓ spawn_agent  {n}").trim_end().to_string()
+        }
+        "workflow" => {
+            let id = parsed
+                .as_ref()
+                .and_then(|v| v.get("run_id").and_then(Value::as_str))
+                .unwrap_or("");
+            format!("✓ workflow  {id}").trim_end().to_string()
         }
         "write_file" | "edit_file" | "delete_file" | "list_dir" | "screenshot" | "read_image"
         | "project_memory" => format!("✓ {name}"),

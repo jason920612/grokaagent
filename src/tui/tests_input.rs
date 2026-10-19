@@ -44,6 +44,8 @@ fn fixture() -> Fixture {
         dispatcher: false,
         child_model: String::new(),
         reasoning_effort: ReasoningEffort::High,
+        ultracode: false,
+        workflow_size: Default::default(),
     };
     let app = App::new(opts, Some(store), boot, settings, skills, Rt::dummy(), None);
     Fixture { app, dir }

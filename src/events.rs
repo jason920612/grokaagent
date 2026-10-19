@@ -44,6 +44,9 @@ pub enum AgentEvent {
         finish: String,
         input_tokens: u32,
         cached_tokens: u32,
+        /// Generated tokens, reasoning included (0 from older binaries).
+        #[serde(default)]
+        output_tokens: u32,
     },
     ToolStarted {
         #[serde(flatten)]
@@ -209,6 +212,17 @@ pub enum AgentEvent {
         intent: String,
         text: String,
     },
+    /// Tokens of a model call that is not an agent turn: a context fold,
+    /// the user proxy, the command reviewer, a reply the loop guard dropped.
+    /// Agent turns report theirs on [`AgentEvent::ModelFinished`].
+    UsageReported {
+        #[serde(flatten)]
+        meta: EventMeta,
+        kind: String,
+        input_tokens: u32,
+        cached_tokens: u32,
+        output_tokens: u32,
+    },
     /// Model posed a questionnaire; the TUI should collect a pick.
     AskUser {
         #[serde(flatten)]
@@ -249,6 +263,7 @@ impl AgentEvent {
             | Self::SessionNamed { meta, .. }
             | Self::AgentMessage { meta, .. }
             | Self::TaskProxy { meta, .. }
+            | Self::UsageReported { meta, .. }
             | Self::AskUser { meta, .. } => meta,
         }
     }
@@ -282,6 +297,7 @@ impl AgentEvent {
             | Self::SessionNamed { meta, .. }
             | Self::AgentMessage { meta, .. }
             | Self::TaskProxy { meta, .. }
+            | Self::UsageReported { meta, .. }
             | Self::AskUser { meta, .. } => meta,
         }
     }

@@ -204,6 +204,30 @@ impl SessionStore {
         serde_json::from_slice(&raw).unwrap_or_default()
     }
 
+    /// Persist workflow runs that were stopped because this conversation's
+    /// run ended. No-op unless this id is a real session.
+    pub fn save_closed_workflows<T: Serialize>(&self, id: &str, items: &[T]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let dir = self.dir(id);
+        if !dir.join("meta.json").exists() {
+            return Ok(());
+        }
+        atomic_write(&dir.join("closed-workflows.json"), &serde_json::to_vec_pretty(items)?)?;
+        Ok(())
+    }
+
+    /// Read and delete the closed-workflow snapshot. Empty if none.
+    pub fn take_closed_workflows<T: DeserializeOwned>(&self, id: &str) -> Vec<T> {
+        let path = self.dir(id).join("closed-workflows.json");
+        let Ok(raw) = fs::read(&path) else {
+            return Vec::new();
+        };
+        let _ = fs::remove_file(&path);
+        serde_json::from_slice(&raw).unwrap_or_default()
+    }
+
     /// Persist the model history so the next run in this chat can resume it.
     pub fn save_context(&self, id: &str, items: &[serde_json::Value]) -> Result<()> {
         let dir = self.dir(id);

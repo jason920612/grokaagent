@@ -87,6 +87,9 @@ pub struct ProcessGuard {
     _job: windows_job::Job,
     /// Released: dropping no longer kills the process tree.
     detached: bool,
+    /// The child holds a lifeline (its stdin): on Unix, dropping closes it
+    /// and leaves the child to shut down cleanly instead of killing it.
+    lifeline: bool,
 }
 
 impl ProcessGuard {
@@ -104,11 +107,11 @@ impl ProcessGuard {
                 .raw_handle()
                 .ok_or_else(|| io::Error::other("child has no process handle"))?;
             job.assign_handle(handle as _)?;
-            Ok(Self { child, _job: job, detached: false })
+            Ok(Self { child, _job: job, detached: false, lifeline: false })
         }
         #[cfg(not(windows))]
         {
-            Ok(Self { child, detached: false })
+            Ok(Self { child, detached: false, lifeline: false })
         }
     }
 
@@ -118,6 +121,26 @@ impl ProcessGuard {
         self.detached = true;
         #[cfg(windows)]
         self._job.release();
+    }
+
+    /// The child was started with a lifeline (`--lifeline`, stdin piped
+    /// and kept open, `kill_on_drop(false)` on Unix): when this guard is
+    /// dropped without [`Self::finish`] (the parent is quitting), the child
+    /// sees its stdin close and ends its own session, so the processes its
+    /// tools started (each in a process group of its own) stop too, which
+    /// a SIGKILL of its group would leave running. On Windows the job
+    /// object reaps the whole tree, so dropping kills as before.
+    pub fn with_lifeline(mut self) -> Self {
+        self.lifeline = true;
+        self
+    }
+
+    /// End a child with a lifeline: close it, give the child `grace` to
+    /// shut down cleanly, then kill whatever is left.
+    pub async fn finish(&mut self, grace: std::time::Duration) {
+        drop(self.child.stdin.take());
+        let _ = tokio::time::timeout(grace, self.child.wait()).await;
+        let _ = self.kill().await;
     }
 
     pub fn child_mut(&mut self) -> &mut tokio::process::Child {
@@ -144,6 +167,10 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if self.detached {
+            return;
+        }
+        if self.lifeline && cfg!(unix) {
+            drop(self.child.stdin.take());
             return;
         }
         let _ = self.child.start_kill();

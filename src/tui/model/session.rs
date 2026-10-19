@@ -312,6 +312,10 @@ pub(crate) struct Routed {
     pub run_finished: bool,
 }
 
+/// Finished workflows whose agents stay in the tree; older ones are
+/// dropped when a new workflow starts (each can have dozens of agents).
+const KEEP_WORKFLOWS: usize = 3;
+
 pub(crate) struct Session {
     pub meta: SessionMeta,
     pub chat: Transcript,
@@ -473,7 +477,7 @@ impl Session {
             self.chat.interrupt();
             return true;
         }
-        if self.agents.live_count() > 0 {
+        if self.agents.interruptible_count() > 0 {
             // The session ignores Esc while paused; only the nursery reacts.
             cancel.trip();
             self.agents.log("", EventKind::Agent, "中斷工作中的子代理");
@@ -623,13 +627,30 @@ impl Session {
             // The task proxy may report itself like a child, but it is not a
             // process: its words arrive as TaskProxy rows instead.
             AgentEvent::ChildSpawned { name, .. } | AgentEvent::ChildExited { name, .. } if name == task::AGENT_NAME => {}
+            AgentEvent::ChildSpawned { name, prompt, model, .. } if model == super::agents::WORKFLOW_MODEL => {
+                for gone in self.agents.prune_workflows(KEEP_WORKFLOWS) {
+                    self.close_agent(&gone);
+                    self.views.remove(&gone);
+                }
+                self.agents.spawned("", &name, &prompt, &model);
+                self.chat.push(Row::meta(format!("工作流程 {name} 已啟動  {prompt}")));
+            }
+            AgentEvent::ChildExited { name, detail, .. } if self.agents.get(&name).is_some_and(|a| a.model == super::agents::WORKFLOW_MODEL) => {
+                self.agents.exited("", &name, &detail);
+                if let Some((id, phase)) = self.chat.mark_spawn_done(&name, &detail) {
+                    self.agents.set_tool_phase("", &id, phase);
+                }
+                self.chat.push(Row::meta(format!("工作流程 {name} 結束  {detail}")));
+            }
             AgentEvent::ChildSpawned { name, prompt, model, .. } => {
                 self.agents.spawned("", &name, &prompt, &model);
                 self.chat.push(Row::meta(format!("子代理 {name} 已啟動")));
             }
             AgentEvent::ChildExited { name, detail, .. } => {
                 self.agents.exited("", &name, &detail);
-                self.chat.mark_spawn_done(&name);
+                if let Some((id, phase)) = self.chat.mark_spawn_done(&name, &detail) {
+                    self.agents.set_tool_phase("", &id, phase);
+                }
                 self.chat.push(Row::meta(format!("子代理 {name} 結束")));
             }
             AgentEvent::TaskProxy { intent, text, .. } => {
