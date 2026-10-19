@@ -160,20 +160,21 @@ pub fn peek_name(source: &str) -> Option<String> {
 /// What makes a meta literal not a plain literal (a call, a function, an
 /// interpolation), if anything; strings and comments are skipped.
 fn not_literal(literal: &str) -> Option<&'static str> {
-    let code = code_mask(literal);
     let b = literal.as_bytes();
-    // Inside a non-code region that a backtick opened (a template literal).
-    let mut template = false;
-    for i in 0..b.len() {
-        if !code[i] {
-            if i == 0 || code[i - 1] || region_start(literal, &code, i) {
-                template = b[i] == b'`';
-            } else if template && b[i] == b'$' && b.get(i + 1) == Some(&b'{') && !escaped(b, i) {
+    let regions = regions(literal);
+    for (range, opener) in &regions {
+        if *opener == b'`' {
+            let inner = range.start + 1..range.end;
+            if inner.clone().any(|i| b[i] == b'$' && b.get(i + 1) == Some(&b'{') && !escaped(b, i)) {
                 return Some("a template interpolation");
             }
+        }
+    }
+    let code = code_mask(literal);
+    for i in 0..b.len() {
+        if !code[i] {
             continue;
         }
-        template = false;
         match b[i] {
             b'(' => return Some("a call or parenthesized expression"),
             b'=' if b.get(i + 1) == Some(&b'>') => return Some("a function"),
@@ -187,30 +188,6 @@ fn not_literal(literal: &str) -> Option<&'static str> {
         .map(|(c, keep)| if *keep { *c as char } else { ' ' })
         .collect();
     words.is_match(&plain).then_some("a function or an expression")
-}
-
-/// Whether byte `i` (not code) opens a new string or comment right after
-/// another one closed (`'a'` directly followed by `// x`).
-fn region_start(src: &str, code: &[bool], i: usize) -> bool {
-    let b = src.as_bytes();
-    if i == 0 || code[i - 1] {
-        return true;
-    }
-    let prev = b[i - 1];
-    // The previous region closed on its own quote, or a block comment's `/`.
-    let closed = matches!(prev, b'"' | b'\'' | b'`') && !escaped(b, i - 1) && opener_of(src, code, i - 1) == Some(prev)
-        || (prev == b'/' && i >= 2 && b[i - 2] == b'*');
-    closed && matches!(b[i], b'"' | b'\'' | b'`' | b'/')
-}
-
-/// The first byte of the non-code region that byte `i` belongs to.
-fn opener_of(src: &str, code: &[bool], i: usize) -> Option<u8> {
-    let b = src.as_bytes();
-    let mut j = i;
-    while j > 0 && !code[j - 1] {
-        j -= 1;
-    }
-    (j < i).then(|| b[j])
 }
 
 /// Whether byte `i` is escaped by an odd number of backslashes.
@@ -260,8 +237,20 @@ fn find_meta(src: &str) -> Option<MetaDecl> {
 /// For each byte: true where it is code, false inside a comment or a
 /// string / template literal (quotes included).
 fn code_mask(src: &str) -> Vec<bool> {
+    let mut mask = vec![true; src.len()];
+    for (range, _) in regions(src) {
+        for m in &mut mask[range] {
+            *m = false;
+        }
+    }
+    mask
+}
+
+/// The comments and string / template literals of `src`, quotes and
+/// comment markers included, each with the byte that opened it.
+fn regions(src: &str) -> Vec<(std::ops::Range<usize>, u8)> {
     let b = src.as_bytes();
-    let mut mask = vec![true; b.len()];
+    let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
         let start = i;
@@ -293,12 +282,10 @@ fn code_mask(src: &str) -> Vec<bool> {
             }
         }
         let end = (i + 1).min(b.len());
-        for m in &mut mask[start..end] {
-            *m = false;
-        }
+        out.push((start..end, b[start]));
         i = end;
     }
-    mask
+    out
 }
 
 /// The index of the `}` that closes the `{` at `open`, skipping strings,
@@ -881,8 +868,11 @@ mod tests {
         assert_eq!(peek_name("return 1"), None);
         assert_eq!(peek_name("export const meta = {\"name\": \"a\", \"description\": \"b\"}"), Some("a".into()));
         assert_eq!(peek_name("export const meta = { description: 'set name: \"zzz\"', name: 'real' }"), Some("real".into()));
+        // A template right after a line comment is still a template.
+        let e = parse("export const meta = { name: 'a', description: // note\n`x ${1+1}` }\nreturn 1").unwrap_err();
+        assert!(e.contains("template interpolation"), "{e}");
         // Backticks inside plain strings are not templates.
-        for ok in ["'Fill the `${name}` slot'", "\"Runs `${cmd}` per file\"", "`cost \\${x}`"] {
+        for ok in ["'Fill the `${name}` slot'", "\"Runs `${cmd}` per file\"", "`cost \\${x}`", "\"Edits src/**/`${file}` files\""] {
             let s = parse(&format!("export const meta = {{ name: 'a', description: {ok} }}\nreturn 1"));
             assert!(s.is_ok(), "{ok}: {s:?}");
         }

@@ -696,7 +696,11 @@ impl WorkflowHub {
             name: run.id.clone(),
             detail: head,
         });
-        if run.quiet.load(Ordering::SeqCst) || self.inner.shutting_down.load(Ordering::SeqCst) {
+        // A stop asked for while the script was already ending (it returned
+        // or failed, and its last agents were winding down) does not hide
+        // the result: only a run that did stop is quiet.
+        let quiet = run.quiet.load(Ordering::SeqCst) && status == Status::Stopped;
+        if quiet || self.inner.shutting_down.load(Ordering::SeqCst) {
             self.set_status(run, status);
             return;
         }
